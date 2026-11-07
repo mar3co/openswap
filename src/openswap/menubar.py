@@ -1170,7 +1170,9 @@ def run(switcher, codex=None) -> int:
                         result = request_pause(root, not self._worker_policy.paused)
                     except ClaudeSwitchError as exc:
                         result = {"diagnostic_code": str(exc) if str(exc) in lock_codes else "worker_control_failed"}
-                    if result.get("accepted") is not True:
+                    if result.get("restored") is False:
+                        diagnostic = "pause_unconfirmed"
+                    elif result.get("accepted") is not True:
                         diagnostic = result.get("diagnostic_code") or "pause_refused"
                 elif row_id == "remote_tasks_stop":
                     action = "stop"

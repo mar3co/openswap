@@ -289,7 +289,7 @@ def test_blocked_disable_reports_the_persisted_opt_in(
 
     state = "on" if enabled else "off"
     assert capsys.readouterr().err == (
-        f"Not stopped: an account may still be in use (lease_state_unknown). Remote tasks stay {state}, "
+        f"Not stopped: an account may still be in use (lease_state_unknown). Remote tasks are {state}, "
         "paused. Next: `openswap worker lease release` or `openswap worker lease release --provider claude` "
         "(whichever is held) to free it.\n"
     )
@@ -398,6 +398,7 @@ def test_rejected_pause_restores_previous_paused_policy(tmp_path: Path, monkeypa
         "accepted": False,
         "paused": True,
         "diagnostic_code": "pause_refused",
+        "restored": True,
     }
     assert load_worker_settings(tmp_path).paused is True
 
@@ -807,10 +808,10 @@ def test_a_refused_pause_whose_rollback_times_out_reports_the_setting_kept(tmp_p
     update_worker_settings(tmp_path, enabled=True, paused=False)
     monkeypatch.setattr(cli, "WorkerClient", RefusingClient)
     assert cli.request_pause(tmp_path, True) == {
-        "accepted": False, "paused": True, "diagnostic_code": "settings_unavailable"}
+        "accepted": False, "paused": True, "diagnostic_code": "pause_refused", "restored": False}
 
 
-def test_a_failed_unload_whose_rollback_times_out_is_not_busy(tmp_path: Path, monkeypatch):
+def test_a_failed_unload_whose_rollback_times_out_still_reports_the_unload(tmp_path: Path, monkeypatch):
     snapshot = {"process_state": "stopped", "enabled": True, "paused": True, "lease_quarantined": False,
                 "active_job": None}
     monkeypatch.setattr(cli, "WorkerClient", lambda _path: _Client(None))
@@ -822,7 +823,7 @@ def test_a_failed_unload_whose_rollback_times_out_is_not_busy(tmp_path: Path, mo
         raise cli.ClaudeSwitchError("bootout failed")
 
     monkeypatch.setattr(cli, "uninstall", unload_fails)
-    assert cli.disable_worker(tmp_path)[2] == "settings_unavailable"
+    assert cli.disable_worker(tmp_path)[2] == "worker_unload_failed"
 
 
 @pytest.mark.parametrize("code, line", [
@@ -833,7 +834,7 @@ def test_disable_says_busy_only_when_the_lifecycle_lock_is_held(tmp_path: Path, 
     assert capsys.readouterr().err.strip() == line
 
 
-@pytest.mark.parametrize("paused, where", [(True, "Remote tasks stay on, paused."), (False, "Remote tasks stay on.")])
+@pytest.mark.parametrize("paused, where", [(True, "Remote tasks are on, paused."), (False, "Remote tasks are on.")])
 def test_a_blocked_disable_says_paused_only_when_it_is(tmp_path: Path, monkeypatch, capsys, paused, where):
     update_worker_settings(tmp_path, enabled=True, paused=paused)
     monkeypatch.setattr(cli, "disable_worker", lambda _root: (False, {}, "settings_unavailable"))
@@ -848,4 +849,62 @@ def test_lease_release_says_busy_only_when_the_lifecycle_lock_is_held(tmp_path: 
     monkeypatch.setattr(cli, "release_lease", lambda *_args, **_kwargs: (_ for _ in ()).throw(
         cli.ClaudeSwitchError(code)))
     assert cli.main(["lease", "release"], backup_root=tmp_path) == 1
+    assert capsys.readouterr().err.strip() == line
+
+
+def test_an_unanswered_pause_whose_rollback_fails_keeps_the_error_and_restores_once(tmp_path: Path, monkeypatch):
+    writes = []
+
+    class FailingClient:
+        def __init__(self, _path):
+            pass
+
+        def set_paused(self, _paused):
+            def timed_out(*_args, **_kwargs):
+                writes.append("restore")
+                raise cli.LockError("Failed to acquire lock - another instance may be running")
+
+            monkeypatch.setattr(cli, "update_worker_settings", timed_out)
+            raise cli.IpcError("request_timeout")
+
+    update_worker_settings(tmp_path, enabled=True, paused=True)
+    monkeypatch.setattr(cli, "WorkerClient", FailingClient)
+    assert cli.request_pause(tmp_path, False) == {
+        "accepted": False, "paused": False, "diagnostic_code": "request_timeout", "restored": False}
+    assert writes == ["restore"]
+
+
+def test_an_unanswered_pause_that_is_rolled_back_still_raises(tmp_path: Path, monkeypatch):
+    class FailingClient:
+        def __init__(self, _path):
+            pass
+
+        def set_paused(self, _paused):
+            raise cli.IpcError("request_timeout")
+
+    update_worker_settings(tmp_path, enabled=True, paused=True)
+    monkeypatch.setattr(cli, "WorkerClient", FailingClient)
+    with pytest.raises(cli.IpcError, match="request_timeout"):
+        cli.request_pause(tmp_path, False)
+    assert load_worker_settings(tmp_path).paused is True
+
+
+@pytest.mark.parametrize("payload, line", [
+    ({"paused": False, "diagnostic_code": "request_timeout", "restored": False},
+     "✗ Not confirmed (request_timeout): the setting is saved as taking tasks, but the worker didn't confirm it."),
+    ({"paused": True, "diagnostic_code": "settings_unavailable", "restored": True},
+     "✗ Not changed (settings_unavailable); the worker is still paused."),
+])
+def test_a_refused_resume_says_what_is_saved(tmp_path: Path, monkeypatch, capsys, payload, line):
+    monkeypatch.setattr(cli, "request_pause", lambda *_args: {"accepted": False, **payload})
+    assert cli.main(["pause", "--off"], backup_root=tmp_path) == 1
+    assert capsys.readouterr().err.strip() == line
+
+
+@pytest.mark.parametrize("code, line", [
+    ("worker_lifecycle_busy", cli.BUSY_MESSAGE),
+    ("worker_state_unavailable", "Could not change whether the worker takes tasks.")])
+def test_pause_says_busy_only_when_the_lifecycle_lock_is_held(tmp_path: Path, monkeypatch, capsys, code, line):
+    monkeypatch.setattr(cli, "request_pause", lambda *_args: (_ for _ in ()).throw(cli.ClaudeSwitchError(code)))
+    assert cli.main(["pause"], backup_root=tmp_path) == 1
     assert capsys.readouterr().err.strip() == line

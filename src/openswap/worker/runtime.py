@@ -18,7 +18,7 @@ import threading
 import time
 from urllib.parse import quote
 
-from openswap.settings import load_worker_settings, update_worker_settings
+from openswap.settings import load_worker_settings
 from openswap.worker.accounts import account_in_roster, provider_of
 from openswap.worker.adapter import ProviderAdapter, ProviderLaunchRefused, production_adapter
 from openswap.locking import FileLock
@@ -699,11 +699,17 @@ class WorkerRuntime:
     def set_paused(self, paused: bool) -> ControlResult:
         if type(paused) is not bool:
             return ControlResult(False, diagnostic_code="invalid_pause_value")
+        # Every client saves the value before asking. Taking the admission lock
+        # is the barrier: no admission still running sees the old value. The
+        # worker never writes it, so an answer that arrives after the client
+        # gave up and rolled back cannot undo that rollback.
         try:
             with self._admission_lock:
-                update_worker_settings(self.backup_root, paused=paused)
+                saved = load_worker_settings(self.backup_root).paused
         except (OSError, RuntimeError, ValueError):
             return ControlResult(False, diagnostic_code="settings_unavailable")
+        if saved is not paused:
+            return ControlResult(False, diagnostic_code="pause_not_saved")
         return ControlResult(True, diagnostic_code="admission_paused" if paused else "admission_open")
 
     def reconcile_once(self, *, shutdown_event: threading.Event | None = None) -> JobRecord | None:

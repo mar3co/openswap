@@ -1342,3 +1342,12 @@ def test_phase_two_never_emits_approval_state_or_arbitrary_events(tmp_path):
             worker_epoch=epoch, expected_generation=created.generation,
             diagnostic_code="raw provider text",
         )
+
+
+def test_the_worker_confirms_a_pause_only_when_it_is_saved_and_never_writes_it(tmp_path, monkeypatch):
+    update_worker_settings(tmp_path, enabled=True, paused=True)
+    runtime = WorkerRuntime(tmp_path)
+    monkeypatch.setattr(shared_settings, "atomic_write_json", lambda *_args: pytest.fail("the worker wrote settings"))
+    assert (runtime.set_paused(True).accepted, runtime.set_paused(True).diagnostic_code) == (True, "admission_paused")
+    refused = runtime.set_paused(False)
+    assert (refused.accepted, refused.diagnostic_code) == (False, "pause_not_saved")
