@@ -650,7 +650,7 @@ def test_ipc_startup_failure_clears_the_worker_health_record(tmp_path, monkeypat
         runtimes.append(runtime)
         return runtime
 
-    def failing_serve(path, runtime, stop_event, *, ready_event):
+    def failing_serve(path, runtime, stop_event, *, ready_event, notices=None):
         return None  # could not bind the control socket; never signals ready
 
     monkeypatch.setattr(ipc, "serve", failing_serve)
