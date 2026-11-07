@@ -126,7 +126,7 @@ _SUBCOMMAND_FLAGS = {
 # (`openswap account`, `openswap pair`).
 _KNOWN_VERBS = frozenset({
     *_SUBCOMMAND_FLAGS, "switch", "auto", "codex", "claude-desktop", "widget", "statusline", "setup", "uninstall", "config",
-    "unclaimed", "alias", "swap", "move", "worker", "tui", "watch", "run", "map", "unmap",
+    "unclaimed", "alias", "swap", "move", "worker", "tui", "watch", "run", "map", "unmap", "claude",
 })
 # The worker verbs an owner is likely to type at the top level.
 _WORKER_VERBS = ("setup", "pair", "unpair", "status", "enable", "disable", "pause", "stop", "account",
@@ -1669,6 +1669,17 @@ def main() -> None:
         from openswap.worker.cli import main as worker_main
 
         sys.exit(worker_main(sys.argv[2:]))
+    # Claude Code's and Codex's hooks run this: no migration, theme or
+    # engine, and nothing printed.
+    if len(sys.argv) > 1 and sys.argv[1] == "attention":
+        from openswap.attention import main as attention_main
+
+        sys.exit(attention_main(sys.argv[2:]))
+    # Claude Code with OpenSwap's channel; every other argument is Claude Code's.
+    if len(sys.argv) > 1 and sys.argv[1] == "claude":
+        from openswap.attention import launch_claude
+
+        sys.exit(launch_claude(sys.argv[2:]))
     if len(sys.argv) > 1 and sys.argv[1] == "claude-desktop":
         from openswap.claude_desktop import main as desktop_main
 

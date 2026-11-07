@@ -16,6 +16,8 @@ opensoft.me/swap/changelog shows this file.
 ### New
 
 - Settings › Remote lists the folders remote tasks may work in, with Add Folder… and Remove for each.
+- Settings › Remote › Sessions can tell your control service when a Claude Code or Codex session waits for your approval, when a Claude Code session asks a question or sits idle, and when a Codex turn ends, with or without details. Off until you turn it on. Codex asks you once to trust OpenSwap's hooks.
+- Sessions you start with `openswap claude` can be answered from your phone and watch: allow or deny a tool, answer a question, or send a quick reply to an idle session. Turn on Settings › Remote › Sessions › Allow replies from my phone and watch on the Mac first; it is off until you do.
 
 ### Improved
 

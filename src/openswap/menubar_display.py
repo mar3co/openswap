@@ -11,6 +11,7 @@ import logging
 import os
 import plistlib
 import re
+import shlex
 import shutil
 import sys
 import threading
@@ -733,6 +734,76 @@ def remote_folder_rows(worker_status: dict) -> list[dict]:
     return rows
 
 
+REMOTE_ATTENTION_NEEDS_WORKER = "Notices are sent while the local worker is on."
+REMOTE_ATTENTION_UNREADABLE = ("OpenSwap can't read its settings file, so these switches show as off and sessions "
+                               "send nothing new until it can.")
+REMOTE_ATTENTION_MISSING = ("Some session hooks run {program}, which is gone{more}; sessions skip them quietly. "
+                            "Turn notices off and on to point them at this copy of OpenSwap.")
+CODEX_REVIEW = ("Codex shows “Hooks need review” the next time it starts. Choose “Trust all and "
+                "continue” so Codex sessions can tell you when they need you.")
+# Codex's state for OpenSwap's hooks (``attention.codex_hooks_status``), in words.
+CODEX_HOOKS_STATUS = {
+    "trusted": "Codex: OpenSwap's hooks are trusted.",
+    "review": "Codex: " + CODEX_REVIEW,
+    "review_others": ("Codex: Codex shows “Hooks need review” the next time it starts, for other hooks too. "
+                      "Trust OpenSwap's (codex-hook) and only the hooks you recognize; don't choose “Trust all and "
+                      "continue” unless you know them all."),
+    "disabled": "Codex: OpenSwap's hooks are turned off in Codex (/hooks), so Codex sessions can't tell you "
+                "when they need you.",
+    "off": "Codex: hooks are turned off in Codex's settings, so Codex sessions can't tell you when they need you.",
+    "blocked": "Codex: your organization's Codex settings don't allow OpenSwap's hooks.",
+    "missing": "Codex: OpenSwap's hooks are missing from Codex's hooks.json; the worker puts them back.",
+    "unknown": "Codex: OpenSwap can't read Codex's settings to tell whether its hooks are trusted.",
+}
+REMOTE_REPLIES_HOW = ("Only sessions started with {launcher} can be answered from your phone and watch; "
+                      "to make it your claude command, add alias claude={launcher_quoted} to your shell's "
+                      "startup file. Claude Code asks you to confirm the OpenSwap channel each time it starts, "
+                      "and Team and Enterprise organizations must turn channels on first.")
+
+
+def remote_attention_rows(worker_status: dict, *, enabled: bool) -> list[dict]:
+    """Settings › Remote › Sessions: the two session attention switches (shown on a
+    paired Mac, and on an unpaired one while notices are on so they can be turned off).
+
+    ``worker_status["attention"]`` is ``{"notices": bool, "details": bool, "replies": bool}``
+    as read from settings, plus ``codex``, Codex's state for OpenSwap's hooks
+    (None without Codex), and ``launcher``, the ``openswap claude`` command
+    line; no rows until it is known.
+    """
+    switches = worker_status.get("attention")
+    if not isinstance(switches, dict):
+        return []
+    notices = switches.get("notices") is True
+    rows = [
+        _section_row("group_remote_attention", "Sessions"),
+        {"kind": "toggle", "section": SETTINGS_SECTION_REMOTE, "id": "remote_attention_notices",
+         "label": "Tell me when a session needs me", "value": notices},
+        {"kind": "toggle", "section": SETTINGS_SECTION_REMOTE, "id": "remote_attention_details",
+         "label": "Send details", "value": switches.get("details") is True, "disabled": not notices},
+        {"kind": "toggle", "section": SETTINGS_SECTION_REMOTE, "id": "remote_attention_replies",
+         "label": "Allow replies from my phone and watch", "value": switches.get("replies") is True,
+         "disabled": not notices},
+    ]
+    if notices and not enabled:
+        rows.append(_remote_hint("remote_attention_note", REMOTE_ATTENTION_NEEDS_WORKER))
+    if switches.get("readable") is False:
+        rows.append(_remote_hint("remote_attention_unreadable", REMOTE_ATTENTION_UNREADABLE))
+    missing = switches.get("missing") or []
+    if notices and missing:
+        rows.append(_remote_hint("remote_attention_missing", REMOTE_ATTENTION_MISSING.format(
+            program=missing[0], more=f" (and {len(missing) - 1} more)" if len(missing) > 1 else "")))
+    for n, problem in enumerate(switches.get("problems") or []):
+        rows.append(_remote_hint(f"remote_attention_problem_{n}", problem))
+    codex = CODEX_HOOKS_STATUS.get(switches.get("codex"))
+    if notices and codex:
+        rows.append(_remote_hint("remote_attention_codex", codex))
+    launcher = switches.get("launcher")
+    if notices and switches.get("replies") is True and isinstance(launcher, str):
+        rows.append(_remote_hint("remote_attention_replies_note", REMOTE_REPLIES_HOW.format(
+            launcher=launcher, launcher_quoted=shlex.quote(launcher))))
+    return rows
+
+
 def remote_status_rows(worker_status: dict, *, enabled: bool, paused: bool, paired: bool,
                        expanded: bool) -> list[dict]:
     """Settings › Remote › Status: the one-line status, a key warning, Active job, then Details."""
@@ -949,6 +1020,9 @@ def settings_page_rows(
         _remote_tasks_account_row(status.get("account_picker")),
         _remote_tasks_web_choice_row(status.get("account_picker")),
         *(remote_folder_rows(status) if worker_paired else []),
+        # Also while unpaired with notices on, so they can still be turned off.
+        *(remote_attention_rows(status, enabled=worker_enabled)
+          if worker_paired or (status.get("attention") or {}).get("notices") else []),
         *remote_status_rows(status, enabled=worker_enabled, paused=worker_paused, paired=worker_paired,
                             expanded="remote_tasks_details" in (expanded_sections or ())),
     ]

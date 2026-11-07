@@ -51,7 +51,7 @@ Enrollment does not enable local execution or select an account/workspace.
 | --- | --- | --- |
 | `pair` | `code` (string, at most 200 characters); optional `code_verifier` (see [Connect to OpenTag](#connect-to-opentag-optional)) | `worker_id`, `device_key`, `expires_at` |
 | `register` | none (`{}`) | `worker_id`, `worker_epoch` (positive integer), `heartbeat_seconds` (5), `lease_seconds` (20) |
-| `heartbeat` | `worker_epoch` | `last_seen_at`, `cancel_job_ids` (array of IDs) |
+| `heartbeat` | `worker_epoch`; optional `attention_acks` (see [Replies](#replies)) | `last_seen_at`, `cancel_job_ids` (array of IDs); `attention_replies` for a worker that advertised `"attention"` |
 | `submit` | submission object below | `job_id`, `state` |
 | `poll` | `worker_epoch` | `claim` (claim object below, or null) |
 | `renew` | `worker_epoch`, `job_id`, `epoch` | `lease_until`, `state`, `cancel_requested` (boolean) |
@@ -498,8 +498,9 @@ unknown operation (404 `unsupported_version`).
 
 `features` holds 0–20 unique strings, each 1–64 characters of lowercase ASCII
 letters, digits, `_` and `-`. A backend ignores a feature it does not know;
-v1 defines `"origin"` and `"key_rotation"` (see
-[Optional key rotation](#optional-key-rotation-v1-extension)). The response's
+v1 defines `"origin"`, `"key_rotation"` (see
+[Optional key rotation](#optional-key-rotation-v1-extension)) and `"attention"`
+(see [Optional session attention](#optional-session-attention-v1-extension)). The response's
 `features` is the subset of the request the backend accepts. The request
 atomically replaces the worker's whole advertised set. It carries the current
 worker epoch like any other mutation and returns `stale_epoch` from a
@@ -641,6 +642,182 @@ wins, and nothing is written), then switches every later request to it. If
 the save fails, it keeps the old key, which still works because the new one is
 only pending. The registration, the worker ID and the saved status are kept;
 see [Local enrollment and status](#local-enrollment-and-status).
+
+## Optional session attention (v1 extension)
+
+Without this extension a session on the Mac that stops to ask the owner
+something just waits until the owner looks. With it, the Mac reports every
+Claude Code session that waits for a permission, asks a question or has gone
+idle, and every finished Codex turn, so the backend can tell the owner
+elsewhere. The report authorizes nothing by itself. The owner can answer some
+items from elsewhere ([Replies](#replies)); the Mac decides which, and only
+while the owner allows replies on the Mac.
+
+The extension is additive. A worker advertises it as the `"attention"` feature
+of `capabilities` (see
+[Optional submission origin](#optional-submission-origin-v1-extension)) whenever
+its build supports it, whatever the owner's switches say, and sends the
+operation only after a registration whose `capabilities` the backend
+acknowledged with that feature. A backend that does not implement it ignores
+the feature, and rejects the operation like any unknown operation (404
+`unsupported_version`).
+
+| Operation | Request fields | Success response |
+| --- | --- | --- |
+| `attention` | `worker_epoch`, `notices_enabled` (boolean), `replies_enabled` (boolean), `items` (array below), `closed` (array below) | `item_count` |
+
+The request atomically replaces the worker's whole set of open items, like
+`readiness`, and `item_count` is the number of `items` received. It carries
+the current worker epoch like any other mutation and returns `stale_epoch` from
+a superseded registration. A backend refuses it with 400 `invalid_request` when
+the current registration did not advertise `"attention"`. A new registration
+keeps the report: the worker sends the whole set again, and an item it still
+lists is the same item, not a new one (a backend that alerts the owner does so
+once per item ID). A revocation clears it.
+
+`notices_enabled` and `replies_enabled` are the owner's switches on the Mac
+(set only there, never from the backend). With notices off the worker sends
+`items: []` and `replies_enabled: false`. With replies off every item's
+`actions` is empty. These are promises of the reference worker; a backend
+need not refuse a request that breaks them.
+
+`items` holds 0–50 entries, the newest open items, each a closed object with
+exactly these fields, and optionally `session_id` and `detail`:
+
+- `id`: 1–64 characters of ASCII letters, digits, `_` and `-`; unique within
+  the request. Every occurrence of a session needing the owner gets a new
+  random ID, never reused.
+- `kind`: `permission` (a tool waits for approval), `question` (a session asks
+  a multiple-choice question), `idle` (a session finished its turn and waits)
+  or `finished` (a Codex turn ended).
+- `provider`: `claude` or `codex`.
+- `session_label`: 1–100 characters with no Unicode control characters,
+  naming the session without its content (for example `Terminal · 3f2a`).
+- `session_id` (optional; the reference worker always sends it): 1–64
+  characters of ASCII letters, digits, `_` and `-`; an opaque per-Mac
+  identifier of the session (an HMAC of the Claude session ID or Codex thread
+  ID under the same per-Mac key as `folder_id`), never the ID itself. Items of
+  one session share it, so a backend can group or collapse their alerts.
+- `folder_id`: 1–64 characters of ASCII letters, digits, `_` and `-`; an opaque
+  per-Mac identifier of the session's folder (the reference client sends an
+  HMAC of the path under a random per-Mac key), never a path.
+- `folder_label`: 1–100 characters with no Unicode control characters: an
+  approved Remote tasks folder's label, else the folder's own name when the
+  owner sends details, else `a session`.
+- `created_at`: when the item opened, RFC 3339.
+- `actions`: the reply kinds the item accepts now, 0–8 unique strings of 1–64
+  lowercase ASCII letters, digits, `_` and `-`: `allow` and `deny` (a
+  permission), `answer` (a question), `message` (an idle session). Empty for a
+  notice-only item. A backend ignores values it does not know.
+- `detail` (optional, only while the owner sends details): a closed object
+  with at least one of `tool_name` (1–100 characters), `description` (1–1,000),
+  `input_preview` (1–4,000; the call as Claude Code itself previews it to
+  OpenSwap's channel, sent only for a permission that takes replies), `last_message`
+  (1–1,000, the start of the session's last message) and `questions` (1–4 closed objects, each with
+  `question` (1–1,000), an optional `header` (1–100) and `options`, 0–4
+  option labels of 1–100 characters). `tool_name`, `header` and option labels
+  contain no Unicode control characters; the other text may contain newline,
+  carriage return and tab, and no other control character. A tool's raw input
+  is never sent: for `Bash` the worker sends the model's own description of
+  the command.
+
+`closed` holds 0–50 closed objects with exactly `id` (the item ID's grammar,
+unique within the array) and `reason`, one for each item that closed since
+the last report the backend accepted, sent once:
+`answered_on_mac`, `answered_from_watch`, `session_ended`, `superseded` (a
+newer Codex turn, or a newer turn of an idle Claude Code session) or `expired` (a Codex item 24 hours old). An ID never
+appears in both arrays of one request. A backend ignores a close for an item
+it never saw (an earlier report may have been lost). An item that leaves
+`items` without a close (notices turned off, or past the 50-item cap) ended
+without an answer to show.
+
+Text is counted in Unicode code points. Escaped non-ASCII text could take 50
+full items past the 1,500,000-byte body limit, so the worker leaves out the
+`detail` of the oldest items until the request fits.
+
+The worker sends the report after each registration whose `capabilities` the
+backend accepted with `"attention"`, at once whenever an item opens, is
+published or closes, and within 5 seconds of a switch changing (by local
+fingerprint, like `readiness`). It runs on a thread of its own, so it never delays heartbeats,
+claims or results. A 404 `unsupported_version` (or 404 `not_found`, from
+reference servers predating this extension) stops it until the next
+registration; other failures are retried every 5 seconds, and logged at
+most every 10 minutes per error. A 403 (`forbidden`) is asked again only
+every 15 minutes, and the worker's status says why. A 413 halves the next
+report's size (oldest details, then oldest items, left out). A 400 is taken
+as one item's fault: the next report leaves out the items' detail, then adds
+each back one report at a time and keeps out for good the one refused again;
+failing that, generic labels; failing that, the report carries only closes.
+Closes always get through: at most 50 a report, the next report follows at
+once while more wait. A close is dropped on the Mac once a report carrying it
+was accepted, when notices are turned off, or, past 200 waiting while no
+report gets through, oldest first; its item still leaves `items`. An
+unreadable settings file is not "off": the worker keeps its open items and
+sends waiting closes, with no detail and no actions, and its status says so.
+
+### Replies
+
+The owner answers an item from another device; the backend hands the answer
+to the Mac in its heartbeat. A `heartbeat` request may carry `attention_acks`
+on any registration of the worker, including one that has not yet re-sent
+`capabilities`; the backend applies them in order and never refuses a
+heartbeat over them (it ignores a malformed entry, or one for a reply it does
+not know or another worker's). The response carries `attention_replies`
+always, and only, for a registration that advertised `"attention"`; other
+registrations' heartbeat responses are unchanged.
+
+`attention_replies` holds 0–20 closed objects, oldest first:
+
+- `id`: the backend's reply ID, the item ID's grammar.
+- `item_id`: the `id` of the item it answers.
+- `action`: one of the item's `actions`.
+- `expires_at`: RFC 3339, when the reply lapses (the reference service: 10
+  minutes after it was sent). The Mac judges it on the backend's clock.
+- `answers`, exactly for `answer`: 1–4 closed `{question, option}` objects,
+  0-based positions in the item's `detail.questions` and that question's
+  `options`, one per question. Never titles.
+- `text`, exactly for `message`: 1–1,000 characters; newline, carriage return
+  and tab allowed, no other control character.
+
+A reply names an item, never a prompt's own identifier: each item stands for
+one prompt and its ID is never reused, and the Mac keeps the mapping to the
+session's prompt to itself. The backend sends a reply on every heartbeat until
+an acknowledgement for it arrives, while it is unexpired and its item is still
+listed.
+
+`attention_acks` holds 1–50 closed `{id, outcome}` objects, and may name a
+reply more than once (the reference worker sends only the latest outcome per
+reply when it can, and keeps an outcome until a heartbeat carrying it
+succeeds): `sent` (handed to
+the session), `applied` (the session acted on it: the call ran or was denied,
+the question took that answer, the message started a turn), `item_closed` (the
+item had closed, or its prompt was answered at the Mac, before the reply could
+reach it; nothing was handed over), `expired`, or `refused` (replies off, an
+action the item does not take now, an answer that does not fit, or a session
+the Mac cannot reach). The Mac acts on each reply ID at most once, across restarts as
+well, and acknowledges it again with the same outcome if the reply comes back. A reply
+first acknowledged `sent` may later be acknowledged `applied`; one whose item
+then closes any other way (answered at the Mac, the session ended) stays
+`sent`, and the item's close reason says what happened. The first
+acknowledgement of a reply fixes its outcome, except `sent` → `applied`;
+later ones are ignored.
+
+The heartbeat thread only queues replies; another thread applies them, so a
+reply never delays liveness. A heartbeat refused with `invalid_request` for
+the outcomes it carries is sent again at once without them; those outcomes
+are tried again one per heartbeat after a minute, and one refused alone is
+given up (logged). An item answered from the other device closes as
+`answered_from_watch` only when the Mac knows that reply decided it.
+
+The reference service implements `attention`, keeps the latest report per
+worker and the close reason of each item any report listed since the worker
+paired;
+`openswap worker refserver attention --database PATH [WORKER_ID]` prints them
+with each reply and its outcome. `openswap worker refserver attention-reply
+--database PATH WORKER_ID ITEM_ID ACTION [--answer QUESTION:OPTION ...]
+[--text TEXT]` queues a reply as the owner's device would: only for an item
+the latest report lists open with that action, while replies are on, and one
+reply per item.
 
 ## Errors, persistence, and operating the reference service
 
@@ -1453,6 +1630,229 @@ After each registration the worker sends `capabilities` with `["origin"]`; the
 reference service implements it, keeps the accepted set per registration,
 accepts `origin` only from a worker that advertised it, and `submit-test` takes
 `--origin-kind KIND --origin-label LABEL` (both or neither).
+
+### Telling you when a session needs you
+
+Settings › Remote › Sessions has two switches, set on this Mac only: **Tell me
+when a session needs me** (off by default) and **Send details** (on by
+default). They need a paired Mac with the local worker on. The worker reports
+open items with the [session attention
+extension](#optional-session-attention-v1-extension).
+
+Turning notices on installs Claude Code hooks (`openswap attention <event>`,
+`async`) in the `settings.json` of every config home OpenSwap manages:
+`~/.claude`, each account session profile (in a `settings.json` of its own
+when it does not share `~/.claude`'s, which sharing may later replace), and
+each Claude Desktop profile's Code folder. Every entry runs through
+`/bin/sh -c`, so a program that is gone or cannot run the hook (an older
+build) exits 0 and prints nothing: no Claude Code or Codex event fails or is
+blocked over it. Only OpenSwap's own entries are added or removed; a settings
+file that cannot be read is left alone, as with the status line. OpenSwap
+records every file it writes hooks into (`worker/attention-hooks.json`), and
+removal goes through exactly those files, found or not, and no other: it
+writes through a link, deletes a file only when OpenSwap created it at its
+latest install and nothing else is in it, and names a file it could not
+change (uninstall then does not report the step done). For Codex, it adds
+OpenSwap's hooks (`PermissionRequest`, `PostToolUse`, `Stop`,
+`UserPromptSubmit`, `Interrupt`, `SessionEnd`) to the Codex home's
+`hooks.json`; Codex's `notify` is left alone. Codex runs hooks unless its
+`hooks` feature is off (`features.hooks`, else the legacy
+`features.codex_hooks`; on by default in Codex 0.166). When it is off, only
+the owner's own turning on of notices sets `[features] hooks = true`, and,
+while other hooks in `hooks.json` would start running with it, only after the
+owner agrees to that; the worker never turns it on. Each Codex entry runs
+`<backup root>/bin/codex-hook <event>`, a script that starts the current
+OpenSwap: the entries never change when the app is updated or moved or a DEV
+build runs, so Codex asks to trust them once. Codex records trust by an
+entry's position (under the Codex home's resolved path), so an existing entry
+keeps its place and other hooks are never moved; a new entry goes last.
+OpenSwap never writes `/etc/codex` or other managed Codex files. The worker
+repeats the install at each start and every 30 seconds, so a config home
+added since gets the hooks and the script follows the app. Turning notices
+off, or uninstalling OpenSwap, removes the hooks and puts `features.hooks`
+back as it was before OpenSwap turned it on (unset, `true` or `false`) unless
+the owner changed it since or hooks other than those there then were added,
+which keeps it on. Taking an entry out of `hooks.json` can move the owner's
+hooks after it onto other trust records: OpenSwap never does that where a
+hook would gain trust, and otherwise only for the owner, naming the hooks
+Codex will ask about again; with notices off, the worker takes out at its
+start any hook a failed removal left, except such an entry.
+
+Codex shows "Hooks need review" at its next start after the hooks are added
+or changed; until the owner chooses "Trust all and continue" (or trusts them
+in `/hooks`), they do not run. Settings › Remote › Sessions shows Codex's
+actual state, read from Codex's own files: trusted, waiting for that review,
+turned off in Codex (`/hooks` or `features.hooks = false`), blocked by managed
+configuration (`allow_managed_hooks_only`, or hooks turned off in
+`/etc/codex` or a managed profile), or missing; it never advises trusting
+all while other hooks there also wait for review. It also names hook entries
+whose program is gone. Turning notices on says so when the review is still
+to come.
+
+A hook hands its event to the worker's socket and exits within a second,
+printing nothing; with no worker running the event is dropped. The worker
+publishes an item when Claude Code itself decides the owner seems away (its
+`permission_prompt` notification, about 6 seconds into a permission or
+question dialog, and `idle_prompt`, about 60 seconds after a turn ends). A `permission_prompt` publishes only the prompt
+waiting now, once: Claude Code sends it 6 seconds after that dialog showed,
+which is when the dialog's `PermissionRequest` ran, so it is matched to that
+call (several subagent prompts can wait at once, each with its own notice). A
+recorded call whose notice is overdue ended before it and is dropped unseen;
+a notice with no recorded call becomes a notice without detail.
+
+Answering at the Mac closes the item as `answered_on_mac`: `PostToolUse` or
+`PostToolUseFailure` of that very call (matched by a digest of its input),
+`Stop` for the main thread's permissions and questions (a background
+subagent's prompt can outlive the turn that started it), `SubagentStop` for
+that subagent's (a "No" or Esc on its prompt ends it), a typed prompt
+(`UserPromptSubmit`) for everything. One session can run in two Claude Code
+processes (`claude --resume` elsewhere): each process's hooks and session
+file speak only for its own items, a process is the same one only while its
+start time matches (a reused PID is not), and an item whose process is unknown
+closes only when every running copy of the session agrees. A "No" or Esc fires no hook, so the worker also reads every
+managed config home's `sessions/{pid}.json` twice a second: a session that
+left `waiting` after a prompt was recorded answered it (an idle item closes
+only on a typed prompt: a channel or background turn also leaves `idle`). With
+several prompts open in a session, a status that is `waiting` again when the
+grace ends closes none of them (queued dialogs: the one answered cannot be
+told from the one now shown); each closes on its own signal. A
+`permission_prompt` that finds the session not waiting publishes nothing only
+when that status was set after the dialog showed.
+Those closes wait 1.5 seconds,
+so that a quit or `/clear` right after them closes the item as
+`session_ended` instead. The session ending (`SessionEnd`, `/clear`, its
+session file gone, or its Claude Code process gone; the hook reports that
+process's ID) closes everything as `session_ended`. A turn that OpenSwap's own
+channel starts (a prompt beginning `<channel source="openswap"`) closes the
+main thread's permission and question items, not a subagent's that still waits
+and not the idle item, which replies settle, and
+a turn that a background task's result starts (`<task-notification>`) closes
+nothing: a subagent's prompt may still be waiting.
+Codex sends no such notification, so its items wait as Claude Code's do: an
+approval (`PermissionRequest`) is published once it has been open 6 seconds,
+and a finished turn (`Stop`) once 60 seconds pass without the owner typing on
+that thread. Codex runs `Stop` only for a thread the owner works in (a
+subagent gets `SubagentStop`, and Codex's own helper threads, such as its
+title writer and approval reviewer, run no hooks). An approval no person is
+asked for opens nothing: with `approval_policy = "never"`, or when the
+thread's `approvals_reviewer` (read from its session record's `turn_context`)
+is not `user`. A Codex approval closes as `answered_on_mac` on that call's
+`PostToolUse`, on `Stop`, `UserPromptSubmit` or `Interrupt` (Esc or "No") on
+the same thread, or when Codex's own log database (`logs_*.sqlite` in the
+Codex home) records an answer on that thread since the approval was asked
+(each logged answer closes one approval, the oldest asked before it, once);
+a finished turn closes on the thread's next `UserPromptSubmit`. A subagent's
+approval belongs to its own thread. Codex items close as `session_ended` with
+`SessionEnd` or when the Codex process that ran their hooks exits (Codex's
+shared app-server, which keeps a thread open after the terminal closes, the
+desktop app, or `codex exec`), and expire after 24 hours.
+Hooks run asynchronously and can arrive out of order, so each one carries the
+time it ran, which orders it against the others and against the session
+files' `statusUpdatedAt`. An idle item shows the last message of the latest
+turn only, never one from an earlier turn. Open items survive a worker restart
+(`worker/attention.json` under the backup root, owner-only) and are checked
+against the session files and Claude Code processes when it starts.
+
+#### Answering from the phone and watch
+
+A third switch, **Allow replies from my phone and watch** (off by default,
+set on this Mac only), lets the owner answer sessions started with `openswap
+claude [claude's own arguments]`. That command starts Claude Code with
+OpenSwap's channel: it passes a `--mcp-config` file in OpenSwap's support
+folder (`worker/channel-mcp.json`) naming `openswap attention channel`, and
+names it with `--dangerously-load-development-channels server:openswap`, so
+Claude Code asks to confirm the channel at each start while channels are a
+research preview. Nothing is installed into a config home for the channel, so
+it exists only in those sessions. Team and Enterprise organizations must turn
+channels on (the command says so when this Mac's managed settings turn them
+off); with them off, notices still work. Settings shows the command line to
+alias `claude` to.
+
+The channel is a stdio MCP server with no SDK: it never offers
+`server/discover` and answers `initialize` with MCP revision 2025-11-25, with
+the channel and permission-relay capabilities. It registers on a long-lived
+connection to the worker's socket. The worker accepts it only when the
+connecting process, started as `<openswap> attention channel`, is a direct
+child of a Claude Code process started with the channel named
+(`--dangerously-load-development-channels` or `--channels`) whose
+`sessions/{pid}.json` is in a managed config home. The first such channel of
+that Claude Code process holds it (by PID and start time, kept across worker
+restarts). Another process asking for it while the holder runs (another MCP
+server, a command the session ran, whatever its command line says) cannot be
+told from the real one, so that Claude Code process gets no replies for the
+rest of its life, and Settings says why. A new channel takes over only once
+the holder's process is gone: `/mcp` → Reconnect starts a new channel process,
+and Claude Code 2.1.311 relays the next prompt to it and obeys its verdict
+(measured). A refused channel asks again every 3 seconds. The session is read
+from that file at each use, so `/clear` moves it. Permission prompts the
+channel relays, verdicts and messages travel only on that connection; a
+verdict goes only to the channel that relayed its prompt, while its process
+still holds the session.
+
+What each item takes, while replies are on, and only while nothing but the
+item's own Claude Code process has been seen for its session since it opened
+(a hook of another process or of an unknown one, another process's session
+file: `claude --resume` in a second terminal, a headless run), checked again
+at delivery. The Mac takes a reply only for an action the last report the
+backend accepted offered for that item, and an item is never offered `allow`
+or `answer` in a report that leaves out the detail showing its call or its
+questions (details off, or the detail cut for size):
+
+- A permission prompt takes `deny`, and `allow` while details are on (the
+  phone then shows the call as Claude Code previews it to the channel). It
+  takes either only when the channel's request is provably that very call:
+  the same tool, the same input (the hook compares a digest of Claude Code's
+  preview format, and only for a preview Claude Code did not cut, mask or
+  normalize), within 5 seconds, and no other waiting prompt or request with
+  the same preview. Anything else stays a notice, so Allow never approves a
+  call other than the one shown.
+- A question takes `answer` while exactly one synchronous hook waits for that
+  very question (the one Claude Code ran with it), and only when every
+  question and option is sent whole (none past the caps, cut or cleaned to
+  nothing) while details are on. Any command a session runs can connect as a
+  question hook; it gains nothing (a second one only keeps the question from
+  taking an answer), and at most 4 wait per Claude Code process. That hook
+  (`openswap attention question`, a `PermissionRequest` hook on
+  `AskUserQuestion` with a 600-second timeout) is installed in every managed
+  config home only while replies are on. It is served only in a session whose
+  Claude Code process holds a channel registration and whose session file
+  names its session; anywhere else it exits at once and leaves the dialog to
+  the owner. It gives Claude Code the chosen options, or nothing when the
+  question closes, the wait passes about 10 minutes or the worker is gone.
+- An idle session takes `message`, which arrives as a channel event the
+  channel's instructions describe as the owner's message from the paired
+  device. It is handed over only while the session file says `idle` with no
+  turn since the item opened: otherwise `refused` (the owner typed, a turn
+  runs or a dialog waits). A turn that ends while the session stays idle (a
+  background task's result) closes the item as `superseded` and opens a new
+  one, which takes messages; a reply to the old one gets `item_closed`.
+
+Before handing a verdict or an answer over, the worker reads the session file:
+a prompt that is no longer waiting was answered at the Mac (`item_closed`).
+It saves the record that the reply was handled first, and refuses the reply
+when that save fails; a reply arriving after the saved state had to be set
+aside at start is refused too. `sent` is reported only once the channel or
+the question hook took the reply; one that never got there (the hook left,
+the send failed) settles as `refused` (`item_closed` if the item closed) and
+the item takes a reply again. A reply a worker restart left between the two
+is never reported `refused` or `item_closed` (it may have landed), and its
+item takes no other reply until it closes. A
+reply counts as `applied` only on the session's own signal for it: the
+dialog closing within 2 seconds of the verdict as an approval or a decline, the
+call's `PostToolUse` or `PostToolUseFailure` after an allow, the `Stop` that
+follows a channel deny (a "No" at the Mac fires none), a subagent's next call
+after a deny of its prompt, a `PostToolUse` carrying the chosen options, or
+the channel turn carrying the message's own token. Otherwise the item closes
+with its usual reason and the reply stays `sent`.
+
+Always sent: the kind, the provider, a session label, the time and an opaque
+folder ID. With details on, also the folder's name (an approved Remote tasks
+folder's label is always sent), the tool name and, for `Bash`, the model's own
+description of the command (never the command itself; for a prompt that takes
+replies, Claude Code's own preview of the call, which shows the command), a question with its
+header and option labels, and the first 1,000 characters of the session's
+last message. Never sent: prompts the owner typed, transcripts, account data
+or a tool's raw input.
 
 `worker status --json` includes `remote_connectivity` and
 `remote_last_seen_at`; `last_seen_at` remains the local process heartbeat.

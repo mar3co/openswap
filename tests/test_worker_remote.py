@@ -756,7 +756,8 @@ def test_live_transport_maps_reference_server_statuses(tmp_path):
     ((200, {}, b'{"worker_epoch":NaN}'), ("invalid_response", 400)),
     ((409, {}, b'{"error":"vendor_specific_text"}'), ("service_unavailable", 409)),
     ((409, {}, b'{"error":"artifact_conflict"}'), ("artifact_conflict", 409)),
-    ((503, {}, b""), ("invalid_response", 400)),
+    ((503, {}, b""), ("service_unavailable", 503)),  # not the service's own error body: its status still counts
+    ((413, {}, b"<html>413 Request Entity Too Large</html>"), ("service_unavailable", 413)),
     ((400, {}, b'{"error":"invalid_request"}'), ("invalid_request", 400)),
 ])
 def test_live_transport_refuses_unsafe_responses(reply, expected):
