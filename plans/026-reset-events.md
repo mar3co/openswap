@@ -1,6 +1,6 @@
 # OpenSwap feature proposal: reset events for people, webhooks and OpenTag routines
 
-Status: PROPOSED 2026-11-07. Extends kickoff (the 5-hour start timer) and
+Status: ACCEPTED 2026-11-07 with every call in Decisions. Extends kickoff (the 5-hour start timer) and
 reuses plan 017's worker protocol, plan 022's pairing and plan 025's local
 handoff from other OpenSwap processes to the worker.
 
@@ -59,7 +59,7 @@ Code and Codex accounts alike):
 
 | Event | Meaning | When it fires |
 | --- | --- | --- |
-| `window.started` | A new 5-hour window's clock is running (5-hour only) | The first time a fresh fetch shows a `resets_at` later than the window OpenSwap last knew about. After a successful kickoff, OpenSwap requests one fetch for each account it kicked off, so `started` follows within moments with the real `resets_at`, never an estimate. |
+| `window.started` | A new 5-hour window's clock is running (5-hour only) | The first time a live reading shows a `resets_at` later than the window OpenSwap last knew about. After a kickoff this is the store's next fetch of that account, carrying the real `resets_at`, never an estimate. |
 | `window.ending_soon` | The window ends within the lead time and quota is left | Once per window, when `resets_at - now <= lead time` and the remaining percentage is at or above the destination's minimum. |
 | `window.reset` | The window ended and its quota is fresh | At the stored `resets_at`, without waiting for a fetch. For the weekly window this is also the start of the next window: weekly limits roll on a fixed 7-day schedule (see `_rolled_weekly_window`, `menubar_display.py`), so `reset` is the only weekly boundary event. A 5-hour window has no schedule, so after its `reset` the next window starts only on the account's next request, and that start is reported as a separate `started`. |
 
@@ -73,13 +73,15 @@ first request, which OpenSwap sees only at its next usage fetch. The event
 says when OpenSwap observed it (`observed_at`) as well as the window's
 `resets_at`, so the start can be derived as `resets_at - window length`.
 
-**Staleness.** Usage fetches are rationed, and a rate-limited account can
-show last-known-good numbers for up to about an hour. When `ending_soon` is due
-and the account's numbers are older than 15 minutes, OpenSwap requests one
-fresh fetch and fires with its result. If that fetch fails, it fires anyway
-with the old numbers. Either way the payload's `measured_at` says how old the
-numbers are. That costs at most one extra fetch per account per window.
-`started` never fires from a last-known-good entry, only from a fresh fetch.
+**Staleness.** Usage fetches are rationed by the usage store: every
+surface, including an explicit refresh, is capped by its serve TTL (180 s) and
+per-account poll plans (`snapshot_source.py`, `usage_store.reserve`), so the
+extra has no supported way to force a fetch, and adding one would spend the
+budget plan 002's pacing protects. Revised 2026-11-07 when planning S1 (this
+supersedes the earlier "request one fresh fetch" call): `ending_soon` fires
+with the freshest numbers the store has and never forces a fetch. The
+payload's `measured_at` says how old they are. `started` fires only from a
+live reading (never last-known-good), at the store's next natural fetch.
 
 Each `(account, window, resets_at, event)` fires at most once. That must
 survive an app restart: a restart must not re-send `ending_soon` for the
@@ -203,11 +205,11 @@ Calls made in design (owner may override):
   turns it on.
 - No weekly `started`. Weekly `reset` is that moment, and firing both would
   double every weekly event.
-- After kickoff, request one fetch per kicked-off account, so `started`
+- `started` after kickoff waits for the store's next natural fetch, so it
   carries the real `resets_at` (an estimate would not match the fetched value
-  and would fire twice).
-- `ending_soon` refreshes numbers older than 15 minutes with one fetch, and
-  every payload says when its numbers were measured.
+  and would fire twice). No forced fetch (see Staleness).
+- `ending_soon` uses the freshest stored numbers, and every payload says when
+  they were measured.
 - Deterministic event `id` across Macs, with OpenTag deduping per owner.
 - Per-model weekly limits are payload context, not events.
 - OpenTag delivery has the same no-queue rule as webhooks.
