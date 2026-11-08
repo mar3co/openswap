@@ -881,6 +881,44 @@ def test_settings_page_reset_events_hint_reports_unreadable_config_and_paused_st
     )
 
 
+def test_settings_page_reset_events_hint_shows_a_failed_delivery_alongside_notices(tmp_path):
+    from openswap.reset_events import Destination
+
+    mac = Destination(id="mac", kind="mac", enabled=False)
+    hook = Destination(id="h1", kind="webhook", enabled=True, url="https://x.test", last_error="HTTP 500")
+
+    _, by_id = _reset_event_rows([mac, hook], save_error="disk full")
+    assert by_id["reset_events_webhooks"]["label"] == (
+        "Reset events are paused: can't save their state (disk full) · last delivery failed"
+    )
+
+
+def test_settings_page_reset_events_hint_reports_a_failed_pass_and_a_reset_state():
+    from openswap.reset_events import Destination
+
+    mac = Destination(id="mac", kind="mac", enabled=True)
+
+    _, by_id = _reset_event_rows([mac], pass_error="RuntimeError: boom")
+    assert by_id["reset_events_webhooks"]["label"] == "Reset events paused: RuntimeError: boom"
+
+    _, by_id = _reset_event_rows([mac], state_reset=True)
+    assert by_id["reset_events_webhooks"]["label"] == (
+        "Reset events state was unreadable and was reset"
+    )
+
+
+def test_settings_page_reset_events_reports_unavailable_settings_instead_of_defaults():
+    rows = menubar.settings_page_rows(
+        menubar.MenuBarSettings(), strategy="best", threshold=90,
+        reset_events={"unavailable": "PermissionError: denied"},
+    )
+    by_id = {row["id"]: row for row in rows}
+    assert "reset_events_mac" not in by_id
+    assert by_id["reset_events_webhooks"]["label"] == (
+        "Reset events settings unavailable: PermissionError: denied"
+    )
+
+
 def _reset_events_app(tmp_path, *, delivered, notified, logged, save_state=None):
     from openswap import reset_events
     from tests.menubar_harness import extract_class
@@ -895,7 +933,7 @@ def _reset_events_app(tmp_path, *, delivered, notified, logged, save_state=None)
             (dest.id, json.loads(body), json.loads((tmp_path / "reset_events_state.json").read_text()))
         ),
         **{name: getattr(reset_events, name) for name in (
-            "CONFIG_FILENAME", "FiredState", "detect",
+            "CONFIG_FILENAME", "CORRUPT_STATE_FILENAME", "STATE_FILENAME", "FiredState", "detect",
             "load_destinations_checked", "load_state_checked", "payload",
             "readings_from_snapshot", "save_state", "update_destinations",
             "with_delivery_result",
@@ -1052,6 +1090,74 @@ def test_reset_events_pass_skips_delivery_and_logs_once_while_state_cannot_be_sa
     assert [d[0] for d in delivered] == ["h1"]
     assert app._reset_events_settings()["save_error"] == ""
     assert len(logged) == 1
+
+
+def test_reset_events_pass_moves_a_corrupt_state_aside_and_notes_it_until_the_next_pass(tmp_path):
+    state_path = tmp_path / "reset_events_state.json"
+    corrupt = tmp_path / "reset_events_state.corrupt.json"
+    corrupt.write_text("older")
+    state_path.write_text("{oops")
+    logged = []
+    app = _reset_events_app(tmp_path, delivered=[], notified=[], logged=logged)
+    app.snapshot = _ending_soon_snapshot()
+
+    _rerun(app)
+    assert corrupt.read_text() == "{oops"
+    assert isinstance(json.loads(state_path.read_text()), dict)
+    assert app._reset_events_settings()["state_reset"] is True
+    assert len(logged) == 1 and str(corrupt) in logged[0][-1]
+
+    _rerun(app)
+    assert app._reset_events_settings()["state_reset"] is False
+    assert len(logged) == 1
+
+
+def test_reset_events_pass_failure_is_logged_once_and_shown_until_a_pass_succeeds(tmp_path):
+    logged = []
+    app = _reset_events_app(tmp_path, delivered=[], notified=[], logged=logged)
+    app.snapshot = None
+
+    for _ in range(3):
+        _rerun(app)
+    assert len(logged) == 1
+    assert app._reset_events_settings()["pass_error"].startswith("AttributeError: ")
+
+    app.snapshot = _ending_soon_snapshot()
+    _rerun(app)
+    assert app._reset_events_settings()["pass_error"] == ""
+    assert len(logged) == 1
+
+
+def test_reset_events_pass_skips_a_malformed_row_and_logs_it_once(tmp_path):
+    from openswap.reset_events import Destination, save_destinations
+
+    save_destinations(tmp_path, [Destination(id="h1", kind="webhook", enabled=True, url="https://x.test/h")])
+    delivered, logged = [], []
+    app = _reset_events_app(tmp_path, delivered=delivered, notified=[], logged=logged)
+    app.snapshot = _ending_soon_snapshot()
+    app.snapshot["accounts"].insert(0, (2, "broken@example.com"))
+
+    for _ in range(2):
+        _rerun(app)
+    assert [d[0] for d in delivered] == ["h1"]
+    assert len(logged) == 1
+    assert app._reset_events_settings()["pass_error"] == ""
+
+
+def test_reset_events_save_failure_clears_once_nothing_is_pending(tmp_path):
+    def failing_save(root, state, now=None):
+        raise OSError("disk full")
+
+    logged = []
+    app = _reset_events_app(tmp_path, delivered=[], notified=[], logged=logged, save_state=failing_save)
+    app.snapshot = _ending_soon_snapshot()
+
+    _rerun(app)
+    assert app._reset_events_settings()["save_error"] == "disk full"
+
+    app.snapshot = {"accounts": [], "identities": {}}
+    _rerun(app)
+    assert app._reset_events_settings()["save_error"] == ""
 
 
 def test_reset_events_writes_never_clobber_an_unreadable_config(tmp_path):

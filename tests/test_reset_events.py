@@ -395,8 +395,9 @@ def test_readings_skip_rows_without_usage():
                        "codex:1": ("c@example.com", "")},
     }
 
-    got = readings_from_snapshot(snapshot)
+    got, problem = readings_from_snapshot(snapshot)
 
+    assert problem is None
     assert got == [
         AccountReading(provider="claude", email="b@example.com", org_uuid="org-2",
                        label="b@example.com", org_name="", is_active=False, live=False,
@@ -738,3 +739,19 @@ def test_update_destinations_skips_the_write_when_nothing_changed(tmp_path):
     update_destinations(tmp_path, lambda dests: list(dests))
 
     assert config.read_text() == before
+
+
+def test_readings_skip_a_malformed_row_and_report_it():
+    good = {"five_hour": {"pct": 10.0, "resets_at": _iso(T)}}
+    snapshot = {
+        "accounts": [
+            ("1", "a@example.com", True),
+            ("2", "b@example.com", False, good, None, None, "", False, T - 30),
+        ],
+        "identities": {"2": ("b@example.com", "org-2")},
+    }
+
+    got, problem = readings_from_snapshot(snapshot)
+
+    assert [r.email for r in got] == ["b@example.com"]
+    assert problem is not None

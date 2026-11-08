@@ -6,6 +6,7 @@ status item stays a short title; this panel is what opens on click.
 
 from __future__ import annotations
 
+import logging
 import time
 from functools import lru_cache
 from pathlib import Path
@@ -2426,8 +2427,9 @@ class MenuBarPanel:
             bundled_widget = False
         try:
             reset_events = self._reset_events()
-        except Exception:
-            reset_events = None
+        except Exception as e:
+            logging.getLogger("openswap").warning("reset events settings failed", exc_info=True)
+            reset_events = {"unavailable": f"{type(e).__name__}: {e}"}
         rows = settings_page_rows(
             settings,
             strategy=strategy,

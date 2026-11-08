@@ -1240,34 +1240,50 @@ def settings_page_rows(
 
 def reset_events_settings_rows(
     destinations: list = (), unreadable_config=None, save_error: str = "",
+    pass_error: str = "", state_reset: bool = False, unavailable: str = "",
 ) -> list[dict]:
     """Automation › Reset events, from the destinations in ``reset_events.json``.
 
     ``unreadable_config`` is that file's path when part of it could not be
-    read; ``save_error`` is set while the fired state can't be saved."""
-    mac_enabled = any(d.kind == "mac" and d.enabled for d in destinations)
-    webhooks = [d for d in destinations if d.kind == "webhook"]
-    notices = []
-    if save_error:
-        notices.append(f"Reset events are paused: can't save their state ({save_error})")
-    if unreadable_config:
-        notices.append(f"Reset events config can't be read: fix or remove {unreadable_config}")
-    if notices:
-        hint = " · ".join(notices)
-    elif webhooks:
-        hint = f"{len(webhooks)} webhook(s) · manage with openswap events"
-        if any(d.last_error for d in webhooks):
-            hint += " · last delivery failed"
-    else:
-        hint = "Send events to your own automations with openswap events add-webhook"
-    return [
+    read; ``save_error`` is set while the fired state can't be saved;
+    ``pass_error`` while the event pass itself fails; ``state_reset`` after an
+    unreadable fired state was moved aside; ``unavailable`` when these
+    settings could not be gathered at all, which replaces the toggle."""
+    rows = [
         {"kind": "group", "style": "section", "section": SETTINGS_SECTION_AUTOMATION,
          "id": "group_reset_events", "label": "Reset events"},
-        {"kind": "toggle", "section": SETTINGS_SECTION_AUTOMATION,
-         "id": "reset_events_mac", "label": "Notify on this Mac", "value": mac_enabled},
+    ]
+    if unavailable:
+        hint = f"Reset events settings unavailable: {unavailable}"
+    else:
+        rows.append(
+            {"kind": "toggle", "section": SETTINGS_SECTION_AUTOMATION, "id": "reset_events_mac",
+             "label": "Notify on this Mac",
+             "value": any(d.kind == "mac" and d.enabled for d in destinations)},
+        )
+        webhooks = [d for d in destinations if d.kind == "webhook"]
+        notices = []
+        if pass_error:
+            notices.append(f"Reset events paused: {pass_error}")
+        if save_error:
+            notices.append(f"Reset events are paused: can't save their state ({save_error})")
+        if state_reset:
+            notices.append("Reset events state was unreadable and was reset")
+        if unreadable_config:
+            notices.append(f"Reset events config can't be read: fix or remove {unreadable_config}")
+        if not notices:
+            notices.append(
+                f"{len(webhooks)} webhook(s) · manage with openswap events" if webhooks
+                else "Send events to your own automations with openswap events add-webhook"
+            )
+        if any(d.last_error for d in webhooks):
+            notices.append("last delivery failed")
+        hint = " · ".join(notices)
+    rows.append(
         {"kind": "group", "style": "hint", "section": SETTINGS_SECTION_AUTOMATION,
          "id": "reset_events_webhooks", "label": hint, "lines": _hint_lines(hint)},
-    ]
+    )
+    return rows
 
 
 OPEN_AT_LOGIN_MOVE_HINT = "Move OpenSwap to Applications to open it at login."

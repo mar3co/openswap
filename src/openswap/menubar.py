@@ -180,6 +180,8 @@ def run(switcher, codex=None) -> int:
     from openswap.claude_desktop_menu import ClaudeDesktopMenu, has_saved_profiles
     from openswap.reset_events import (
         CONFIG_FILENAME,
+        CORRUPT_STATE_FILENAME,
+        STATE_FILENAME,
         FiredState,
         detect,
         load_destinations_checked,
@@ -4175,18 +4177,25 @@ def run(switcher, codex=None) -> int:
             self._reset_events_at = started
             try:
                 self._fire_reset_events()
-            except Exception:
-                self.switcher._logger.warning("reset events pass failed", exc_info=True)
+            except Exception as e:
+                self._note_reset_events_condition("pass failed", f"{type(e).__name__}: {e}", exc_info=True)
+            else:
+                self._note_reset_events_condition("pass failed", None)
 
         def _fire_reset_events(self):
             root = self.switcher.backup_dir
             now = time.time()
             state, state_problem = load_state_checked(root)
-            self._note_reset_events_condition("state unreadable", state_problem)
+            if state_problem:
+                corrupt = root / CORRUPT_STATE_FILENAME
+                (root / STATE_FILENAME).replace(corrupt)
+                self._note_reset_events_condition("state reset", f"{state_problem}; moved it to {corrupt}")
             dests, config_problem = load_destinations_checked(root)
             self._note_reset_events_condition("config unreadable", config_problem)
+            readings, readings_problem = readings_from_snapshot(self.snapshot)
+            self._note_reset_events_condition("account rows skipped", readings_problem)
             before = FiredState(dict(state.windows), dict(state.sent), dict(state.emitted))
-            fired = detect(readings_from_snapshot(self.snapshot), dests, state, now)
+            fired = detect(readings, dests, state, now)
             # Saved before delivery so a crash mid-delivery never repeats an event.
             if state != before:
                 try:
@@ -4194,7 +4203,9 @@ def run(switcher, codex=None) -> int:
                 except OSError as e:
                     self._note_reset_events_condition("state not saved", str(e))
                     return
-                self._note_reset_events_condition("state not saved", None)
+            self._note_reset_events_condition("state not saved", None)
+            if not state_problem:
+                self._note_reset_events_condition("state reset", None)
             for dest, event in fired:
                 try:
                     if dest.kind == "mac":
@@ -4207,14 +4218,16 @@ def run(switcher, codex=None) -> int:
                         "reset event %s to %s failed", event.type, dest.id, exc_info=True
                     )
 
-        def _note_reset_events_condition(self, name: str, problem: str | None) -> None:
+        def _note_reset_events_condition(
+            self, name: str, problem: str | None, *, exc_info: bool = False,
+        ) -> None:
             """Log ``problem`` once per change, not on every 15 s pass."""
             if self._reset_events_conditions.get(name) == problem:
                 return
             self._reset_events_conditions[name] = problem
             self._dirty = True
             if problem:
-                self.switcher._logger.warning("reset events %s: %s", name, problem)
+                self.switcher._logger.warning("reset events %s: %s", name, problem, exc_info=exc_info)
 
         def _reset_events_settings(self) -> dict:
             root = self.switcher.backup_dir
@@ -4223,6 +4236,8 @@ def run(switcher, codex=None) -> int:
                 "destinations": dests,
                 "unreadable_config": root / CONFIG_FILENAME if problem else None,
                 "save_error": self._reset_events_conditions.get("state not saved") or "",
+                "pass_error": self._reset_events_conditions.get("pass failed") or "",
+                "state_reset": bool(self._reset_events_conditions.get("state reset")),
             }
 
         def _record_reset_event_delivery(self, dest_id: str, error: str):

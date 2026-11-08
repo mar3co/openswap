@@ -63,8 +63,7 @@ def validate_webhook_url(url: str) -> str | None:
         return "Webhook URL can't contain spaces or control characters."
     try:
         parts = urlsplit(url)
-        host = parts.hostname
-        parts.port
+        host, _port = parts.hostname, parts.port
     except ValueError:
         return "Webhook URL is not valid."
     if parts.scheme not in ("http", "https"):

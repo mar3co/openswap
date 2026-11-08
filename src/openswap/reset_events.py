@@ -26,6 +26,7 @@ KINDS = ("mac", "webhook")
 
 CONFIG_FILENAME = "reset_events.json"
 STATE_FILENAME = "reset_events_state.json"
+CORRUPT_STATE_FILENAME = "reset_events_state.corrupt.json"
 SENT_RETENTION_S = 8 * 86400
 WEEK_S = 7 * 86400
 MAX_LEAD_S = 30 * 86400
@@ -344,29 +345,39 @@ class ResetEvent:
         return "evt_" + hashlib.sha256(raw.encode()).hexdigest()[:24]
 
 
-def readings_from_snapshot(snapshot: dict) -> list[AccountReading]:
+def _reading_from_row(row, identities: dict) -> AccountReading | None:
+    num, email, is_active, display, last_good, alias, org_name, _disabled, fetched_at = row
+    live = isinstance(display, dict)
+    usage = display if live else last_good if isinstance(last_good, dict) else None
+    if usage is None:
+        return None
+    _, org_uuid = identities.get(str(num)) or ("", "")
+    return AccountReading(
+        provider="codex" if str(num).startswith("codex:") else "claude",
+        email=email,
+        org_uuid=org_uuid,
+        label=alias or email,
+        org_name=org_name or "",
+        is_active=bool(is_active),
+        live=live,
+        usage=usage,
+        fetched_at=fetched_at,
+    )
+
+
+def readings_from_snapshot(snapshot: dict) -> tuple[list[AccountReading], str | None]:
+    """The readings, and why any malformed account row was skipped."""
     identities = snapshot.get("identities") or {}
-    readings = []
-    for num, email, is_active, display, last_good, alias, org_name, _disabled, fetched_at in (
-        snapshot.get("accounts") or []
-    ):
-        live = isinstance(display, dict)
-        usage = display if live else last_good if isinstance(last_good, dict) else None
-        if usage is None:
+    readings, skipped = [], []
+    for row in snapshot.get("accounts") or []:
+        try:
+            reading = _reading_from_row(row, identities)
+        except (TypeError, ValueError) as e:
+            skipped.append(f"skipped a malformed account row ({e})")
             continue
-        _, org_uuid = identities.get(str(num)) or ("", "")
-        readings.append(AccountReading(
-            provider="codex" if str(num).startswith("codex:") else "claude",
-            email=email,
-            org_uuid=org_uuid,
-            label=alias or email,
-            org_name=org_name or "",
-            is_active=bool(is_active),
-            live=live,
-            usage=usage,
-            fetched_at=fetched_at,
-        ))
-    return readings
+        if reading is not None:
+            readings.append(reading)
+    return readings, "; ".join(skipped) or None
 
 
 def _scoped(usage: dict) -> tuple[dict, ...]:
