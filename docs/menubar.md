@@ -133,7 +133,7 @@ A slot that newly becomes re-login-needed toasts once (`personal signed out`) wh
 
 ## Reset events
 
-`reset_events.py` watches each account's 5-hour and weekly windows in the extra's snapshot and fires events to the destinations in `reset_events.json`; `reset_events_state.json` records what already fired, so a restart never repeats one. Destinations are the Mac notification (Settings › Automation › Reset events › **Notify on this Mac**, off by default) and any number of webhooks, managed with `openswap events`. Each destination has its own filter: accounts, windows, events, the ending-soon lead time (30 minutes for 5-hour, 3 hours for weekly) and the ending-soon minimum left (20%).
+`reset_events.py` watches each account's 5-hour and weekly windows in the extra's snapshot and fires events to the destinations in `reset_events.json`; `reset_events_state.json` records what already fired, so a restart never repeats one. Destinations are the Mac notification (Settings › Automation › Reset events › **Notify on this Mac**, off by default) and any number of webhooks, managed with `openswap events`. Each destination has its own filter: accounts, windows, events, the ending-soon lead time (30 minutes for 5-hour, 3 hours for weekly) and the ending-soon minimum left (20%). If part of `reset_events.json` can't be read, the menu bar keeps going with what it could read, the Settings hint names the file, and `openswap events list` exits 1; if `reset_events_state.json` can't be saved, events pause and the Settings hint shows the error.
 
 | Event | Meaning |
 | --- | --- |
@@ -162,7 +162,7 @@ Every webhook gets this JSON body in a `POST`. `id` is the same on every Mac for
 }
 ```
 
-Webhooks must use `https://` (`http://` only for `localhost`). Delivery makes three attempts (now, after 30 s, after another 60 s), 10 s each, then gives up and shows the error in `openswap events list`. Each request carries `OpenSwap-Signature: t=<unix>,v1=<hex HMAC-SHA256 of "<t>.<body>">`, keyed with the secret `add-webhook` printed (kept in the Keychain). Verify it on the raw body before parsing:
+Webhooks must use `https://` (`http://` only for `localhost`). Delivery makes three attempts (now, after 30 s, after another 60 s), 10 s each, then gives up and shows the error in `openswap events list`. Delivery is at most once: the state is saved before anything is sent, so an event still in flight when OpenSwap quits is not sent again after a restart. Events fire only while OpenSwap is running in the menu bar; a reset that passed while it was not running, or while the Mac was asleep, fires at the next pass if it is under 7 days old. Each request carries `OpenSwap-Signature: t=<unix>,v1=<hex HMAC-SHA256 of "<t>.<body>">`, keyed with the secret `add-webhook` printed (kept in the Keychain). Verify it on the raw body before parsing:
 
 ```python
 import hashlib, hmac, time

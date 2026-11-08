@@ -20,7 +20,7 @@ from dataclasses import asdict, dataclass, fields, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from openswap import pace, printer
+from openswap import oauth, pace, printer
 from openswap.exceptions import ClaudeSwitchError, CredentialReadError
 from openswap.kickoff import (
     KICKOFF_RETRY_BACKOFF_S,
@@ -1704,7 +1704,10 @@ def notification_copy_for_reset_event(event, now: float) -> NotificationCopy:
     window_name = _RESET_WINDOW_NAMES[event.window]
     remaining = 100 - event.used_pct
     if event.type == "window.started":
-        clock = datetime.fromtimestamp(event.resets_at).strftime("%-I:%M %p")
+        clock = oauth.reset_clock_string(
+            datetime.fromtimestamp(event.resets_at, timezone.utc),
+            datetime.fromtimestamp(now, timezone.utc),
+        )
         return NotificationCopy(
             title=f"{label}: 5-hour window started",
             body=f"{remaining:.0f}% left · resets {clock}",

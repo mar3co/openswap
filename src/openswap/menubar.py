@@ -4252,15 +4252,9 @@ def run(switcher, codex=None) -> int:
                 self._show_error(f"Couldn't change Mac notifications: {e}")
 
         def _resolve_mac_name(self):
-            try:
-                name = subprocess.run(
-                    ["scutil", "--get", "ComputerName"],
-                    capture_output=True, text=True, timeout=2,
-                ).stdout.strip()
-            except (OSError, subprocess.SubprocessError):
-                return
-            if name:
-                self._mac_name = name
+            from openswap.worker.connect import computer_name
+
+            self._mac_name = computer_name()
 
         def _run_kickoff(self):
             results: list[KickoffResult] = []

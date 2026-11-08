@@ -14,8 +14,8 @@ from openswap.reset_events import (
     AccountReading,
     Destination,
     DestinationsUnreadable,
-    FiredState,
     Filter,
+    FiredState,
     ResetEvent,
     detect,
     load_destinations,
@@ -361,7 +361,7 @@ def test_disabled_destination_gets_nothing():
 
 def test_account_filter_limits_events():
     other = reading(email="b@example.com")
-    state = FiredState(windows={f"{KEY}|five_hour": T, f"claude:b@example.com:org-1|five_hour": T},
+    state = FiredState(windows={f"{KEY}|five_hour": T, "claude:b@example.com:org-1|five_hour": T},
                        sent={})
 
     out = detect([reading(), other], [hook(accounts=(KEY,))], state, now=T + 1)
@@ -478,11 +478,14 @@ def test_partial_lead_s_filter_gets_defaults():
 
 def test_notification_copy_for_each_event_type():
     from openswap.menubar_display import notification_copy_for_reset_event
+    from openswap.oauth import reset_clock_string
 
     r = reading()
     started = ResetEvent("window.started", "five_hour", r, T, 38.0, ())
-    clock = datetime.fromtimestamp(T).strftime("%-I:%M %p")
-    copy = notification_copy_for_reset_event(started, T - 5 * 3600)
+    now = T - 5 * 3600
+    clock = reset_clock_string(datetime.fromtimestamp(T, timezone.utc),
+                               datetime.fromtimestamp(now, timezone.utc))
+    copy = notification_copy_for_reset_event(started, now)
     assert (copy.title, copy.body) == ("Work: 5-hour window started", f"62% left · resets {clock}")
 
     ending = ResetEvent("window.ending_soon", "seven_day", r, T, 61.0, ())

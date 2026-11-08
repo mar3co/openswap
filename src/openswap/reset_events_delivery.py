@@ -117,7 +117,10 @@ def deliver_async(
 
 
 def _run(dest, body, on_result, sleep, opener) -> None:
-    error = _deliver(dest, body, sleep, opener)
+    try:
+        error = _deliver(dest, body, sleep, opener)
+    except Exception as e:
+        error = f"{type(e).__name__}: {e}"
     try:
         on_result(dest.id, error)
     except Exception:

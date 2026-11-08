@@ -208,3 +208,14 @@ def test_failing_callback_is_logged(caplog):
     (record,) = [r for r in caplog.records if r.name == delivery.__name__]
     assert record.levelname == "WARNING" and "wh_1" in record.getMessage()
     assert "callback broke" in str(record.exc_info[1])
+
+
+def test_unexpected_delivery_exception_is_reported_as_the_result(monkeypatch):
+    def broken(_dest_id):
+        raise RuntimeError("keychain exploded")
+
+    monkeypatch.setattr(delivery, "get_secret", broken)
+    opener = FakeOpener()
+    results, _ = _deliver(opener, secret=None)
+    assert results == [("wh_1", "RuntimeError: keychain exploded")]
+    assert opener.requests == []
