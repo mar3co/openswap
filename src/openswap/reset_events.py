@@ -134,8 +134,8 @@ def _destination_from_json(raw) -> Destination:
         raise ValueError(f"bad id {dest_id!r}")
     if kind not in KINDS:
         raise ValueError(f"unknown kind {kind!r}")
-    if dest_id == "mac" and kind != "mac":
-        raise ValueError(f"id 'mac' is reserved for the mac destination, not {kind!r}")
+    if (dest_id == "mac") != (kind == "mac"):
+        raise ValueError(f"the mac destination must have id 'mac' (got id {dest_id!r}, kind {kind!r})")
     if not isinstance(enabled, bool):
         raise ValueError(f"bad enabled {enabled!r}")
     if not all(isinstance(v, str) for v in (url, last_error, last_failure)):

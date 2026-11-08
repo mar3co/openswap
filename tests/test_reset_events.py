@@ -121,6 +121,16 @@ def test_mac_destination_inserted_when_none_survives(tmp_path):
     assert load_destinations(tmp_path) == DEFAULT
 
 
+def test_mac_kind_reserved_for_mac_id(tmp_path):
+    _write_config(tmp_path, [
+        {"id": "other", "kind": "mac", "enabled": True},
+        {"id": "second", "kind": "mac", "enabled": True},
+    ])
+    dests, problem = load_destinations_checked(tmp_path)
+    assert dests == DEFAULT
+    assert problem is not None
+
+
 def test_duplicate_ids_keep_first(tmp_path):
     _write_config(tmp_path, [
         {"id": "mac", "kind": "mac", "enabled": False},
