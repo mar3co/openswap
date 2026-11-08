@@ -43,6 +43,9 @@ class Filter:
     lead_s: dict[str, int] = field(default_factory=_default_lead_s)
     min_left_pct: float = 20.0
 
+    def __post_init__(self):
+        object.__setattr__(self, "lead_s", _default_lead_s() | self.lead_s)
+
 
 @dataclass(frozen=True)
 class Destination:
@@ -58,6 +61,7 @@ class Destination:
 class FiredState:
     windows: dict[str, float]
     sent: dict[str, float]
+    emitted: dict[str, float] = field(default_factory=dict)
 
 
 def _default_destinations() -> list[Destination]:
@@ -106,7 +110,7 @@ def _filter_from_json(raw) -> Filter:
         accounts=_str_tuple(raw.get("accounts", list(default.accounts))),
         windows=_str_tuple(raw.get("windows", list(default.windows)), WINDOWS),
         events=_str_tuple(raw.get("events", list(default.events)), EVENT_TYPES),
-        lead_s=default.lead_s | {k: int(v) for k, v in lead_s.items()},
+        lead_s={k: int(v) for k, v in lead_s.items()},
         min_left_pct=float(min_left_pct),
     )
 
@@ -213,15 +217,20 @@ def _number_map(value) -> dict[str, float]:
 
 def load_state(root: Path) -> FiredState:
     raw = _read_object(root / STATE_FILENAME) or {}
-    return FiredState(windows=_number_map(raw.get("windows")), sent=_number_map(raw.get("sent")))
+    return FiredState(
+        windows=_number_map(raw.get("windows")),
+        sent=_number_map(raw.get("sent")),
+        emitted=_number_map(raw.get("emitted")),
+    )
 
 
 def save_state(root: Path, state: FiredState, now: float | None = None) -> None:
     cutoff = (time.time() if now is None else now) - SENT_RETENTION_S
     state.sent = {k: ts for k, ts in state.sent.items() if ts >= cutoff}
+    state.emitted = {k: ts for k, ts in state.emitted.items() if ts >= cutoff}
     atomic_write_json(
         root / STATE_FILENAME,
-        {"windows": dict(state.windows), "sent": dict(state.sent)},
+        {"windows": dict(state.windows), "sent": dict(state.sent), "emitted": dict(state.emitted)},
     )
 
 
@@ -333,8 +342,8 @@ def _window_events(reading: AccountReading, state: FiredState, now: float) -> li
             if window == "seven_day":
                 known += (int((now - known) // WEEK_S) + 1) * WEEK_S
                 state.windows[k] = known
-        if reading.live and ts > now and (known is None or ts > known):
-            if known is not None and window == "five_hour" and pct < 100:
+        if reading.live and ts > now and ts != known:
+            if known is not None and ts > known and window == "five_hour" and pct < 100:
                 events.append(ResetEvent("window.started", window, reading, ts, pct, scoped))
             state.windows[k] = ts
         if ts > now:
@@ -360,11 +369,20 @@ def detect(
     readings: list[AccountReading], dests: list[Destination], state: FiredState, now: float,
 ) -> list[tuple[Destination, ResetEvent]]:
     """Update window tracking in ``state`` and return each (destination, event)
-    not yet sent; records what it returns in ``state.sent``."""
+    not yet sent; records what it returns in ``state.sent``.
+
+    ``started`` and ``reset`` are moments: they go only to destinations that
+    match when first emitted, so a destination enabled later never gets a
+    days-old reset. ``ending_soon`` is tracked per destination instead,
+    since each destination has its own lead time."""
     enabled = [d for d in dests if d.enabled]
     out = []
     for reading in readings:
         for event in _window_events(reading, state, now):
+            if event.type != "window.ending_soon":
+                if event.id in state.emitted:
+                    continue
+                state.emitted[event.id] = now
             for dest in enabled:
                 sent_key = f"{dest.id}|{event.id}"
                 if sent_key not in state.sent and matches(dest, event, now):
@@ -387,8 +405,8 @@ def payload(event: ResetEvent, *, mac: str, now: float, test: bool = False) -> d
         "remaining_pct": round(100 - event.used_pct, 1),
         "is_active_account": r.is_active,
         "scoped_limits": list(event.scoped),
-        "measured_at": None if r.fetched_at is None else _iso_z(r.fetched_at),
-        "observed_at": _iso_z(now),
+        "measured_at": None if r.fetched_at is None else _iso_z(int(r.fetched_at)),
+        "observed_at": _iso_z(int(now)),
         "mac": mac,
     }
     if test:

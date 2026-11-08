@@ -157,6 +157,7 @@ def test_state_round_trip_prunes_sent_older_than_8_days(tmp_path):
     state = FiredState(
         windows={"claude:a@example.com:org-1|five_hour": now + 3600},
         sent={"mac|old": now - 9 * 86400, "mac|recent": now - 86400},
+        emitted={"evt_old": now - 9 * 86400, "evt_recent": now - 86400},
     )
 
     save_state(tmp_path, state, now=now)
@@ -164,6 +165,7 @@ def test_state_round_trip_prunes_sent_older_than_8_days(tmp_path):
 
     assert loaded.windows == state.windows
     assert loaded.sent == {"mac|recent": now - 86400}
+    assert loaded.emitted == {"evt_recent": now - 86400}
 
 
 def test_missing_or_corrupt_state_is_empty(tmp_path):
@@ -193,7 +195,6 @@ def reading(window_ts=T, pct=40.0, live=True, fetched_at=None, window="five_hour
 
 
 def hook(dest_id="h", enabled=True, **filter_kw):
-    filter_kw["lead_s"] = Filter().lead_s | filter_kw.get("lead_s", {})
     return Destination(id=dest_id, kind="webhook", enabled=enabled,
                        url="https://example.com/h", filter=Filter(**filter_kw))
 
@@ -397,7 +398,9 @@ def test_payload_shape():
     assert body["seconds_until_reset"] == 7200
     assert body["remaining_pct"] == 39.0
     assert body["measured_at"] == "2027-01-15T07:50:00Z"
-    assert body["observed_at"] == "2027-01-15T05:59:59.500000Z"
+    assert body["observed_at"] == "2027-01-15T05:59:59Z"
+    assert payload(replace(event, reading=reading(fetched_at=T - 600.7)), mac="m",
+                   now=T)["measured_at"] == "2027-01-15T07:49:59Z"
     assert body["scoped_limits"] == list(scoped)
     assert body["is_active_account"] is True
     assert payload(event, mac="m", now=T + 5, test=True)["test"] is True
@@ -422,3 +425,25 @@ def test_signature_header_matches_reference():
     expected = hmac.new(b"s", b"1700000000." + body, hashlib.sha256).hexdigest()
 
     assert signature_header("s", body, 1700000000) == f"t=1700000000,v1={expected}"
+
+
+def test_reset_not_delivered_to_destination_added_later():
+    state = FiredState(windows={f"{KEY}|five_hour": T}, sent={})
+
+    assert types(detect([reading(live=False)], [hook("h")], state, now=T + 1)) == ["window.reset"]
+    assert detect([reading(live=False)], [hook("h"), hook("new")], state, now=T + 3 * 86400) == []
+
+
+def test_weekly_anchor_moved_earlier_corrects_state_without_started():
+    k = f"{KEY}|seven_day"
+    state = FiredState(windows={k: T + WEEK}, sent={})
+
+    out = detect([reading(window_ts=T + WEEK - 3600, window="seven_day")],
+                 [hook(events=("window.started",))], state, now=T)
+
+    assert out == []
+    assert state.windows[k] == T + WEEK - 3600
+
+
+def test_partial_lead_s_filter_gets_defaults():
+    assert Filter(lead_s={"five_hour": 600}).lead_s == {"five_hour": 600, "seven_day": 10800}
