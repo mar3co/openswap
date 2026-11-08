@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -89,9 +90,9 @@ def _filter_from_json(raw) -> Filter:
     if not isinstance(raw, dict):
         raise ValueError("filter is not an object")
     default = Filter()
-    lead_s = raw.get("leadS", default.lead_s)
+    lead_s = raw.get("leadS", {})
     if not isinstance(lead_s, dict) or not all(
-        k in WINDOWS and _is_number(v) for k, v in lead_s.items()
+        k in WINDOWS and _is_number(v) and v >= 0 for k, v in lead_s.items()
     ):
         raise ValueError(f"bad leadS {lead_s!r}")
     min_left_pct = raw.get("minLeftPct", default.min_left_pct)
@@ -101,7 +102,7 @@ def _filter_from_json(raw) -> Filter:
         accounts=_str_tuple(raw.get("accounts", list(default.accounts))),
         windows=_str_tuple(raw.get("windows", list(default.windows)), WINDOWS),
         events=_str_tuple(raw.get("events", list(default.events)), EVENT_TYPES),
-        lead_s={k: int(v) for k, v in lead_s.items()},
+        lead_s=default.lead_s | {k: int(v) for k, v in lead_s.items()},
         min_left_pct=float(min_left_pct),
     )
 
@@ -115,6 +116,8 @@ def _destination_from_json(raw) -> Destination:
         raise ValueError(f"bad id {dest_id!r}")
     if kind not in KINDS:
         raise ValueError(f"unknown kind {kind!r}")
+    if dest_id == "mac" and kind != "mac":
+        raise ValueError(f"id 'mac' is reserved for the mac destination, not {kind!r}")
     if not isinstance(enabled, bool):
         raise ValueError(f"bad enabled {enabled!r}")
     if not isinstance(url, str) or not isinstance(last_error, str):
@@ -156,21 +159,46 @@ def load_destinations(root: Path) -> list[Destination]:
     if not isinstance(entries, list):
         _logger.warning("%s has no destinations list; using defaults", path)
         return _default_destinations()
-    dests = []
+    dests: list[Destination] = []
     for entry in entries:
         try:
-            dests.append(_destination_from_json(entry))
+            dest = _destination_from_json(entry)
+            if any(d.id == dest.id for d in dests):
+                raise ValueError(f"duplicate id {dest.id!r}")
         except ValueError as e:
             _logger.warning("Dropping reset-event destination in %s: %s", path, e)
+            continue
+        dests.append(dest)
+    if not any(d.kind == "mac" for d in dests):
+        dests = _default_destinations() + dests
     return dests
 
 
+def _config_lock(root: Path) -> FileLock:
+    return FileLock(root / "reset_events.lock")
+
+
+def _write_destinations(root: Path, dests: list[Destination]) -> None:
+    atomic_write_json(
+        root / CONFIG_FILENAME,
+        {"destinations": [_destination_to_json(d) for d in dests]},
+    )
+
+
 def save_destinations(root: Path, dests: list[Destination]) -> None:
-    with FileLock(root / "reset_events.lock"):
-        atomic_write_json(
-            root / CONFIG_FILENAME,
-            {"destinations": [_destination_to_json(d) for d in dests]},
-        )
+    with _config_lock(root):
+        _write_destinations(root, dests)
+
+
+def update_destinations(
+    root: Path, fn: Callable[[list[Destination]], list[Destination]],
+) -> list[Destination]:
+    """Load, transform, and save under one lock so concurrent writers never
+    overwrite each other's changes from a stale copy."""
+    with _config_lock(root):
+        dests = fn(load_destinations(root))
+        _write_destinations(root, dests)
+    return dests
 
 
 def _number_map(value) -> dict[str, float]:
