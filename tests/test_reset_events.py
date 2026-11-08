@@ -494,3 +494,78 @@ def test_notification_copy_for_each_event_type():
     reset = ResetEvent("window.reset", "five_hour", r, T, 0.0, ())
     copy = notification_copy_for_reset_event(reset, T + 10)
     assert (copy.title, copy.body) == ("Work: 5-hour reset", "Full quota available")
+
+
+FIVE_HOUR_BOUNDARY = "2026-10-30T02:20:00"
+SEVEN_DAY_BOUNDARY = "2026-11-04T04:00:00"
+
+
+def _api_reading(fraction, window="five_hour", boundary=FIVE_HOUR_BOUNDARY):
+    usage = {window: {"pct": 40.0, "resets_at": f"{boundary}.{fraction}+00:00"}}
+    return AccountReading(
+        provider="claude", email="a@example.com", org_uuid="org-1", label="Work", org_name="Acme",
+        is_active=True, live=True, usage=usage, fetched_at=None,
+    )
+
+
+@pytest.mark.parametrize("window, boundary", [
+    ("five_hour", FIVE_HOUR_BOUNDARY), ("seven_day", SEVEN_DAY_BOUNDARY),
+])
+def test_resets_at_microsecond_jitter_gives_no_started_and_one_ending_soon(window, boundary):
+    whole = datetime.fromisoformat(f"{boundary}+00:00").timestamp()
+    dests = [hook("one"), hook("two")]
+    state = empty_state()
+    out = []
+
+    for i, fraction in enumerate(("472302", "512000", "600000", "300000", "900000")):
+        out += detect([_api_reading(fraction, window, boundary)], dests, state,
+                      now=whole - 1200 + i * 60)
+
+    assert sorted((d.id, e.type) for d, e in out) == [
+        ("one", "window.ending_soon"), ("two", "window.ending_soon")]
+    assert state.windows == {f"{KEY}|{window}": whole}
+    assert out[0][1].resets_at_iso == f"{boundary}Z"
+
+
+def test_event_id_identical_for_fractions_of_the_same_boundary():
+    whole = datetime.fromisoformat(f"{FIVE_HOUR_BOUNDARY}+00:00").timestamp()
+
+    [(_, a)] = detect([_api_reading("472302")], [hook()], empty_state(), now=whole - 600)
+    [(_, b)] = detect([_api_reading("900000")], [hook()], empty_state(), now=whole - 600)
+
+    assert a.id == b.id
+
+
+def test_scoped_resets_at_truncated_to_whole_seconds():
+    scoped = [{"name": "Fable", "pct": 10.0, "resets_at": f"{SEVEN_DAY_BOUNDARY}.472466+00:00"}]
+    state = FiredState(windows={f"{KEY}|five_hour": T}, sent={})
+
+    [(_, event)] = detect([reading(scoped=scoped)], [hook()], state, now=T + 1)
+
+    assert event.scoped[0]["resets_at"] == f"{SEVEN_DAY_BOUNDARY}Z"
+
+
+@pytest.mark.parametrize("usage", [
+    {"five_hour": {"pct": 0}, "seven_day": {"pct": 0}},
+    {},
+])
+def test_reset_fires_when_reading_has_no_resets_at(usage):
+    state = FiredState(windows={f"{KEY}|five_hour": T, f"{KEY}|seven_day": T}, sent={})
+    idle = replace(reading(), usage=usage)
+
+    out = detect([idle], [hook()], state, now=T + 1)
+
+    assert sorted((e.type, e.window, e.resets_at) for _, e in out) == [
+        ("window.reset", "five_hour", T), ("window.reset", "seven_day", T)]
+    assert state.windows[f"{KEY}|seven_day"] == T + WEEK
+
+
+def test_five_hour_anchor_moved_earlier_corrects_state_without_started():
+    k = f"{KEY}|five_hour"
+    state = FiredState(windows={k: T + 5 * 3600}, sent={})
+
+    out = detect([reading(window_ts=T + 4 * 3600)], [hook(events=("window.started",))],
+                 state, now=T)
+
+    assert out == []
+    assert state.windows[k] == T + 4 * 3600

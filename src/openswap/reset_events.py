@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from openswap.locking import FileLock
+from openswap.poll_policy import parse_reset_ts
 from openswap.settings import atomic_write_json
 
 _logger = logging.getLogger(__name__)
@@ -276,13 +277,10 @@ def _iso_z(ts: float) -> str:
     return datetime.fromtimestamp(ts, timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _parse_ts(value) -> float | None:
-    if not isinstance(value, str):
-        return None
-    try:
-        return datetime.fromisoformat(value).timestamp()
-    except ValueError:
-        return None
+def _reset_ts(value) -> float | None:
+    """A ``resets_at`` in whole seconds: the API stamps per-request microseconds on it."""
+    ts = parse_reset_ts(value) if isinstance(value, str) else None
+    return None if ts is None else float(int(ts))
 
 
 @dataclass(frozen=True)
@@ -335,7 +333,7 @@ def _scoped(usage: dict) -> tuple[dict, ...]:
     for entry in usage.get("scoped") or []:
         if not isinstance(entry, dict) or not entry.get("name") or not _is_number(entry.get("pct")):
             continue
-        ts = _parse_ts(entry.get("resets_at"))
+        ts = _reset_ts(entry.get("resets_at"))
         out.append({
             "name": entry["name"],
             "used_pct": float(entry["pct"]),
@@ -348,13 +346,6 @@ def _window_events(reading: AccountReading, state: FiredState, now: float) -> li
     events = []
     scoped = _scoped(reading.usage)
     for window in WINDOWS:
-        data = reading.usage.get(window)
-        if not isinstance(data, dict) or not _is_number(data.get("pct")):
-            continue
-        ts = _parse_ts(data.get("resets_at"))
-        if ts is None:
-            continue
-        pct = float(data["pct"])
         k = f"{reading.key}|{window}"
         known = state.windows.get(k)
         if known is not None and known <= now:
@@ -363,8 +354,15 @@ def _window_events(reading: AccountReading, state: FiredState, now: float) -> li
             if window == "seven_day":
                 known += (int((now - known) // WEEK_S) + 1) * WEEK_S
                 state.windows[k] = known
+        data = reading.usage.get(window)
+        if not isinstance(data, dict) or not _is_number(data.get("pct")):
+            continue
+        ts = _reset_ts(data.get("resets_at"))
+        if ts is None:
+            continue
+        pct = float(data["pct"])
         if reading.live and ts > now and ts != known:
-            if known is not None and ts > known and window == "five_hour" and pct < 100:
+            if known is not None and ts > known + 60 and window == "five_hour" and pct < 100:
                 events.append(ResetEvent("window.started", window, reading, ts, pct, scoped))
             state.windows[k] = ts
         if ts > now:
@@ -393,9 +391,11 @@ def detect(
     not yet sent; records what it returns in ``state.sent``.
 
     ``started`` and ``reset`` are moments: they go only to destinations that
-    match when first emitted, so a destination enabled later never gets a
-    days-old reset. ``ending_soon`` is tracked per destination instead,
-    since each destination has its own lead time."""
+    match when first emitted, so a destination enabled later never gets an
+    earlier moment. A reset can still arrive up to 7 days late, after the
+    Mac was off or asleep, to the destinations enabled at that point.
+    ``ending_soon`` is tracked per destination instead, since each
+    destination has its own lead time."""
     enabled = [d for d in dests if d.enabled]
     out = []
     for reading in readings:
