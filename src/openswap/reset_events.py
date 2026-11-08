@@ -6,11 +6,14 @@ records what has already fired so a restart does not repeat an event.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 from openswap.locking import FileLock
@@ -25,6 +28,7 @@ KINDS = ("mac", "webhook")
 CONFIG_FILENAME = "reset_events.json"
 STATE_FILENAME = "reset_events_state.json"
 SENT_RETENTION_S = 8 * 86400
+WEEK_S = 7 * 86400
 
 
 def _default_lead_s() -> dict[str, int]:
@@ -219,3 +223,179 @@ def save_state(root: Path, state: FiredState, now: float | None = None) -> None:
         root / STATE_FILENAME,
         {"windows": dict(state.windows), "sent": dict(state.sent)},
     )
+
+
+@dataclass(frozen=True)
+class AccountReading:
+    provider: str
+    email: str
+    org_uuid: str
+    label: str
+    org_name: str
+    is_active: bool
+    live: bool
+    usage: dict | None
+    fetched_at: float | None
+
+    @property
+    def key(self) -> str:
+        return f"{self.provider}:{self.email}:{self.org_uuid}"
+
+
+def _iso_z(ts: float) -> str:
+    return datetime.fromtimestamp(ts, timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _parse_ts(value) -> float | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value).timestamp()
+    except ValueError:
+        return None
+
+
+@dataclass(frozen=True)
+class ResetEvent:
+    type: str
+    window: str
+    reading: AccountReading
+    resets_at: float
+    used_pct: float
+    scoped: tuple[dict, ...]
+
+    @property
+    def resets_at_iso(self) -> str:
+        return _iso_z(self.resets_at)
+
+    @property
+    def id(self) -> str:
+        r = self.reading
+        raw = f"{r.provider}|{r.email}|{r.org_uuid}|{self.window}|{self.resets_at_iso}|{self.type}"
+        return "evt_" + hashlib.sha256(raw.encode()).hexdigest()[:24]
+
+
+def readings_from_snapshot(snapshot: dict) -> list[AccountReading]:
+    identities = snapshot.get("identities") or {}
+    readings = []
+    for num, email, is_active, display, last_good, alias, org_name, _disabled, fetched_at in (
+        snapshot.get("accounts") or []
+    ):
+        live = isinstance(display, dict)
+        usage = display if live else last_good if isinstance(last_good, dict) else None
+        if usage is None:
+            continue
+        _, org_uuid = identities.get(str(num)) or ("", "")
+        readings.append(AccountReading(
+            provider="codex" if str(num).startswith("codex:") else "claude",
+            email=email,
+            org_uuid=org_uuid,
+            label=alias or email,
+            org_name=org_name or "",
+            is_active=bool(is_active),
+            live=live,
+            usage=usage,
+            fetched_at=fetched_at,
+        ))
+    return readings
+
+
+def _scoped(usage: dict) -> tuple[dict, ...]:
+    out = []
+    for entry in usage.get("scoped") or []:
+        if not isinstance(entry, dict) or not entry.get("name") or not _is_number(entry.get("pct")):
+            continue
+        ts = _parse_ts(entry.get("resets_at"))
+        out.append({
+            "name": entry["name"],
+            "used_pct": float(entry["pct"]),
+            "resets_at": None if ts is None else _iso_z(ts),
+        })
+    return tuple(out)
+
+
+def _window_events(reading: AccountReading, state: FiredState, now: float) -> list[ResetEvent]:
+    events = []
+    scoped = _scoped(reading.usage)
+    for window in WINDOWS:
+        data = reading.usage.get(window)
+        if not isinstance(data, dict) or not _is_number(data.get("pct")):
+            continue
+        ts = _parse_ts(data.get("resets_at"))
+        if ts is None:
+            continue
+        pct = float(data["pct"])
+        k = f"{reading.key}|{window}"
+        known = state.windows.get(k)
+        if known is not None and known <= now:
+            if now < known + WEEK_S:
+                events.append(ResetEvent("window.reset", window, reading, known, 0.0, scoped))
+            if window == "seven_day":
+                known += (int((now - known) // WEEK_S) + 1) * WEEK_S
+                state.windows[k] = known
+        if reading.live and ts > now and (known is None or ts > known):
+            if known is not None and window == "five_hour" and pct < 100:
+                events.append(ResetEvent("window.started", window, reading, ts, pct, scoped))
+            state.windows[k] = ts
+        if ts > now:
+            events.append(ResetEvent("window.ending_soon", window, reading, ts, pct, scoped))
+    return events
+
+
+def matches(dest: Destination, event: ResetEvent, now: float) -> bool:
+    f = dest.filter
+    if f.accounts and event.reading.key not in f.accounts:
+        return False
+    if event.window not in f.windows or event.type not in f.events:
+        return False
+    if event.type == "window.ending_soon":
+        return (
+            0 < event.resets_at - now <= f.lead_s[event.window]
+            and 100 - event.used_pct >= f.min_left_pct
+        )
+    return True
+
+
+def detect(
+    readings: list[AccountReading], dests: list[Destination], state: FiredState, now: float,
+) -> list[tuple[Destination, ResetEvent]]:
+    """Update window tracking in ``state`` and return each (destination, event)
+    not yet sent; records what it returns in ``state.sent``."""
+    enabled = [d for d in dests if d.enabled]
+    out = []
+    for reading in readings:
+        for event in _window_events(reading, state, now):
+            for dest in enabled:
+                sent_key = f"{dest.id}|{event.id}"
+                if sent_key not in state.sent and matches(dest, event, now):
+                    state.sent[sent_key] = now
+                    out.append((dest, event))
+    return out
+
+
+def payload(event: ResetEvent, *, mac: str, now: float, test: bool = False) -> dict:
+    r = event.reading
+    body = {
+        "id": event.id,
+        "type": event.type,
+        "provider": r.provider,
+        "account": {"label": r.label, "email": r.email, "org": r.org_name},
+        "window": event.window,
+        "resets_at": event.resets_at_iso,
+        "seconds_until_reset": max(0, int(event.resets_at - now)),
+        "used_pct": event.used_pct,
+        "remaining_pct": round(100 - event.used_pct, 1),
+        "is_active_account": r.is_active,
+        "scoped_limits": list(event.scoped),
+        "measured_at": None if r.fetched_at is None else _iso_z(r.fetched_at),
+        "observed_at": _iso_z(now),
+        "mac": mac,
+    }
+    if test:
+        body["test"] = True
+    return body
+
+
+def signature_header(secret: str, body: bytes, t: int) -> str:
+    digest = hmac.new(secret.encode(), f"{t}.".encode() + body, hashlib.sha256).hexdigest()
+    return f"t={t},v1={digest}"

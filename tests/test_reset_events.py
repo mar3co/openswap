@@ -1,18 +1,27 @@
-"""Tests for the reset-event config and fired-state files (reset_events.py)."""
+"""Tests for reset events: config and state files, detection, payload and signature."""
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 from dataclasses import replace
+from datetime import datetime, timezone
 
 from openswap.reset_events import (
+    AccountReading,
     Destination,
     FiredState,
     Filter,
+    ResetEvent,
+    detect,
     load_destinations,
     load_state,
+    payload,
+    readings_from_snapshot,
     save_destinations,
     save_state,
+    signature_header,
     update_destinations,
 )
 
@@ -161,3 +170,255 @@ def test_missing_or_corrupt_state_is_empty(tmp_path):
     assert load_state(tmp_path) == FiredState(windows={}, sent={})
     (tmp_path / "reset_events_state.json").write_text("{oops")
     assert load_state(tmp_path) == FiredState(windows={}, sent={})
+
+
+T = 1_800_000_000.0
+WEEK = 7 * 86400
+KEY = "claude:a@example.com:org-1"
+
+
+def _iso(ts):
+    return datetime.fromtimestamp(ts, timezone.utc).isoformat()
+
+
+def reading(window_ts=T, pct=40.0, live=True, fetched_at=None, window="five_hour",
+            email="a@example.com", scoped=None):
+    usage = {window: {"pct": pct, "resets_at": _iso(window_ts)}}
+    if scoped is not None:
+        usage["scoped"] = scoped
+    return AccountReading(
+        provider="claude", email=email, org_uuid="org-1", label="Work", org_name="Acme",
+        is_active=True, live=live, usage=usage, fetched_at=fetched_at,
+    )
+
+
+def hook(dest_id="h", enabled=True, **filter_kw):
+    filter_kw["lead_s"] = Filter().lead_s | filter_kw.get("lead_s", {})
+    return Destination(id=dest_id, kind="webhook", enabled=enabled,
+                       url="https://example.com/h", filter=Filter(**filter_kw))
+
+
+def empty_state():
+    return FiredState(windows={}, sent={})
+
+
+def types(results):
+    return [e.type for _, e in results]
+
+
+def test_first_observation_seeds_without_started():
+    state = empty_state()
+
+    assert detect([reading()], [hook()], state, now=T - 4 * 3600) == []
+    assert state.windows == {f"{KEY}|five_hour": T}
+
+
+def test_later_resets_at_from_live_reading_fires_started_once():
+    state = FiredState(windows={f"{KEY}|five_hour": T}, sent={})
+    later = T + 5 * 3600
+    now = T + 60
+
+    out = detect([reading(window_ts=later, pct=2.0)], [hook(events=("window.started",))], state, now)
+
+    assert len(out) == 1
+    event = out[0][1]
+    assert (event.type, event.window, event.resets_at, event.used_pct) == (
+        "window.started", "five_hour", later, 2.0)
+    assert state.windows[f"{KEY}|five_hour"] == later
+    assert detect([reading(window_ts=later, pct=2.0)], [hook(events=("window.started",))],
+                  state, now) == []
+
+
+def test_started_not_fired_for_weekly():
+    state = FiredState(windows={f"{KEY}|seven_day": T}, sent={})
+
+    out = detect([reading(window_ts=T + WEEK, window="seven_day")],
+                 [hook(events=("window.started",))], state, now=T - 60)
+
+    assert out == []
+    assert state.windows[f"{KEY}|seven_day"] == T + WEEK
+
+
+def test_started_never_from_last_known_good():
+    state = FiredState(windows={f"{KEY}|five_hour": T}, sent={})
+
+    out = detect([reading(window_ts=T + 5 * 3600, live=False)],
+                 [hook(events=("window.started",))], state, now=T - 60)
+
+    assert out == []
+    assert state.windows[f"{KEY}|five_hour"] == T
+
+
+def test_reset_fires_from_state_without_fetch():
+    state = FiredState(windows={f"{KEY}|five_hour": T}, sent={})
+
+    out = detect([reading(window_ts=T, live=False)], [hook()], state, now=T + 1)
+
+    assert types(out) == ["window.reset"]
+    assert out[0][1].resets_at == T
+    assert out[0][1].used_pct == 0
+    assert detect([reading(window_ts=T, live=False)], [hook()], state, now=T + 2) == []
+
+
+def test_reset_not_emitted_after_seven_days():
+    state = FiredState(windows={f"{KEY}|five_hour": T}, sent={})
+
+    assert detect([reading(window_ts=T, live=False)], [hook()], state, now=T + WEEK) == []
+
+
+def test_weekly_state_rolls_to_next_boundary_after_reset():
+    k = f"{KEY}|seven_day"
+    state = FiredState(windows={k: T}, sent={})
+
+    out = detect([reading(window_ts=T, window="seven_day", live=False)], [hook()], state, now=T + 1)
+
+    assert types(out) == ["window.reset"]
+    assert state.windows[k] == T + WEEK
+
+    state = FiredState(windows={k: T}, sent={})
+    assert detect([reading(window_ts=T, window="seven_day", live=False)], [hook()], state,
+                  now=T + 3 * WEEK + 5) == []
+    assert state.windows[k] == T + 4 * WEEK
+
+
+def test_sleep_past_reset_gives_reset_not_ending_soon():
+    state = FiredState(windows={f"{KEY}|five_hour": T}, sent={})
+
+    out = detect([reading(window_ts=T, live=False)], [hook(lead_s={"five_hour": 7200})],
+                 state, now=T + 3600)
+
+    assert types(out) == ["window.reset"]
+
+
+def test_ending_soon_respects_lead_and_min_left():
+    dest = hook(events=("window.ending_soon",), lead_s={"five_hour": 1800})
+    state = FiredState(windows={f"{KEY}|five_hour": T}, sent={})
+
+    assert detect([reading(pct=60.0)], [dest], state, now=T - 1900) == []
+    assert detect([reading(pct=85.0)], [dest], state, now=T - 1700) == []
+    out = detect([reading(pct=60.0)], [dest], state, now=T - 1700)
+
+    assert types(out) == ["window.ending_soon"]
+    assert (out[0][1].resets_at, out[0][1].used_pct) == (T, 60.0)
+
+
+def test_ending_soon_per_destination_independent():
+    early = hook("early", events=("window.ending_soon",), lead_s={"five_hour": 3600})
+    late = hook("late", events=("window.ending_soon",), lead_s={"five_hour": 600})
+    state = FiredState(windows={f"{KEY}|five_hour": T}, sent={})
+    got = []
+
+    for now in (T - 4000, T - 3500, T - 3000, T - 500, T - 100):
+        got += [(d.id, now) for d, _ in detect([reading()], [early, late], state, now)]
+
+    assert got == [("early", T - 3500), ("late", T - 500)]
+
+
+def test_ending_soon_from_previous_window_numbers_skipped():
+    state = FiredState(windows={f"{KEY}|five_hour": T + 5 * 3600}, sent={})
+
+    out = detect([reading(window_ts=T, live=False)],
+                 [hook(events=("window.ending_soon",), lead_s={"five_hour": 7200})],
+                 state, now=T + 60)
+
+    assert out == []
+
+
+def test_disabled_destination_gets_nothing():
+    state = FiredState(windows={f"{KEY}|five_hour": T}, sent={})
+
+    assert detect([reading()], [hook(enabled=False)], state, now=T + 1) == []
+    assert state.sent == {}
+
+
+def test_account_filter_limits_events():
+    other = reading(email="b@example.com")
+    state = FiredState(windows={f"{KEY}|five_hour": T, f"claude:b@example.com:org-1|five_hour": T},
+                       sent={})
+
+    out = detect([reading(), other], [hook(accounts=(KEY,))], state, now=T + 1)
+
+    assert [e.reading.key for _, e in out] == [KEY]
+
+
+def test_event_id_identical_across_states():
+    state_a = FiredState(windows={f"{KEY}|five_hour": T}, sent={})
+    state_b = FiredState(windows={f"{KEY}|five_hour": T}, sent={})
+
+    [(_, a)] = detect([reading()], [hook("one")], state_a, now=T + 1)
+    [(_, b)] = detect([reading()], [hook("two")], state_b, now=T + 1)
+
+    expected = "evt_" + hashlib.sha256(
+        f"claude|a@example.com|org-1|five_hour|{_iso(T).replace('+00:00', 'Z')}|window.reset"
+        .encode()).hexdigest()[:24]
+    assert a.id == b.id == expected
+
+
+def test_readings_skip_rows_without_usage():
+    good = {"five_hour": {"pct": 10.0, "resets_at": _iso(T)}}
+    snapshot = {
+        "accounts": [
+            ("1", "a@example.com", True, "Rate limited", None, "Work", "Acme", False, None),
+            ("2", "b@example.com", False, "Rate limited", good, None, "", False, T - 30),
+            ("codex:1", "c@example.com", False, good, None, None, "", False, T - 10),
+        ],
+        "identities": {"1": ("a@example.com", "org-1"), "2": ("b@example.com", "org-2"),
+                       "codex:1": ("c@example.com", "")},
+    }
+
+    got = readings_from_snapshot(snapshot)
+
+    assert got == [
+        AccountReading(provider="claude", email="b@example.com", org_uuid="org-2",
+                       label="b@example.com", org_name="", is_active=False, live=False,
+                       usage=good, fetched_at=T - 30),
+        AccountReading(provider="codex", email="c@example.com", org_uuid="",
+                       label="c@example.com", org_name="", is_active=False, live=True,
+                       usage=good, fetched_at=T - 10),
+    ]
+
+
+def test_payload_shape():
+    scoped = ({"name": "Fable", "used_pct": 100.0, "resets_at": "2027-01-15T08:00:00Z"},)
+    event = ResetEvent(type="window.ending_soon", window="seven_day",
+                       reading=reading(fetched_at=T - 600), resets_at=T,
+                       used_pct=61.0, scoped=scoped)
+
+    body = payload(event, mac="Test Mac", now=T - 7200.5)
+
+    assert set(body) == {
+        "id", "type", "provider", "account", "window", "resets_at", "seconds_until_reset",
+        "used_pct", "remaining_pct", "is_active_account", "scoped_limits", "measured_at",
+        "observed_at", "mac",
+    }
+    assert body["id"] == event.id
+    assert body["account"] == {"label": "Work", "email": "a@example.com", "org": "Acme"}
+    assert body["resets_at"] == "2027-01-15T08:00:00Z"
+    assert body["seconds_until_reset"] == 7200
+    assert body["remaining_pct"] == 39.0
+    assert body["measured_at"] == "2027-01-15T07:50:00Z"
+    assert body["observed_at"] == "2027-01-15T05:59:59.500000Z"
+    assert body["scoped_limits"] == list(scoped)
+    assert body["is_active_account"] is True
+    assert payload(event, mac="m", now=T + 5, test=True)["test"] is True
+    assert payload(event, mac="m", now=T + 5)["seconds_until_reset"] == 0
+    no_fetch = replace(event, reading=reading(fetched_at=None))
+    assert payload(no_fetch, mac="m", now=T)["measured_at"] is None
+
+
+def test_detect_maps_scoped_limits():
+    scoped = [{"name": "Fable", "pct": 100.0, "resets_at": "2027-01-15T08:00:00+00:00",
+               "countdown": "1h", "clock": "08:00"}, {"name": "Bad"}]
+    state = FiredState(windows={f"{KEY}|five_hour": T}, sent={})
+
+    [(_, event)] = detect([reading(scoped=scoped)], [hook()], state, now=T + 1)
+
+    assert event.scoped == (
+        {"name": "Fable", "used_pct": 100.0, "resets_at": "2027-01-15T08:00:00Z"},)
+
+
+def test_signature_header_matches_reference():
+    body = b'{"a": 1}'
+    expected = hmac.new(b"s", b"1700000000." + body, hashlib.sha256).hexdigest()
+
+    assert signature_header("s", body, 1700000000) == f"t=1700000000,v1={expected}"
