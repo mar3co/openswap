@@ -92,6 +92,8 @@ def delete_secret(dest_id: str) -> None:
 def post_once(
     url: str, body: bytes, secret: str, *, now: float, opener=_open_without_redirects
 ) -> None:
+    if problem := validate_webhook_url(url):
+        raise DeliveryError(problem, permanent=True)
     try:
         request = urllib.request.Request(
             url,

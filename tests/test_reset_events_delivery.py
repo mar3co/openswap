@@ -39,16 +39,16 @@ def _http_error(code):
     return urllib.error.HTTPError(URL, code, "error", {}, None)
 
 
-def _dest():
-    return Destination(id="wh_1", kind="webhook", enabled=True, url=URL)
+def _dest(url=URL):
+    return Destination(id="wh_1", kind="webhook", enabled=True, url=url)
 
 
-def _deliver(opener, *, secret="s3cret"):
+def _deliver(opener, *, secret="s3cret", url=URL):
     if secret is not None:
         macos_keychain.set_password(delivery.KEYCHAIN_SERVICE, "wh_1", secret)
     results, sleeps = [], []
     thread = delivery.deliver_async(
-        _dest(), BODY,
+        _dest(url), BODY,
         on_result=lambda dest_id, error: results.append((dest_id, error)),
         sleep=sleeps.append, opener=opener,
     )
@@ -217,6 +217,13 @@ def test_missing_secret_reports_without_network():
     opener = FakeOpener()
     results, sleeps = _deliver(opener, secret=None)
     assert results == [("wh_1", "secret missing; re-add this webhook")]
+    assert opener.requests == [] and sleeps == []
+
+
+def test_deliver_refuses_an_invalid_stored_url_without_network():
+    opener = FakeOpener()
+    results, sleeps = _deliver(opener, url="http://example.com/x")
+    assert results == [("wh_1", "Webhook URL must use https:// unless the host is localhost.")]
     assert opener.requests == [] and sleeps == []
 
 
