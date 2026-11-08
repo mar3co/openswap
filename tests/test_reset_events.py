@@ -8,9 +8,12 @@ import json
 from dataclasses import replace
 from datetime import datetime, timezone
 
+import pytest
+
 from openswap.reset_events import (
     AccountReading,
     Destination,
+    DestinationsUnreadable,
     FiredState,
     Filter,
     ResetEvent,
@@ -127,6 +130,28 @@ def test_duplicate_ids_keep_first(tmp_path):
     assert [(d.id, d.url, d.enabled) for d in dests] == [
         ("mac", "", False), ("h", "https://first.example", True),
     ]
+
+
+@pytest.mark.parametrize("text", [
+    "{not json",
+    json.dumps({"destinations": "nope"}),
+    json.dumps({"destinations": [
+        {"id": "mac", "kind": "mac", "enabled": True},
+        {"id": "h", "kind": "webhook", "enabled": "yes", "url": "https://example.com/h"},
+    ]}),
+])
+def test_update_destinations_refuses_to_overwrite_a_degraded_file(tmp_path, text):
+    config = tmp_path / "reset_events.json"
+    config.write_text(text)
+
+    with pytest.raises(DestinationsUnreadable):
+        update_destinations(tmp_path, lambda dests: dests)
+
+    assert config.read_text() == text
+
+
+def test_update_destinations_starts_from_defaults_when_file_is_missing(tmp_path):
+    assert update_destinations(tmp_path, lambda dests: dests) == DEFAULT
 
 
 def test_update_destinations_sees_current_file_and_persists(tmp_path):
@@ -461,6 +486,10 @@ def test_notification_copy_for_each_event_type():
     ending = ResetEvent("window.ending_soon", "seven_day", r, T, 61.0, ())
     copy = notification_copy_for_reset_event(ending, T - (3 * 3600 + 5 * 60))
     assert (copy.title, copy.body) == ("Work: weekly ends in 3h 5m", "39% left")
+
+    for now in (T - 59, T - 0.5, T + 1):
+        copy = notification_copy_for_reset_event(ending, now)
+        assert copy.title == "Work: weekly ends in under a minute"
 
     reset = ResetEvent("window.reset", "five_hour", r, T, 0.0, ())
     copy = notification_copy_for_reset_event(reset, T + 10)

@@ -1698,7 +1698,11 @@ def notification_copy_for_reset_event(event, now: float) -> NotificationCopy:
             body=f"{remaining:.0f}% left · resets {clock}",
         )
     if event.type == "window.ending_soon":
-        countdown = _live_countdown({"resets_at": event.resets_at_iso}, now)
+        countdown = (
+            _live_countdown({"resets_at": event.resets_at_iso}, now)
+            if event.resets_at - now >= 60
+            else "under a minute"
+        )
         return NotificationCopy(
             title=f"{label}: {window_name} ends in {countdown}",
             body=f"{remaining:.0f}% left",

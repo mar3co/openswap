@@ -64,6 +64,10 @@ class FiredState:
     emitted: dict[str, float] = field(default_factory=dict)
 
 
+class DestinationsUnreadable(ValueError):
+    """``reset_events.json`` could not be read in full, so writing it back would lose data."""
+
+
 def _default_destinations() -> list[Destination]:
     return [Destination(id="mac", kind="mac", enabled=False, filter=Filter())]
 
@@ -158,16 +162,20 @@ def _destination_to_json(dest: Destination) -> dict:
     }
 
 
-def load_destinations(root: Path) -> list[Destination]:
+def _load_destinations(root: Path) -> tuple[list[Destination], bool]:
+    """The destinations, and whether anything in the file had to be dropped."""
     path = root / CONFIG_FILENAME
+    if not path.exists():
+        return _default_destinations(), False
     raw = _read_object(path)
     if raw is None:
-        return _default_destinations()
+        return _default_destinations(), True
     entries = raw.get("destinations")
     if not isinstance(entries, list):
         _logger.warning("%s has no destinations list; using defaults", path)
-        return _default_destinations()
+        return _default_destinations(), True
     dests: list[Destination] = []
+    degraded = False
     for entry in entries:
         try:
             dest = _destination_from_json(entry)
@@ -175,11 +183,16 @@ def load_destinations(root: Path) -> list[Destination]:
                 raise ValueError(f"duplicate id {dest.id!r}")
         except ValueError as e:
             _logger.warning("Dropping reset-event destination in %s: %s", path, e)
+            degraded = True
             continue
         dests.append(dest)
     if not any(d.kind == "mac" for d in dests):
         dests = _default_destinations() + dests
-    return dests
+    return dests, degraded
+
+
+def load_destinations(root: Path) -> list[Destination]:
+    return _load_destinations(root)[0]
 
 
 def _config_lock(root: Path) -> FileLock:
@@ -202,9 +215,17 @@ def update_destinations(
     root: Path, fn: Callable[[list[Destination]], list[Destination]],
 ) -> list[Destination]:
     """Load, transform, and save under one lock so concurrent writers never
-    overwrite each other's changes from a stale copy."""
+    overwrite each other's changes from a stale copy.
+
+    Raises :class:`DestinationsUnreadable`, writing nothing, when the file
+    could not be read in full."""
     with _config_lock(root):
-        dests = fn(load_destinations(root))
+        dests, degraded = _load_destinations(root)
+        if degraded:
+            raise DestinationsUnreadable(
+                f"{root / CONFIG_FILENAME} could not be read; fix or remove it"
+            )
+        dests = fn(dests)
         _write_destinations(root, dests)
     return dests
 

@@ -864,6 +864,7 @@ def _reset_events_app(tmp_path, *, delivered, notified, logged):
         "time": __import__("time"),
         "json": json,
         "replace": replace,
+        "ClaudeSwitchError": menubar.ClaudeSwitchError,
         "notification_copy_for_reset_event": menubar.notification_copy_for_reset_event,
         "deliver_async": lambda dest, body, *, on_result: delivered.append(
             (dest.id, json.loads(body), json.loads((tmp_path / "reset_events_state.json").read_text()))
@@ -873,7 +874,8 @@ def _reset_events_app(tmp_path, *, delivered, notified, logged):
             "readings_from_snapshot", "save_state", "update_destinations",
         )},
     }
-    names = {"_maybe_reset_events", "_fire_reset_events", "_record_reset_event_delivery", "_mac_name"}
+    names = {"_maybe_reset_events", "_fire_reset_events", "_record_reset_event_delivery",
+             "_toggle_reset_events_mac"}
     app = extract_class(menubar.__file__, "MenuBarApp", names, scope)()
     app.switcher = SimpleNamespace(
         backup_dir=tmp_path,
@@ -882,7 +884,7 @@ def _reset_events_app(tmp_path, *, delivered, notified, logged):
     app._desktop_switching = False
     app._snapshot_at = 1.0
     app._reset_events_at = float("-inf")
-    app._mac_name_cached = "Test Mac"
+    app._mac_name = "Test Mac"
     app._dirty = False
     app._notify = notified.append
     return app
@@ -922,6 +924,26 @@ def test_reset_events_pass_saves_state_before_delivering_and_fires_once(tmp_path
     assert logged == []
 
 
+def test_reset_events_pass_still_delivers_webhooks_when_the_mac_banner_fails(tmp_path):
+    from openswap.reset_events import Destination, save_destinations
+
+    save_destinations(tmp_path, [
+        Destination(id="mac", kind="mac", enabled=True),
+        Destination(id="h1", kind="webhook", enabled=True, url="https://x.test/h"),
+    ])
+    delivered, logged = [], []
+    app = _reset_events_app(tmp_path, delivered=delivered, notified=[], logged=logged)
+    app.snapshot = _ending_soon_snapshot()
+
+    def boom(_copy):
+        raise RuntimeError("no notification center")
+
+    app._notify = boom
+    app._maybe_reset_events()
+    assert [d[0] for d in delivered] == ["h1"]
+    assert len(logged) == 1
+
+
 def test_reset_events_pass_logs_failures_at_most_every_15_seconds(tmp_path):
     delivered, notified, logged = [], [], []
     app = _reset_events_app(tmp_path, delivered=delivered, notified=notified, logged=logged)
@@ -930,6 +952,37 @@ def test_reset_events_pass_logs_failures_at_most_every_15_seconds(tmp_path):
     app._maybe_reset_events()
     app._maybe_reset_events()
     assert len(logged) == 1
+
+
+def test_reset_events_writes_never_clobber_an_unreadable_config(tmp_path):
+    config = tmp_path / "reset_events.json"
+    config.write_text("{not json")
+    logged, errors = [], []
+    app = _reset_events_app(tmp_path, delivered=[], notified=[], logged=logged)
+    app._show_error = errors.append
+
+    app._toggle_reset_events_mac()
+    assert len(errors) == 1 and errors[0].startswith("Couldn't change Mac notifications:")
+
+    assert config.read_text() == "{not json"
+
+    text = json.dumps({"destinations": [
+        {"id": "h1", "kind": "webhook", "enabled": True, "url": "https://x.test/h"},
+        {"id": "h2", "kind": "webhook", "enabled": "yes"},
+    ]})
+    config.write_text(text)
+    app._record_reset_event_delivery("h1", "HTTP 500")
+    assert app._dirty is False
+    assert any("could not record" in a[0] for a in logged)
+    assert config.read_text() == text
+
+
+def test_reset_events_mac_toggle_flips_the_saved_destination(tmp_path):
+    from openswap.reset_events import load_destinations
+
+    app = _reset_events_app(tmp_path, delivered=[], notified=[], logged=[])
+    app._toggle_reset_events_mac()
+    assert [d.enabled for d in load_destinations(tmp_path) if d.kind == "mac"] == [True]
 
 
 def test_reset_events_delivery_result_records_only_changed_errors(tmp_path):
