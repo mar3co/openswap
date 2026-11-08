@@ -78,6 +78,22 @@ def test_validate_rejects_ftp_and_hostless():
         assert delivery.validate_webhook_url(url), url
 
 
+def test_validate_rejects_non_ascii():
+    assert delivery.validate_webhook_url("https://hooks.example.com/réset") == (
+        "Use an ASCII URL (percent-encode other characters)"
+    )
+    assert delivery.validate_webhook_url("https://bücher.example/hook")
+
+
+@pytest.mark.parametrize("url", [
+    "http://127.0.0.1:1/réset",
+    "https://" + "a" * 70 + ".example.com/hook",
+])
+def test_post_once_reports_unencodable_url(url):
+    with pytest.raises(delivery.DeliveryError):
+        delivery.post_once(url, BODY, "s", now=0)
+
+
 def test_post_once_sends_signature_and_json_headers():
     opener = FakeOpener(None)
     delivery.post_once(URL, BODY, "s3cret", now=1_700_000_000.7, opener=opener)
@@ -176,3 +192,19 @@ def test_secret_lifecycle_uses_reset_events_service(block_real_keychain):
     assert delivery.get_secret("wh_1") == secret
     delivery.delete_secret("wh_1")
     assert delivery.get_secret("wh_1") is None
+
+
+def test_failing_callback_is_logged(caplog):
+    macos_keychain.set_password(delivery.KEYCHAIN_SERVICE, "wh_1", "s3cret")
+
+    def broken(dest_id, error):
+        raise RuntimeError("callback broke")
+
+    with caplog.at_level("WARNING", logger=delivery.__name__):
+        thread = delivery.deliver_async(_dest(), BODY, on_result=broken, sleep=lambda _s: None,
+                                        opener=FakeOpener(None))
+        thread.join(timeout=5)
+    assert not thread.is_alive()
+    (record,) = [r for r in caplog.records if r.name == delivery.__name__]
+    assert record.levelname == "WARNING" and "wh_1" in record.getMessage()
+    assert "callback broke" in str(record.exc_info[1])

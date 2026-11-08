@@ -7,6 +7,7 @@ A delivery makes three attempts, then gives up and reports the last error.
 from __future__ import annotations
 
 import http.client
+import logging
 import secrets
 import threading
 import time
@@ -22,6 +23,8 @@ KEYCHAIN_SERVICE = "OpenSwap reset events"
 RETRY_DELAYS_S = (30, 60)
 TIMEOUT_S = 10
 _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+_logger = logging.getLogger(__name__)
 
 
 class DeliveryError(Exception):
@@ -40,6 +43,8 @@ def _open_without_redirects(request: urllib.request.Request, timeout: float):
 
 
 def validate_webhook_url(url: str) -> str | None:
+    if not url.isascii():
+        return "Use an ASCII URL (percent-encode other characters)"
     try:
         parts = urlsplit(url)
         host = parts.hostname
@@ -71,16 +76,16 @@ def delete_secret(dest_id: str) -> None:
 def post_once(
     url: str, body: bytes, secret: str, *, now: float, opener=_open_without_redirects
 ) -> None:
-    request = urllib.request.Request(
-        url,
-        data=body,
-        method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "OpenSwap-Signature": signature_header(secret, body, int(now)),
-        },
-    )
     try:
+        request = urllib.request.Request(
+            url,
+            data=body,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "OpenSwap-Signature": signature_header(secret, body, int(now)),
+            },
+        )
         with opener(request, timeout=TIMEOUT_S):
             pass
     except urllib.error.HTTPError as e:
@@ -89,7 +94,7 @@ def post_once(
         raise DeliveryError(f"timed out after {TIMEOUT_S} s") from None
     except urllib.error.URLError as e:
         raise DeliveryError(str(e.reason) or "connection failed") from None
-    except (OSError, http.client.HTTPException) as e:
+    except (OSError, http.client.HTTPException, ValueError) as e:
         raise DeliveryError(str(e) or type(e).__name__) from None
 
 
@@ -102,7 +107,7 @@ def deliver_async(
     opener=_open_without_redirects,
 ) -> threading.Thread:
     thread = threading.Thread(
-        target=_deliver,
+        target=_run,
         args=(dest, body, on_result, sleep, opener),
         name=f"reset-webhook-{dest.id}",
         daemon=True,
@@ -111,15 +116,21 @@ def deliver_async(
     return thread
 
 
-def _deliver(dest, body, on_result, sleep, opener) -> None:
+def _run(dest, body, on_result, sleep, opener) -> None:
+    error = _deliver(dest, body, sleep, opener)
+    try:
+        on_result(dest.id, error)
+    except Exception:
+        _logger.warning("Reset event delivery callback failed for %s", dest.id, exc_info=True)
+
+
+def _deliver(dest, body, sleep, opener) -> str:
     try:
         secret = get_secret(dest.id)
     except macos_keychain.KEYCHAIN_ERRORS as e:
-        on_result(dest.id, f"Keychain unavailable: {e}")
-        return
+        return f"Keychain unavailable: {e}"
     if not secret:
-        on_result(dest.id, "secret missing; re-add this webhook")
-        return
+        return "secret missing; re-add this webhook"
     error = ""
     for delay in (0, *RETRY_DELAYS_S):
         if delay:
@@ -129,6 +140,5 @@ def _deliver(dest, body, on_result, sleep, opener) -> None:
         except DeliveryError as e:
             error = str(e)
         else:
-            on_result(dest.id, "")
-            return
-    on_result(dest.id, error)
+            return ""
+    return error
