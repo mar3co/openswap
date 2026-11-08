@@ -323,3 +323,16 @@ def test_set_without_changes_is_an_error(temp_home, capsys):
     assert code == 2
     assert "Nothing to change" in err
     assert config.read_text() == before
+
+
+@pytest.mark.parametrize("flag", ["--lead-5h", "--lead-weekly"])
+def test_lead_time_is_capped_at_what_the_config_accepts(temp_home, capsys, flag):
+    root = _seed()
+
+    code, _, err = _run(["set", "mac", flag, str(reset_events.MAX_LEAD_S // 60 + 1)], capsys)
+    assert code == 2
+    assert "43200" in err
+
+    code, _, _ = _run(["set", "mac", flag, str(reset_events.MAX_LEAD_S // 60)], capsys)
+    assert code == 0
+    assert reset_events.load_destinations_checked(root)[1] is None

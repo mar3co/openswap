@@ -673,3 +673,34 @@ def test_state_skips_numbers_that_overflow_or_are_not_finite(tmp_path):
 
     assert state.windows == {"d": 5.0}
     assert problem is None
+
+
+@pytest.mark.parametrize("dests", [
+    [DEFAULT_MAC, Destination(id="h", kind="webhook", enabled=True, url="https://example.com/h",
+                              filter=Filter(lead_s={"seven_day": 31 * 86400}))],
+    [DEFAULT_MAC, Destination(id="h", kind="webhook", enabled=True),
+     Destination(id="h", kind="webhook", enabled=False)],
+    [Destination(id="mac", kind="webhook", enabled=True)],
+], ids=["lead over 30 days", "duplicate id", "mac id on a webhook"])
+def test_writers_refuse_destinations_the_loader_would_drop(tmp_path, dests):
+    save_destinations(tmp_path, DEFAULT)
+    before = (tmp_path / "reset_events.json").read_text()
+
+    with pytest.raises(ValueError):
+        save_destinations(tmp_path, dests)
+    with pytest.raises(ValueError):
+        update_destinations(tmp_path, lambda _: dests)
+
+    assert (tmp_path / "reset_events.json").read_text() == before
+
+
+def test_deeply_nested_config_and_state_are_reported_unreadable(tmp_path):
+    nested = "[" * 1_000_000 + "]" * 1_000_000
+    (tmp_path / "reset_events.json").write_text(nested)
+    (tmp_path / "reset_events_state.json").write_text(nested)
+
+    dests, problem = load_destinations_checked(tmp_path)
+    state, state_problem = load_state_checked(tmp_path)
+
+    assert dests == DEFAULT and problem is not None
+    assert state == FiredState(windows={}, sent={}) and state_problem is not None

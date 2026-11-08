@@ -1101,12 +1101,16 @@ def _accounts_arg(value: str) -> tuple[str, ...]:
 
 
 def _minutes_arg(value: str) -> int:
+    from openswap.reset_events import MAX_LEAD_S
+
     try:
         minutes = int(value)
     except ValueError:
         minutes = -1
-    if minutes < 1:
-        raise argparse.ArgumentTypeError("use a whole number of minutes, 1 or more")
+    if not 1 <= minutes <= MAX_LEAD_S // 60:
+        raise argparse.ArgumentTypeError(
+            f"use a whole number of minutes, 1 or more and at most {MAX_LEAD_S // 60}"
+        )
     return minutes
 
 

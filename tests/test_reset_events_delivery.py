@@ -78,6 +78,18 @@ def test_validate_rejects_ftp_and_hostless():
         assert delivery.validate_webhook_url(url), url
 
 
+@pytest.mark.parametrize("url", [
+    "https://hooks.example.com/a b",
+    "https://hooks.example.com/a\tb",
+    "https://hooks.example.com/a\nb",
+    "https://hooks.example.com/a\x7fb",
+    "https://hooks.example.com:99999/x",
+    "https://hooks.example.com:abc/x",
+])
+def test_validate_rejects_whitespace_control_characters_and_bad_ports(url):
+    assert delivery.validate_webhook_url(url), url
+
+
 def test_validate_rejects_non_ascii():
     assert delivery.validate_webhook_url("https://hooks.example.com/réset") == (
         "Use an ASCII URL (percent-encode other characters)"

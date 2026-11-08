@@ -45,9 +45,12 @@ def _open_without_redirects(request: urllib.request.Request, timeout: float):
 def validate_webhook_url(url: str) -> str | None:
     if not url.isascii():
         return "Use an ASCII URL (percent-encode other characters)"
+    if any(c <= " " or c == "\x7f" for c in url):
+        return "Webhook URL can't contain spaces or control characters."
     try:
         parts = urlsplit(url)
         host = parts.hostname
+        parts.port
     except ValueError:
         return "Webhook URL is not valid."
     if parts.scheme not in ("http", "https"):

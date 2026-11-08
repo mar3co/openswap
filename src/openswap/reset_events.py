@@ -78,7 +78,7 @@ def _read_object(path: Path) -> tuple[dict | None, str | None]:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return None, None
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, RecursionError) as e:
         return None, str(e)
     if not isinstance(raw, dict):
         return None, "not a JSON object"
@@ -165,6 +165,22 @@ def destination_to_json(dest: Destination) -> dict:
     }
 
 
+def _destinations_from_json(entries: list) -> tuple[list[Destination], list[str]]:
+    """The destinations that parse, and why each other entry was dropped."""
+    dests: list[Destination] = []
+    dropped: list[str] = []
+    for entry in entries:
+        try:
+            dest = _destination_from_json(entry)
+            if any(d.id == dest.id for d in dests):
+                raise ValueError(f"duplicate id {dest.id!r}")
+        except ValueError as e:
+            dropped.append(str(e))
+            continue
+        dests.append(dest)
+    return dests, dropped
+
+
 def _unreadable(path: Path, reason: str) -> str:
     return f"Reset events config could not be read in full ({reason}); fix or remove it: {path}"
 
@@ -179,17 +195,7 @@ def load_destinations_checked(root: Path) -> tuple[list[Destination], str | None
     entries = raw.get("destinations")
     if not isinstance(entries, list):
         return _default_destinations(), _unreadable(path, "no destinations list")
-    dests: list[Destination] = []
-    dropped: list[str] = []
-    for entry in entries:
-        try:
-            dest = _destination_from_json(entry)
-            if any(d.id == dest.id for d in dests):
-                raise ValueError(f"duplicate id {dest.id!r}")
-        except ValueError as e:
-            dropped.append(str(e))
-            continue
-        dests.append(dest)
+    dests, dropped = _destinations_from_json(entries)
     if not any(d.kind == "mac" for d in dests):
         dests = _default_destinations() + dests
     return dests, _unreadable(path, "; ".join(dropped)) if dropped else None
@@ -204,10 +210,12 @@ def _config_lock(root: Path) -> FileLock:
 
 
 def _write_destinations(root: Path, dests: list[Destination]) -> None:
-    atomic_write_json(
-        root / CONFIG_FILENAME,
-        {"destinations": [destination_to_json(d) for d in dests]},
-    )
+    """Raises ValueError, writing nothing, for anything the loader would drop."""
+    entries = [destination_to_json(d) for d in dests]
+    _, dropped = _destinations_from_json(entries)
+    if dropped:
+        raise ValueError(f"Invalid reset events destination: {'; '.join(dropped)}")
+    atomic_write_json(root / CONFIG_FILENAME, {"destinations": entries})
 
 
 def save_destinations(root: Path, dests: list[Destination]) -> None:
