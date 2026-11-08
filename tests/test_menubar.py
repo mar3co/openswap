@@ -961,10 +961,11 @@ def _reset_events_app(tmp_path, *, delivered, notified, logged, save_state=None)
 def _ending_soon_snapshot():
     import time as _time
 
-    resets_at = _dt.datetime.fromtimestamp(_time.time() + 600, _dt.timezone.utc).isoformat()
+    now = _time.time()
+    resets_at = _dt.datetime.fromtimestamp(now + 600, _dt.timezone.utc).isoformat()
     usage = {"five_hour": {"pct": 40.0, "resets_at": resets_at}}
     return {
-        "accounts": [(1, "a@example.com", True, usage, None, "Work", "Acme", False, None)],
+        "accounts": [(1, "a@example.com", True, usage, None, "Work", "Acme", False, now)],
         "identities": {"1": ("a@example.com", "org-1")},
     }
 
@@ -1110,6 +1111,19 @@ def test_reset_events_pass_moves_a_corrupt_state_aside_and_notes_it_until_the_ne
     _rerun(app)
     assert app._reset_events_settings()["state_reset"] is False
     assert len(logged) == 1
+
+
+def test_reset_events_pass_keeps_what_survived_a_partly_malformed_state(tmp_path):
+    state_path = tmp_path / "reset_events_state.json"
+    state_path.write_text('{"windows": {"k": 1}, "sent": {"h|evt_1": 5, "h|evt_2": "x"}}')
+    app = _reset_events_app(tmp_path, delivered=[], notified=[], logged=[])
+    app.snapshot = {"accounts": [], "identities": {}}
+
+    _rerun(app)
+
+    saved = json.loads(state_path.read_text())
+    assert saved["windows"] == {"k": 1.0}
+    assert app._reset_events_settings()["state_reset"] is True
 
 
 def test_reset_events_pass_failure_is_logged_once_and_shown_until_a_pass_succeeds(tmp_path):

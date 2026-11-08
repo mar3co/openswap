@@ -4192,12 +4192,12 @@ def run(switcher, codex=None) -> int:
                 self._note_reset_events_condition("state reset", f"{state_problem}; moved it to {corrupt}")
             dests, config_problem = load_destinations_checked(root)
             self._note_reset_events_condition("config unreadable", config_problem)
-            readings, readings_problem = readings_from_snapshot(self.snapshot)
+            readings, readings_problem = readings_from_snapshot(self.snapshot, now)
             self._note_reset_events_condition("account rows skipped", readings_problem)
             before = FiredState(dict(state.windows), dict(state.sent), dict(state.emitted))
             fired = detect(readings, dests, state, now)
             # Saved before delivery so a crash mid-delivery never repeats an event.
-            if state != before:
+            if state_problem or state != before:
                 try:
                     save_state(root, state, now)
                 except OSError as e:

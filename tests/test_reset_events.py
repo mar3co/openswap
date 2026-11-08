@@ -30,6 +30,7 @@ from openswap.reset_events import (
     update_destinations,
     with_delivery_result,
 )
+from openswap.usage_store import STALE_OK_S
 
 DEFAULT_MAC = Destination(id="mac", kind="mac", enabled=False, filter=Filter())
 DEFAULT = [DEFAULT_MAC]
@@ -395,7 +396,7 @@ def test_readings_skip_rows_without_usage():
                        "codex:1": ("c@example.com", "")},
     }
 
-    got, problem = readings_from_snapshot(snapshot)
+    got, problem = readings_from_snapshot(snapshot, T)
 
     assert problem is None
     assert got == [
@@ -406,6 +407,28 @@ def test_readings_skip_rows_without_usage():
                        label="c@example.com", org_name="", is_active=False, live=True,
                        usage=good, fetched_at=T - 10),
     ]
+
+
+@pytest.mark.parametrize("fetched_at, live", [
+    (T - STALE_OK_S, True),
+    (T - STALE_OK_S - 1, False),
+    (None, False),
+])
+def test_display_usage_is_live_only_while_fresh(fetched_at, live):
+    later = T + 5 * 3600
+    usage = {"five_hour": {"pct": 2.0, "resets_at": _iso(later)}}
+    snapshot = {
+        "accounts": [("1", "a@example.com", True, usage, None, "Work", "Acme", False, fetched_at)],
+        "identities": {"1": ("a@example.com", "org-1")},
+    }
+    state = FiredState(windows={f"{KEY}|five_hour": T - 60}, sent={})
+
+    readings, _ = readings_from_snapshot(snapshot, T)
+    out = detect(readings, [hook(events=("window.started",))], state, T)
+
+    assert readings[0].live is live
+    assert types(out) == (["window.started"] if live else [])
+    assert state.windows[f"{KEY}|five_hour"] == (later if live else T - 60)
 
 
 def test_payload_shape():
@@ -666,7 +689,7 @@ def test_integer_literal_over_the_json_digit_limit_is_reported_unreadable(tmp_pa
     assert state == FiredState(windows={}, sent={}) and state_problem is not None
 
 
-def test_state_skips_numbers_that_overflow_or_are_not_finite(tmp_path):
+def test_state_skips_and_reports_numbers_that_overflow_or_are_not_finite(tmp_path):
     (tmp_path / "reset_events_state.json").write_text(
         f'{{"windows": {{"a": {HUGE_INT}, "b": NaN, "c": Infinity, "d": 5}}, "sent": {{}}}}'
     )
@@ -674,7 +697,29 @@ def test_state_skips_numbers_that_overflow_or_are_not_finite(tmp_path):
     state, problem = load_state_checked(tmp_path)
 
     assert state.windows == {"d": 5.0}
-    assert problem is None
+    assert problem.endswith("state file has malformed windows")
+
+
+@pytest.mark.parametrize("text, key", [
+    ('{"windows": [], "sent": {}}', "windows"),
+    ('{"sent": "x"}', "sent"),
+    ('{"emitted": null}', "emitted"),
+    ('{"sent": {"h|evt_1": "soon"}}', "sent"),
+    ('{"emitted": {"evt_1": true}}', "emitted"),
+])
+def test_state_with_a_malformed_map_is_reported(tmp_path, text, key):
+    path = tmp_path / "reset_events_state.json"
+    path.write_text(text)
+
+    _, problem = load_state_checked(tmp_path)
+
+    assert problem == f"{path}: state file has malformed {key}"
+
+
+def test_state_without_emitted_is_fine(tmp_path):
+    (tmp_path / "reset_events_state.json").write_text('{"windows": {"a": 1}, "sent": {"b": 2}}')
+
+    assert load_state_checked(tmp_path) == (FiredState(windows={"a": 1.0}, sent={"b": 2.0}), None)
 
 
 @pytest.mark.parametrize("dests", [
@@ -751,7 +796,7 @@ def test_readings_skip_a_malformed_row_and_report_it():
         "identities": {"2": ("b@example.com", "org-2")},
     }
 
-    got, problem = readings_from_snapshot(snapshot)
+    got, problem = readings_from_snapshot(snapshot, T)
 
     assert [r.email for r in got] == ["b@example.com"]
     assert problem is not None

@@ -19,6 +19,7 @@ from pathlib import Path
 from openswap.locking import FileLock
 from openswap.poll_policy import parse_reset_ts
 from openswap.settings import atomic_write_json
+from openswap.usage_store import STALE_OK_S
 
 EVENT_TYPES = ("window.started", "window.ending_soon", "window.reset")
 WINDOWS = ("five_hour", "seven_day")
@@ -272,16 +273,19 @@ def _number_map(value) -> dict[str, float]:
 
 
 def load_state_checked(root: Path) -> tuple[FiredState, str | None]:
-    """The fired state (empty when missing or unreadable), and why it was unreadable."""
+    """The fired state (empty when missing or unreadable, without any entry it
+    could not read), and why it was unreadable or had such entries."""
     path = root / STATE_FILENAME
     raw, problem = _read_object(path)
     raw = raw or {}
-    state = FiredState(
-        windows=_number_map(raw.get("windows")),
-        sent=_number_map(raw.get("sent")),
-        emitted=_number_map(raw.get("emitted")),
-    )
-    return state, None if problem is None else f"{path}: {problem}"
+    maps = {key: _number_map(raw.get(key)) for key in ("windows", "sent", "emitted")}
+    malformed = [
+        key for key, kept in maps.items()
+        if key in raw and not (isinstance(raw[key], dict) and len(kept) == len(raw[key]))
+    ]
+    if problem is None and malformed:
+        problem = f"state file has malformed {', '.join(malformed)}"
+    return FiredState(**maps), None if problem is None else f"{path}: {problem}"
 
 
 def load_state(root: Path) -> FiredState:
@@ -345,10 +349,10 @@ class ResetEvent:
         return "evt_" + hashlib.sha256(raw.encode()).hexdigest()[:24]
 
 
-def _reading_from_row(row, identities: dict) -> AccountReading | None:
+def _reading_from_row(row, identities: dict, now: float) -> AccountReading | None:
     num, email, is_active, display, last_good, alias, org_name, _disabled, fetched_at = row
-    live = isinstance(display, dict)
-    usage = display if live else last_good if isinstance(last_good, dict) else None
+    has_display = isinstance(display, dict)
+    usage = display if has_display else last_good if isinstance(last_good, dict) else None
     if usage is None:
         return None
     _, org_uuid = identities.get(str(num)) or ("", "")
@@ -359,19 +363,20 @@ def _reading_from_row(row, identities: dict) -> AccountReading | None:
         label=alias or email,
         org_name=org_name or "",
         is_active=bool(is_active),
-        live=live,
+        live=has_display and _is_number(fetched_at) and now - fetched_at <= STALE_OK_S,
         usage=usage,
         fetched_at=fetched_at,
     )
 
 
-def readings_from_snapshot(snapshot: dict) -> tuple[list[AccountReading], str | None]:
-    """The readings, and why any malformed account row was skipped."""
+def readings_from_snapshot(snapshot: dict, now: float) -> tuple[list[AccountReading], str | None]:
+    """The readings, and why any malformed account row was skipped. A reading
+    is live only when this pass's usage was fetched within ``STALE_OK_S``."""
     identities = snapshot.get("identities") or {}
     readings, skipped = [], []
     for row in snapshot.get("accounts") or []:
         try:
-            reading = _reading_from_row(row, identities)
+            reading = _reading_from_row(row, identities, now)
         except (TypeError, ValueError) as e:
             skipped.append(f"skipped a malformed account row ({e})")
             continue
