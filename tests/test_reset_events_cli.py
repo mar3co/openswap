@@ -126,7 +126,7 @@ def test_add_webhook_deletes_the_secret_when_saving_fails(
     assert not block_real_keychain.data
 
 
-def test_add_webhook_reports_the_save_error_when_secret_cleanup_fails(
+def test_add_webhook_warns_when_secret_cleanup_also_fails(
     temp_home, capsys, block_real_keychain, monkeypatch,
 ):
     def locked(dest_id):
@@ -135,10 +135,11 @@ def test_add_webhook_reports_the_save_error_when_secret_cleanup_fails(
     monkeypatch.setattr(delivery, "delete_secret", locked)
     _fail_saving(monkeypatch)
 
-    code, _, err = _run(["add-webhook", URL], capsys)
+    code, out, err = _run(["add-webhook", URL], capsys)
 
     assert code == 1
-    assert "disk full" in err and "locked" not in err
+    assert "disk full" in err
+    assert "its Keychain secret could not be deleted: locked" in out + err
 
 
 def test_remove_deletes_secret(temp_home, capsys, block_real_keychain):

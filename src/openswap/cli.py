@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import contextlib
 import json
 import os
 import sys
@@ -1327,8 +1326,13 @@ Examples:
             try:
                 update_destinations(root, add)
             except BaseException:
-                with contextlib.suppress(*macos_keychain.KEYCHAIN_ERRORS):
+                try:
                     delivery.delete_secret(dest_id)
+                except macos_keychain.KEYCHAIN_ERRORS as e:
+                    print(
+                        f"Warning: {dest_id} was not added, but its Keychain secret could not be deleted: {e}",
+                        file=sys.stderr,
+                    )
                 raise
             if json_mode:
                 print(json.dumps({"schemaVersion": 1, "id": dest_id, "secret": secret}, indent=2))
