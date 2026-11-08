@@ -144,7 +144,7 @@ def _destination_from_json(raw) -> Destination:
     )
 
 
-def _destination_to_json(dest: Destination) -> dict:
+def destination_to_json(dest: Destination) -> dict:
     f = dest.filter
     return {
         "id": dest.id,
@@ -202,7 +202,7 @@ def _config_lock(root: Path) -> FileLock:
 def _write_destinations(root: Path, dests: list[Destination]) -> None:
     atomic_write_json(
         root / CONFIG_FILENAME,
-        {"destinations": [_destination_to_json(d) for d in dests]},
+        {"destinations": [destination_to_json(d) for d in dests]},
     )
 
 
@@ -223,7 +223,7 @@ def update_destinations(
         dests, degraded = _load_destinations(root)
         if degraded:
             raise DestinationsUnreadable(
-                f"{root / CONFIG_FILENAME} could not be read; fix or remove it"
+                f"Reset events config could not be read in full; fix or remove it: {root / CONFIG_FILENAME}"
             )
         dests = fn(dests)
         _write_destinations(root, dests)

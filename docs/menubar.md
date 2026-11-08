@@ -130,3 +130,48 @@ remain dialogs; completion does not claim that the running profile is verified.
 A switch toast includes “Restart Claude Code to apply now, or wait about 30 seconds.” only when a Claude Code session or IDE lock is live (`claude_running`). Otherwise the restart sentence is omitted. Codex switches include “Restart Codex to apply.” only when a Codex TUI is live (`codex_running`).
 
 A slot that newly becomes re-login-needed toasts once (`personal signed out`) when auto-switch is off (the engine already emits `account-quarantined` when it is on). Capture success toasts `{name} is signed in again`.
+
+## Reset events
+
+`reset_events.py` watches each account's 5-hour and weekly windows in the extra's snapshot and fires events to the destinations in `reset_events.json`; `reset_events_state.json` records what already fired, so a restart never repeats one. Destinations are the Mac notification (Settings › Automation › Reset events › **Notify on this Mac**, off by default) and any number of webhooks, managed with `openswap events`. Each destination has its own filter: accounts, windows, events, the ending-soon lead time (30 minutes for 5-hour, 3 hours for weekly) and the ending-soon minimum left (20%).
+
+| Event | Meaning |
+| --- | --- |
+| `window.started` | A new 5-hour window's clock is running (5-hour only), seen at the next live usage fetch |
+| `window.ending_soon` | The window ends within the lead time and at least the minimum is left |
+| `window.reset` | The window ended at its `resets_at`; for the weekly window this is also the next window's start |
+
+Every webhook gets this JSON body in a `POST`. `id` is the same on every Mac for the same moment, so receivers should drop repeats by `id`. `openswap events test <id>` sends a sample `window.ending_soon` with `"test": true` added.
+
+```json
+{
+  "id": "evt_3f1c9a0b7d2e4f6a8b1c2d3e",
+  "type": "window.ending_soon",
+  "provider": "claude",
+  "account": { "label": "Work", "email": "a@example.com", "org": "Acme" },
+  "window": "seven_day",
+  "resets_at": "2026-11-09T17:00:00Z",
+  "seconds_until_reset": 7200,
+  "used_pct": 61.0,
+  "remaining_pct": 39.0,
+  "is_active_account": false,
+  "scoped_limits": [ { "name": "Fable", "used_pct": 100.0, "resets_at": "2026-11-10T09:00:00Z" } ],
+  "measured_at": "2026-11-09T14:58:40Z",
+  "observed_at": "2026-11-09T15:00:04Z",
+  "mac": "Yohan's MacBook Pro"
+}
+```
+
+Webhooks must use `https://` (`http://` only for `localhost`). Delivery makes three attempts (now, after 30 s, after another 60 s), 10 s each, then gives up and shows the error in `openswap events list`. Each request carries `OpenSwap-Signature: t=<unix>,v1=<hex HMAC-SHA256 of "<t>.<body>">`, keyed with the secret `add-webhook` printed (kept in the Keychain). Verify it on the raw body before parsing:
+
+```python
+import hashlib, hmac, time
+
+def verify(secret: str, header: str, body: bytes) -> bool:
+    parts = dict(p.partition("=")[::2] for p in header.split(","))
+    t, sig = parts.get("t", ""), parts.get("v1", "")
+    if not t.isdigit() or abs(time.time() - int(t)) > 300:
+        return False
+    expected = hmac.new(secret.encode(), f"{t}.".encode() + body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, sig)
+```
