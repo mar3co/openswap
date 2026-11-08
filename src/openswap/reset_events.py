@@ -78,7 +78,7 @@ def _read_object(path: Path) -> tuple[dict | None, str | None]:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return None, None
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
+    except (OSError, ValueError) as e:
         return None, str(e)
     if not isinstance(raw, dict):
         return None, "not a JSON object"
@@ -90,7 +90,7 @@ def _is_number(value) -> bool:
 
 
 def _is_finite_in(value, low: float, high: float) -> bool:
-    return _is_number(value) and math.isfinite(value) and low <= value <= high
+    return _is_number(value) and low <= value <= high
 
 
 def _str_tuple(value, allowed: tuple[str, ...] | None = None) -> tuple[str, ...]:
@@ -232,10 +232,21 @@ def update_destinations(
     return dests
 
 
+def _finite_float(value) -> float | None:
+    try:
+        f = float(value)
+    except OverflowError:
+        return None
+    return f if math.isfinite(f) else None
+
+
 def _number_map(value) -> dict[str, float]:
     if not isinstance(value, dict):
         return {}
-    return {k: float(v) for k, v in value.items() if isinstance(k, str) and _is_number(v)}
+    return {
+        k: f for k, v in value.items()
+        if isinstance(k, str) and _is_number(v) and (f := _finite_float(v)) is not None
+    }
 
 
 def load_state_checked(root: Path) -> tuple[FiredState, str | None]:

@@ -631,3 +631,45 @@ def test_load_state_checked_reports_corrupt_state(tmp_path):
 
     assert state == FiredState(windows={}, sent={})
     assert str(path) in problem
+
+
+HUGE_INT = "9" * 400
+
+
+@pytest.mark.parametrize("filter_text", [
+    f'{{"leadS": {{"five_hour": {HUGE_INT}}}}}',
+    f'{{"minLeftPct": {HUGE_INT}}}',
+], ids=["leadS", "minLeftPct"])
+def test_huge_integer_filter_numbers_drop_the_destination(tmp_path, filter_text):
+    (tmp_path / "reset_events.json").write_text(
+        '{"destinations": [{"id": "mac", "kind": "mac", "enabled": true},'
+        ' {"id": "h", "kind": "webhook", "enabled": true, "url": "https://example.com/h",'
+        f' "filter": {filter_text}}}]}}'
+    )
+
+    dests, problem = load_destinations_checked(tmp_path)
+
+    assert [d.id for d in dests] == ["mac"]
+    assert problem is not None
+
+
+def test_integer_literal_over_the_json_digit_limit_is_reported_unreadable(tmp_path):
+    (tmp_path / "reset_events.json").write_text(f'{{"destinations": {"9" * 5000}}}')
+    (tmp_path / "reset_events_state.json").write_text(f'{{"windows": {"9" * 5000}}}')
+
+    dests, problem = load_destinations_checked(tmp_path)
+    state, state_problem = load_state_checked(tmp_path)
+
+    assert dests == DEFAULT and "could not be read in full" in problem
+    assert state == FiredState(windows={}, sent={}) and state_problem is not None
+
+
+def test_state_skips_numbers_that_overflow_or_are_not_finite(tmp_path):
+    (tmp_path / "reset_events_state.json").write_text(
+        f'{{"windows": {{"a": {HUGE_INT}, "b": NaN, "c": Infinity, "d": 5}}, "sent": {{}}}}'
+    )
+
+    state, problem = load_state_checked(tmp_path)
+
+    assert state.windows == {"d": 5.0}
+    assert problem is None
