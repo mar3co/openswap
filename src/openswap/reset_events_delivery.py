@@ -1,7 +1,9 @@
 """Webhook delivery for reset events: signed POSTs on a background thread.
 
 Each destination's signing secret lives in the Keychain, keyed by its id.
-A delivery makes three attempts, then gives up and reports the last error.
+A delivery makes three attempts, then gives up and reports the last error;
+a redirect or a 4xx other than 408 and 429 is reported at once, since
+retrying it would get the same answer.
 """
 
 from __future__ import annotations
@@ -28,7 +30,19 @@ _logger = logging.getLogger(__name__)
 
 
 class DeliveryError(Exception):
-    pass
+    def __init__(self, message: str, *, permanent: bool = False):
+        super().__init__(message)
+        self.permanent = permanent
+
+
+def _http_error(code: int) -> DeliveryError:
+    if 300 <= code < 400:
+        return DeliveryError(f"HTTP {code}: the URL redirects; use the final URL", permanent=True)
+    if code in (401, 403):
+        return DeliveryError(
+            f"HTTP {code}: the receiver rejected the request (check the secret)", permanent=True
+        )
+    return DeliveryError(f"HTTP {code}", permanent=400 <= code < 500 and code not in (408, 429))
 
 
 class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
@@ -92,7 +106,7 @@ def post_once(
         with opener(request, timeout=TIMEOUT_S):
             pass
     except urllib.error.HTTPError as e:
-        raise DeliveryError(f"HTTP {e.code}") from None
+        raise _http_error(e.code) from None
     except TimeoutError:
         raise DeliveryError(f"timed out after {TIMEOUT_S} s") from None
     except urllib.error.URLError as e:
@@ -145,6 +159,10 @@ def _deliver(dest, body, sleep, opener) -> str:
             post_once(dest.url, body, secret, now=time.time(), opener=opener)
         except DeliveryError as e:
             error = str(e)
+            if e.permanent:
+                return error
+            if not delay:
+                _logger.warning("Reset event webhook %s failed, retrying: %s", dest.id, error)
         else:
             return ""
     return error

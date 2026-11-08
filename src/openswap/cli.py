@@ -1299,6 +1299,8 @@ Examples:
                     print(f"  {dimmed(_describe_filter(d.filter))}")
                     if d.last_error:
                         warning(f"  last error: {d.last_error}")
+                    if d.last_failure:
+                        warning(f"  last failure: {d.last_failure}")
             if problem:
                 error(problem)
                 sys.exit(1)

@@ -126,6 +126,40 @@ def test_post_once_raises_on_500():
         delivery.post_once(URL, BODY, "s", now=0, opener=FakeOpener(_http_error(500)))
 
 
+@pytest.mark.parametrize("code, message", [
+    (301, "HTTP 301: the URL redirects; use the final URL"),
+    (308, "HTTP 308: the URL redirects; use the final URL"),
+    (401, "HTTP 401: the receiver rejected the request (check the secret)"),
+    (403, "HTTP 403: the receiver rejected the request (check the secret)"),
+    (404, "HTTP 404"),
+])
+def test_permanent_http_failures_are_not_retried(code, message, caplog):
+    opener = FakeOpener(_http_error(code))
+    with caplog.at_level("WARNING", logger=delivery.__name__):
+        results, sleeps = _deliver(opener)
+    assert results == [("wh_1", message)]
+    assert len(opener.requests) == 1 and sleeps == []
+    assert not [r for r in caplog.records if r.name == delivery.__name__]
+
+
+@pytest.mark.parametrize("code", [408, 429, 500])
+def test_timeouts_rate_limits_and_server_errors_are_retried(code):
+    opener = FakeOpener(_http_error(code), _http_error(code), None)
+    results, sleeps = _deliver(opener)
+    assert results == [("wh_1", "")]
+    assert sleeps == [30, 60]
+
+
+def test_first_failed_attempt_is_logged_before_retrying(caplog):
+    opener = FakeOpener(_http_error(502), _http_error(503), _http_error(500))
+    with caplog.at_level("WARNING", logger=delivery.__name__):
+        _deliver(opener)
+    (record,) = [r for r in caplog.records if r.name == delivery.__name__]
+    assert record.levelname == "WARNING"
+    assert "wh_1" in record.getMessage() and "HTTP 502" in record.getMessage()
+    assert "retrying" in record.getMessage()
+
+
 def test_post_once_does_not_follow_redirect():
     paths = []
 

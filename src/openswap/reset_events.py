@@ -12,7 +12,7 @@ import json
 import math
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -55,6 +55,7 @@ class Destination:
     url: str = ""
     filter: Filter = field(default_factory=Filter)
     last_error: str = ""
+    last_failure: str = ""
 
 
 @dataclass
@@ -126,7 +127,7 @@ def _destination_from_json(raw) -> Destination:
     if not isinstance(raw, dict):
         raise ValueError("destination is not an object")
     dest_id, kind, enabled = raw.get("id"), raw.get("kind"), raw.get("enabled")
-    url, last_error = raw.get("url", ""), raw.get("lastError", "")
+    url, last_error, last_failure = raw.get("url", ""), raw.get("lastError", ""), raw.get("lastFailure", "")
     if not isinstance(dest_id, str) or not dest_id:
         raise ValueError(f"bad id {dest_id!r}")
     if kind not in KINDS:
@@ -135,8 +136,8 @@ def _destination_from_json(raw) -> Destination:
         raise ValueError(f"id 'mac' is reserved for the mac destination, not {kind!r}")
     if not isinstance(enabled, bool):
         raise ValueError(f"bad enabled {enabled!r}")
-    if not isinstance(url, str) or not isinstance(last_error, str):
-        raise ValueError("url and lastError must be strings")
+    if not all(isinstance(v, str) for v in (url, last_error, last_failure)):
+        raise ValueError("url, lastError and lastFailure must be strings")
     return Destination(
         id=dest_id,
         kind=kind,
@@ -144,6 +145,7 @@ def _destination_from_json(raw) -> Destination:
         url=url,
         filter=_filter_from_json(raw.get("filter", {})),
         last_error=last_error,
+        last_failure=last_failure,
     )
 
 
@@ -162,6 +164,7 @@ def destination_to_json(dest: Destination) -> dict:
             "minLeftPct": f.min_left_pct,
         },
         "lastError": dest.last_error,
+        "lastFailure": dest.last_failure,
     }
 
 
@@ -227,7 +230,8 @@ def update_destinations(
     root: Path, fn: Callable[[list[Destination]], list[Destination]],
 ) -> list[Destination]:
     """Load, transform, and save under one lock so concurrent writers never
-    overwrite each other's changes from a stale copy.
+    overwrite each other's changes from a stale copy. Nothing is written when
+    ``fn`` changes nothing.
 
     Raises :class:`DestinationsUnreadable`, writing nothing, when the file
     could not be read in full."""
@@ -235,9 +239,18 @@ def update_destinations(
         dests, problem = load_destinations_checked(root)
         if problem:
             raise DestinationsUnreadable(problem)
-        dests = fn(dests)
-        _write_destinations(root, dests)
-    return dests
+        updated = fn(dests)
+        if updated != dests:
+            _write_destinations(root, updated)
+    return updated
+
+
+def with_delivery_result(dest: Destination, error: str, now: float) -> Destination:
+    """``dest`` after a delivery: ``last_error`` is the latest result, and
+    ``last_failure`` keeps the latest failure even after a later success."""
+    if not error:
+        return replace(dest, last_error="")
+    return replace(dest, last_error=error, last_failure=f"{_iso_z(int(now))} {error}")
 
 
 def _finite_float(value) -> float | None:

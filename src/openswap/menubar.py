@@ -182,13 +182,13 @@ def run(switcher, codex=None) -> int:
         CONFIG_FILENAME,
         FiredState,
         detect,
-        load_destinations,
         load_destinations_checked,
         load_state_checked,
         payload,
         readings_from_snapshot,
         save_state,
         update_destinations,
+        with_delivery_result,
     )
     from openswap.reset_events_delivery import deliver_async
 
@@ -4229,18 +4229,22 @@ def run(switcher, codex=None) -> int:
             # Runs on the delivery thread: file writes only, the UI follows via _dirty.
             if error:
                 self.switcher._logger.warning("reset event webhook %s failed: %s", dest_id, error)
-            root = self.switcher.backup_dir
-            if all(d.last_error == error for d in load_destinations(root) if d.id == dest_id):
-                return
+            now = time.time()
+            changed = False
+
+            def record(ds):
+                nonlocal changed
+                updated = [with_delivery_result(d, error, now) if d.id == dest_id else d for d in ds]
+                changed = updated != ds
+                return updated
+
             try:
-                update_destinations(
-                    root,
-                    lambda ds: [replace(d, last_error=error) if d.id == dest_id else d for d in ds],
-                )
+                update_destinations(self.switcher.backup_dir, record)
             except (ClaudeSwitchError, OSError, ValueError) as e:
                 self.switcher._logger.warning("could not record webhook %s result: %s", dest_id, e)
                 return
-            self._dirty = True
+            if changed:
+                self._dirty = True
 
         def _toggle_reset_events_mac(self) -> None:
             try:

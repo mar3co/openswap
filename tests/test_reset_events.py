@@ -28,6 +28,7 @@ from openswap.reset_events import (
     save_state,
     signature_header,
     update_destinations,
+    with_delivery_result,
 )
 
 DEFAULT_MAC = Destination(id="mac", kind="mac", enabled=False, filter=Filter())
@@ -704,3 +705,36 @@ def test_deeply_nested_config_and_state_are_reported_unreadable(tmp_path):
 
     assert dests == DEFAULT and problem is not None
     assert state == FiredState(windows={}, sent={}) and state_problem is not None
+
+
+def test_delivery_result_keeps_the_last_failure_after_a_success():
+    hook = Destination(id="h", kind="webhook", enabled=True, url="https://example.com/h")
+
+    failed = with_delivery_result(hook, "HTTP 500", T + 0.9)
+    assert failed.last_error == "HTTP 500"
+    assert failed.last_failure == "2027-01-15T08:00:00Z HTTP 500"
+
+    recovered = with_delivery_result(failed, "", T + 60)
+    assert recovered.last_error == ""
+    assert recovered.last_failure == "2027-01-15T08:00:00Z HTTP 500"
+
+
+def test_last_failure_round_trips_through_the_config(tmp_path):
+    hook = Destination(id="h", kind="webhook", enabled=True, url="https://example.com/h",
+                       last_failure="2026-11-09T15:00:04Z HTTP 500")
+    save_destinations(tmp_path, [DEFAULT_MAC, hook])
+
+    raw = json.loads((tmp_path / "reset_events.json").read_text())
+    assert raw["destinations"][1]["lastFailure"] == "2026-11-09T15:00:04Z HTTP 500"
+    assert load_destinations(tmp_path) == [DEFAULT_MAC, hook]
+
+
+def test_update_destinations_skips_the_write_when_nothing_changed(tmp_path):
+    save_destinations(tmp_path, DEFAULT)
+    config = tmp_path / "reset_events.json"
+    config.write_text(config.read_text() + "\n")
+    before = config.read_text()
+
+    update_destinations(tmp_path, lambda dests: list(dests))
+
+    assert config.read_text() == before

@@ -175,7 +175,7 @@ def test_set_updates_mac_filter(temp_home, capsys):
 
 
 def test_list_json_shape(temp_home, capsys):
-    _seed(replace(_webhook(), last_error="HTTP 500"))
+    _seed(replace(_webhook(), last_error="HTTP 500", last_failure="2026-11-09T15:00:04Z HTTP 500"))
 
     code, out, _ = _run(["list", "--json"], capsys)
 
@@ -197,7 +197,18 @@ def test_list_json_shape(temp_home, capsys):
             "minLeftPct": 20.0,
         },
         "lastError": "HTTP 500",
+        "lastFailure": "2026-11-09T15:00:04Z HTTP 500",
     }
+
+
+def test_list_shows_the_last_failure_after_a_later_success(temp_home, capsys):
+    _seed(replace(_webhook(), last_failure="2026-11-09T15:00:04Z HTTP 500"))
+
+    code, out, err = _run(["list"], capsys)
+
+    assert code == 0
+    assert "last failure: 2026-11-09T15:00:04Z HTTP 500" in out + err
+    assert "last error" not in out + err
 
 
 @pytest.fixture

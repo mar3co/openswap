@@ -895,9 +895,10 @@ def _reset_events_app(tmp_path, *, delivered, notified, logged, save_state=None)
             (dest.id, json.loads(body), json.loads((tmp_path / "reset_events_state.json").read_text()))
         ),
         **{name: getattr(reset_events, name) for name in (
-            "CONFIG_FILENAME", "FiredState", "detect", "load_destinations",
+            "CONFIG_FILENAME", "FiredState", "detect",
             "load_destinations_checked", "load_state_checked", "payload",
             "readings_from_snapshot", "save_state", "update_destinations",
+            "with_delivery_result",
         )},
     }
     if save_state is not None:
@@ -1084,30 +1085,34 @@ def test_reset_events_mac_toggle_flips_the_saved_destination(tmp_path):
     assert [d.enabled for d in load_destinations(tmp_path) if d.kind == "mac"] == [True]
 
 
-def test_reset_events_delivery_result_records_only_changed_errors(tmp_path):
+def test_reset_events_delivery_result_keeps_the_last_failure_and_skips_unchanged_writes(tmp_path):
     from openswap.reset_events import Destination, load_destinations, save_destinations
 
     save_destinations(tmp_path, [Destination(id="h1", kind="webhook", enabled=True, url="https://x.test/h")])
     config = tmp_path / "reset_events.json"
     app = _reset_events_app(tmp_path, delivered=[], notified=[], logged=[])
 
+    def hook():
+        return {d.id: d for d in load_destinations(tmp_path)}["h1"]
+
+    mtime = config.stat().st_mtime_ns
     app._record_reset_event_delivery("h1", "")
-    assert app._dirty is False
+    assert app._dirty is False and config.stat().st_mtime_ns == mtime
 
     app._record_reset_event_delivery("h1", "HTTP 500")
-    assert {d.id: d.last_error for d in load_destinations(tmp_path)}["h1"] == "HTTP 500"
+    assert hook().last_error == "HTTP 500" and hook().last_failure.endswith("Z HTTP 500")
+    assert app._dirty is True
+
+    app._dirty = False
+    app._record_reset_event_delivery("h1", "")
+    assert hook().last_error == "" and hook().last_failure.endswith("Z HTTP 500")
     assert app._dirty is True
 
     app._dirty = False
     mtime = config.stat().st_mtime_ns
-    app._record_reset_event_delivery("h1", "HTTP 500")
+    app._record_reset_event_delivery("h1", "")
     assert app._dirty is False and config.stat().st_mtime_ns == mtime
 
-    app._record_reset_event_delivery("h1", "")
-    assert {d.id: d.last_error for d in load_destinations(tmp_path)}["h1"] == ""
-    assert app._dirty is True
-
-    app._dirty = False
     app._record_reset_event_delivery("gone", "HTTP 500")
     assert app._dirty is False
 
