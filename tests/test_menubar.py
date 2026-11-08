@@ -14,6 +14,7 @@ import os
 import plistlib
 import sys
 import threading
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -815,6 +816,148 @@ def test_settings_page_hides_kickoff_time_when_disabled():
     ids_on = [row["id"] for row in on]
     assert ids_on.index("kickoff_enabled") < ids_on.index("kickoff_time")
     assert ids_on.index("group_schedule") < ids_on.index("kickoff_enabled")
+
+
+def _reset_event_rows(reset_events):
+    rows = menubar.settings_page_rows(
+        menubar.MenuBarSettings(), strategy="best", threshold=90, reset_events=reset_events,
+    )
+    return [row["id"] for row in rows], {row["id"]: row for row in rows}
+
+
+def test_settings_page_reset_events_rows_without_webhooks():
+    from openswap.reset_events import Destination
+
+    ids, by_id = _reset_event_rows([Destination(id="mac", kind="mac", enabled=True)])
+    assert by_id["group_reset_events"]["label"] == "Reset events"
+    assert by_id["group_reset_events"]["section"] == menubar.SETTINGS_SECTION_AUTOMATION
+    assert by_id["reset_events_mac"]["label"] == "Notify on this Mac"
+    assert by_id["reset_events_mac"]["value"] is True
+    assert by_id["reset_events_webhooks"]["label"] == (
+        "Send events to your own automations with openswap events add-webhook"
+    )
+    assert ids.index("group_schedule") < ids.index("group_reset_events")
+    assert ids.index("group_reset_events") < ids.index("reset_events_mac") < ids.index("reset_events_webhooks")
+
+
+def test_settings_page_reset_events_rows_count_webhooks_and_flag_failures():
+    from openswap.reset_events import Destination
+
+    mac = Destination(id="mac", kind="mac", enabled=False)
+    hooks = [Destination(id=f"h{i}", kind="webhook", enabled=True, url="https://x.test") for i in (1, 2)]
+    _, by_id = _reset_event_rows([mac, *hooks])
+    assert by_id["reset_events_mac"]["value"] is False
+    assert by_id["reset_events_webhooks"]["label"] == "2 webhook(s) · manage with openswap events"
+
+    hooks[1] = replace(hooks[1], last_error="HTTP 500")
+    _, by_id = _reset_event_rows([mac, *hooks])
+    assert by_id["reset_events_webhooks"]["label"] == (
+        "2 webhook(s) · manage with openswap events · last delivery failed"
+    )
+
+
+def _reset_events_app(tmp_path, *, delivered, notified, logged):
+    from openswap import reset_events
+    from tests.menubar_harness import extract_class
+
+    scope = {
+        "time": __import__("time"),
+        "json": json,
+        "replace": replace,
+        "notification_copy_for_reset_event": menubar.notification_copy_for_reset_event,
+        "deliver_async": lambda dest, body, *, on_result: delivered.append(
+            (dest.id, json.loads(body), json.loads((tmp_path / "reset_events_state.json").read_text()))
+        ),
+        **{name: getattr(reset_events, name) for name in (
+            "FiredState", "detect", "load_destinations", "load_state", "payload",
+            "readings_from_snapshot", "save_state", "update_destinations",
+        )},
+    }
+    names = {"_maybe_reset_events", "_fire_reset_events", "_record_reset_event_delivery", "_mac_name"}
+    app = extract_class(menubar.__file__, "MenuBarApp", names, scope)()
+    app.switcher = SimpleNamespace(
+        backup_dir=tmp_path,
+        _logger=SimpleNamespace(warning=lambda *a, **k: logged.append(a)),
+    )
+    app._desktop_switching = False
+    app._snapshot_at = 1.0
+    app._reset_events_at = float("-inf")
+    app._mac_name_cached = "Test Mac"
+    app._dirty = False
+    app._notify = notified.append
+    return app
+
+
+def _ending_soon_snapshot():
+    import time as _time
+
+    resets_at = _dt.datetime.fromtimestamp(_time.time() + 600, _dt.timezone.utc).isoformat()
+    usage = {"five_hour": {"pct": 40.0, "resets_at": resets_at}}
+    return {
+        "accounts": [(1, "a@example.com", True, usage, None, "Work", "Acme", False, None)],
+        "identities": {"1": ("a@example.com", "org-1")},
+    }
+
+
+def test_reset_events_pass_saves_state_before_delivering_and_fires_once(tmp_path):
+    from openswap.reset_events import Destination, save_destinations
+
+    save_destinations(tmp_path, [
+        Destination(id="mac", kind="mac", enabled=True),
+        Destination(id="h1", kind="webhook", enabled=True, url="https://x.test/h"),
+    ])
+    delivered, notified, logged = [], [], []
+    app = _reset_events_app(tmp_path, delivered=delivered, notified=notified, logged=logged)
+    app.snapshot = _ending_soon_snapshot()
+
+    app._maybe_reset_events()
+    assert [c.title for c in notified] == ["Work: 5-hour ends in 9m"]
+    [(dest_id, body, state_at_delivery)] = delivered
+    assert (dest_id, body["type"], body["mac"]) == ("h1", "window.ending_soon", "Test Mac")
+    assert f"h1|{body['id']}" in state_at_delivery["sent"]
+
+    app._reset_events_at = float("-inf")
+    app._maybe_reset_events()
+    assert len(notified) == 1 and len(delivered) == 1
+    assert logged == []
+
+
+def test_reset_events_pass_logs_failures_at_most_every_15_seconds(tmp_path):
+    delivered, notified, logged = [], [], []
+    app = _reset_events_app(tmp_path, delivered=delivered, notified=notified, logged=logged)
+    app.snapshot = None
+
+    app._maybe_reset_events()
+    app._maybe_reset_events()
+    assert len(logged) == 1
+
+
+def test_reset_events_delivery_result_records_only_changed_errors(tmp_path):
+    from openswap.reset_events import Destination, load_destinations, save_destinations
+
+    save_destinations(tmp_path, [Destination(id="h1", kind="webhook", enabled=True, url="https://x.test/h")])
+    config = tmp_path / "reset_events.json"
+    app = _reset_events_app(tmp_path, delivered=[], notified=[], logged=[])
+
+    app._record_reset_event_delivery("h1", "")
+    assert app._dirty is False
+
+    app._record_reset_event_delivery("h1", "HTTP 500")
+    assert {d.id: d.last_error for d in load_destinations(tmp_path)}["h1"] == "HTTP 500"
+    assert app._dirty is True
+
+    app._dirty = False
+    mtime = config.stat().st_mtime_ns
+    app._record_reset_event_delivery("h1", "HTTP 500")
+    assert app._dirty is False and config.stat().st_mtime_ns == mtime
+
+    app._record_reset_event_delivery("h1", "")
+    assert {d.id: d.last_error for d in load_destinations(tmp_path)}["h1"] == ""
+    assert app._dirty is True
+
+    app._dirty = False
+    app._record_reset_event_delivery("gone", "HTTP 500")
+    assert app._dirty is False
 
 
 @pytest.mark.parametrize("title_pct", ["off", "both"])

@@ -447,3 +447,21 @@ def test_weekly_anchor_moved_earlier_corrects_state_without_started():
 
 def test_partial_lead_s_filter_gets_defaults():
     assert Filter(lead_s={"five_hour": 600}).lead_s == {"five_hour": 600, "seven_day": 10800}
+
+
+def test_notification_copy_for_each_event_type():
+    from openswap.menubar_display import notification_copy_for_reset_event
+
+    r = reading()
+    started = ResetEvent("window.started", "five_hour", r, T, 38.0, ())
+    clock = datetime.fromtimestamp(T).strftime("%-I:%M %p")
+    copy = notification_copy_for_reset_event(started, T - 5 * 3600)
+    assert (copy.title, copy.body) == ("Work: 5-hour window started", f"62% left · resets {clock}")
+
+    ending = ResetEvent("window.ending_soon", "seven_day", r, T, 61.0, ())
+    copy = notification_copy_for_reset_event(ending, T - (3 * 3600 + 5 * 60))
+    assert (copy.title, copy.body) == ("Work: weekly ends in 3h 5m", "39% left")
+
+    reset = ResetEvent("window.reset", "five_hour", r, T, 0.0, ())
+    copy = notification_copy_for_reset_event(reset, T + 10)
+    assert (copy.title, copy.body) == ("Work: 5-hour reset", "Full quota available")

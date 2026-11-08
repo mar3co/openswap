@@ -860,11 +860,13 @@ def settings_page_rows(
     desktop_app: str = "claude",
     expanded_sections: set[str] | None = None,
     section: str | None = None,
+    reset_events: list | None = None,
 ) -> list[dict]:
     """Rows for the in-popover settings page. No AppKit.
 
     ``login_item`` feeds General › This Mac (see :func:`this_mac_rows`); it
-    is read when the page is built, not stored in ``MenuBarSettings``.
+    is read when the page is built, not stored in ``MenuBarSettings``. So is
+    ``reset_events``, the destinations behind Automation › Reset events.
 
     Each dict: ``{"kind": "toggle"|"choice"|"group"|"popup", "id": str, "label": str, ...}``.
     Choice and popup rows include ``options`` ``(value, label)`` and the current
@@ -1207,6 +1209,7 @@ def settings_page_rows(
                 ),
             }
         )
+    automation.extend(reset_events_settings_rows(reset_events or []))
     desktop = []
     if settings.desktop_features_enabled:
         desktop.append({"kind": "popup", "section": SETTINGS_SECTION_DESKTOP,
@@ -1233,6 +1236,26 @@ def settings_page_rows(
             section = SETTINGS_SECTION_GENERAL
         rows = [row for row in rows if row["section"] == section]
     return rows
+
+
+def reset_events_settings_rows(destinations: list) -> list[dict]:
+    """Automation › Reset events, from the destinations in ``reset_events.json``."""
+    mac_enabled = any(d.kind == "mac" and d.enabled for d in destinations)
+    webhooks = [d for d in destinations if d.kind == "webhook"]
+    if webhooks:
+        hint = f"{len(webhooks)} webhook(s) · manage with openswap events"
+        if any(d.last_error for d in webhooks):
+            hint += " · last delivery failed"
+    else:
+        hint = "Send events to your own automations with openswap events add-webhook"
+    return [
+        {"kind": "group", "style": "section", "section": SETTINGS_SECTION_AUTOMATION,
+         "id": "group_reset_events", "label": "Reset events"},
+        {"kind": "toggle", "section": SETTINGS_SECTION_AUTOMATION,
+         "id": "reset_events_mac", "label": "Notify on this Mac", "value": mac_enabled},
+        {"kind": "group", "style": "hint", "section": SETTINGS_SECTION_AUTOMATION,
+         "id": "reset_events_webhooks", "label": hint, "lines": _hint_lines(hint)},
+    ]
 
 
 OPEN_AT_LOGIN_MOVE_HINT = "Move OpenSwap to Applications to open it at login."
@@ -1658,6 +1681,29 @@ class NotificationCopy:
 
     def rumps_args(self) -> tuple[str, str, str]:
         return (self.title, self.subtitle, self.body)
+
+
+_RESET_WINDOW_NAMES = {"five_hour": "5-hour", "seven_day": "weekly"}
+
+
+def notification_copy_for_reset_event(event, now: float) -> NotificationCopy:
+    """Mac banner for a reset event (``openswap.reset_events.ResetEvent``)."""
+    label = event.reading.label
+    window_name = _RESET_WINDOW_NAMES[event.window]
+    remaining = 100 - event.used_pct
+    if event.type == "window.started":
+        clock = datetime.fromtimestamp(event.resets_at).strftime("%-I:%M %p")
+        return NotificationCopy(
+            title=f"{label}: 5-hour window started",
+            body=f"{remaining:.0f}% left · resets {clock}",
+        )
+    if event.type == "window.ending_soon":
+        countdown = _live_countdown({"resets_at": event.resets_at_iso}, now)
+        return NotificationCopy(
+            title=f"{label}: {window_name} ends in {countdown}",
+            body=f"{remaining:.0f}% left",
+        )
+    return NotificationCopy(title=f"{label}: {window_name} reset", body="Full quota available")
 
 
 def account_short_name(

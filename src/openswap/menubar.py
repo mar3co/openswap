@@ -9,11 +9,14 @@ popover keep importing from this module. ``rumps`` is imported only in
 
 from __future__ import annotations
 
+import json
 import os
+import socket
 import subprocess
 import sys
 import threading
 import time
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -175,6 +178,17 @@ def run(switcher, codex=None) -> int:
     from openswap.settings import load_settings, set_setting
     from openswap.snapshot_source import SnapshotSource
     from openswap.claude_desktop_menu import ClaudeDesktopMenu, has_saved_profiles
+    from openswap.reset_events import (
+        FiredState,
+        detect,
+        load_destinations,
+        load_state,
+        payload,
+        readings_from_snapshot,
+        save_state,
+        update_destinations,
+    )
+    from openswap.reset_events_delivery import deliver_async
 
     settings_path = menubar_settings_path(switcher.backup_dir)
     log_path = switcher.backup_dir / "openswap.log"
@@ -200,6 +214,8 @@ def run(switcher, codex=None) -> int:
             self._update_found = None  # written by the release-check thread
             self._update_shown = None
             self._snapshot_at = 0.0
+            self._reset_events_at = float("-inf")
+            self._mac_name_cached: str | None = None
             self._refreshing = False
             self._config_path = switcher._get_claude_config_path()
             self._config_mtime = 0.0
@@ -681,6 +697,7 @@ def run(switcher, codex=None) -> int:
             self._maybe_auto_capture_relogin()
             self._drain_kickoff_results()
             self._maybe_kickoff()
+            self._maybe_reset_events()
 
         def _consume_widget_command(self):
             # switch_to and rumps.alert must run on the UI thread.
@@ -1849,6 +1866,7 @@ def run(switcher, codex=None) -> int:
                 login_item=self._login_item_state,
                 status_line=self._status_line_state,
                 bundled_widget=_bundled_widget,
+                reset_events=lambda: load_destinations(self.switcher.backup_dir),
             )
             self._panel.attach(nsitem)
             # Requests left before the observers existed: `openswap setup`
@@ -2469,6 +2487,11 @@ def run(switcher, codex=None) -> int:
                     return
             elif row_id == "kickoff_enabled":
                 self.on_toggle_kickoff(None)
+            elif row_id == "reset_events_mac":
+                update_destinations(
+                    self.switcher.backup_dir,
+                    lambda ds: [replace(d, enabled=not d.enabled) if d.kind == "mac" else d for d in ds],
+                )
             elif row_id == "claude_status_line":
                 self._toggle_status_line()
             elif row_id in ("remote_attention_notices", "remote_attention_details", "remote_attention_replies"):
@@ -4141,6 +4164,61 @@ def run(switcher, codex=None) -> int:
                 return
             self._kickoff_running = True
             threading.Thread(target=self._run_kickoff, daemon=True).start()
+
+        def _maybe_reset_events(self):
+            if self._desktop_switching or self._snapshot_at == 0.0:
+                return
+            started = time.monotonic()
+            if started - self._reset_events_at < 15.0:
+                return
+            self._reset_events_at = started
+            try:
+                self._fire_reset_events()
+            except Exception:
+                self.switcher._logger.warning("reset events pass failed", exc_info=True)
+
+        def _fire_reset_events(self):
+            root = self.switcher.backup_dir
+            now = time.time()
+            state = load_state(root)
+            before = FiredState(dict(state.windows), dict(state.sent), dict(state.emitted))
+            fired = detect(
+                readings_from_snapshot(self.snapshot), load_destinations(root), state, now
+            )
+            # Saved before delivery so a crash mid-delivery never repeats an event.
+            if state != before:
+                save_state(root, state, now)
+            for dest, event in fired:
+                if dest.kind == "mac":
+                    self._notify(notification_copy_for_reset_event(event, now))
+                else:
+                    body = json.dumps(payload(event, mac=self._mac_name(), now=now)).encode()
+                    deliver_async(dest, body, on_result=self._record_reset_event_delivery)
+
+        def _record_reset_event_delivery(self, dest_id: str, error: str):
+            # Runs on the delivery thread: file writes only, the UI follows via _dirty.
+            if error:
+                self.switcher._logger.warning("reset event webhook %s failed: %s", dest_id, error)
+            root = self.switcher.backup_dir
+            if all(d.last_error == error for d in load_destinations(root) if d.id == dest_id):
+                return
+            update_destinations(
+                root,
+                lambda ds: [replace(d, last_error=error) if d.id == dest_id else d for d in ds],
+            )
+            self._dirty = True
+
+        def _mac_name(self) -> str:
+            if self._mac_name_cached is None:
+                try:
+                    name = subprocess.run(
+                        ["scutil", "--get", "ComputerName"],
+                        capture_output=True, text=True, timeout=2,
+                    ).stdout.strip()
+                except (OSError, subprocess.SubprocessError):
+                    name = ""
+                self._mac_name_cached = name or socket.gethostname()
+            return self._mac_name_cached
 
         def _run_kickoff(self):
             results: list[KickoffResult] = []

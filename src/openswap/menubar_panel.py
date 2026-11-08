@@ -1045,6 +1045,7 @@ class MenuBarPanel:
         on_toggle_codex_auto=None,
         status_line=None,
         bundled_widget=None,
+        reset_events=None,
     ):
         self._on_switch = on_switch
         self._on_card_menu = on_card_menu
@@ -1088,6 +1089,7 @@ class MenuBarPanel:
         self._login_item = login_item
         self._status_line = status_line or (lambda: "off")  # "on" | "other" | "off"
         self._bundled_widget = bundled_widget or (lambda: False)
+        self._reset_events = reset_events or (lambda: [])
         self._on_worker_view_active = on_worker_view_active
         self._login_alias = ""
         self._login_alias_field = None
@@ -2422,6 +2424,10 @@ class MenuBarPanel:
             bundled_widget = bool(self._bundled_widget())
         except Exception:
             bundled_widget = False
+        try:
+            reset_events = self._reset_events()
+        except Exception:
+            reset_events = []
         rows = settings_page_rows(
             settings,
             strategy=strategy,
@@ -2440,6 +2446,7 @@ class MenuBarPanel:
             desktop_app=self._desktop_settings_app,
             expanded_sections=self._settings_disclosures,
             section=self._settings_section,
+            reset_events=reset_events,
         )
 
         def _choice_lines(row):
