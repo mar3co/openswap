@@ -1,5 +1,7 @@
 import hmac
 import http.client
+import http.server
+import threading
 import urllib.error
 
 import pytest
@@ -94,6 +96,34 @@ def test_post_once_sends_signature_and_json_headers():
 def test_post_once_raises_on_500():
     with pytest.raises(delivery.DeliveryError, match="HTTP 500"):
         delivery.post_once(URL, BODY, "s", now=0, opener=FakeOpener(_http_error(500)))
+
+
+def test_post_once_does_not_follow_redirect():
+    paths = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            paths.append(self.path)
+            self.rfile.read(int(self.headers["Content-Length"]))
+            self.send_response(302)
+            self.send_header("Location", "/moved")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        do_GET = do_POST
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        with pytest.raises(delivery.DeliveryError, match="HTTP 302"):
+            delivery.post_once(f"http://127.0.0.1:{server.server_port}/hook", BODY, "s", now=0)
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert paths == ["/hook"]
 
 
 @pytest.mark.parametrize("error, message", [

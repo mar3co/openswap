@@ -28,6 +28,17 @@ class DeliveryError(Exception):
     pass
 
 
+class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def _open_without_redirects(request: urllib.request.Request, timeout: float):
+    # Built per call so the HTTPS context picks up the truststore injection
+    # even when this module is imported before it.
+    return urllib.request.build_opener(_RefuseRedirect).open(request, timeout=timeout)
+
+
 def validate_webhook_url(url: str) -> str | None:
     try:
         parts = urlsplit(url)
@@ -58,7 +69,7 @@ def delete_secret(dest_id: str) -> None:
 
 
 def post_once(
-    url: str, body: bytes, secret: str, *, now: float, opener=urllib.request.urlopen
+    url: str, body: bytes, secret: str, *, now: float, opener=_open_without_redirects
 ) -> None:
     request = urllib.request.Request(
         url,
@@ -88,7 +99,7 @@ def deliver_async(
     *,
     on_result: Callable[[str, str], None],
     sleep=time.sleep,
-    opener=urllib.request.urlopen,
+    opener=_open_without_redirects,
 ) -> threading.Thread:
     thread = threading.Thread(
         target=_deliver,
