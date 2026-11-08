@@ -5,9 +5,12 @@ from __future__ import annotations
 import json
 import sys
 from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from openswap import cli, macos_keychain, paths
+import pytest
+
+from openswap import cli, macos_keychain, paths, reset_events
 from openswap import reset_events_delivery as delivery
 from openswap.reset_events import Destination, load_destinations, save_destinations
 
@@ -96,6 +99,46 @@ def test_add_webhook_rolls_back_when_keychain_fails(temp_home, capsys, monkeypat
     assert "locked" in err
     assert "Secret:" not in out
     assert [d.id for d in load_destinations(paths.get_backup_root())] == ["mac"]
+    assert not (paths.get_backup_root() / "reset_events.json").exists()
+
+
+def _fail_saving(monkeypatch):
+    def fail(root, fn):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(reset_events, "update_destinations", fail)
+
+
+def test_add_webhook_deletes_the_secret_when_saving_fails(
+    temp_home, capsys, block_real_keychain, monkeypatch,
+):
+    created = []
+    real_new_secret = delivery.new_secret
+    monkeypatch.setattr(delivery, "new_secret", lambda dest_id: created.append(dest_id) or real_new_secret(dest_id))
+    _fail_saving(monkeypatch)
+
+    code, out, err = _run(["add-webhook", URL], capsys)
+
+    assert code == 1
+    assert len(created) == 1
+    assert "disk full" in err
+    assert "Secret:" not in out
+    assert not block_real_keychain.data
+
+
+def test_add_webhook_reports_the_save_error_when_secret_cleanup_fails(
+    temp_home, capsys, block_real_keychain, monkeypatch,
+):
+    def locked(dest_id):
+        raise macos_keychain.KeychainError("locked")
+
+    monkeypatch.setattr(delivery, "delete_secret", locked)
+    _fail_saving(monkeypatch)
+
+    code, _, err = _run(["add-webhook", URL], capsys)
+
+    assert code == 1
+    assert "disk full" in err and "locked" not in err
 
 
 def test_remove_deletes_secret(temp_home, capsys, block_real_keychain):
@@ -157,7 +200,14 @@ def test_list_json_shape(temp_home, capsys):
     }
 
 
-def test_test_command_exit_code_on_failure(temp_home, capsys, block_real_keychain, monkeypatch):
+@pytest.fixture
+def test_mac_name(monkeypatch):
+    monkeypatch.setattr("openswap.worker.connect.computer_name", lambda: "Test Mac")
+
+
+def test_test_command_exit_code_on_failure(
+    temp_home, capsys, block_real_keychain, monkeypatch, test_mac_name,
+):
     _seed(_webhook())
     block_real_keychain.data[(delivery.KEYCHAIN_SERVICE, "wh_1")] = "s3cret"
     sent = []
@@ -177,9 +227,12 @@ def test_test_command_exit_code_on_failure(temp_home, capsys, block_real_keychai
     assert body["test"] is True
     assert body["type"] == "window.ending_soon"
     assert body["account"] == {"label": "Sample", "email": "sample@example.com", "org": ""}
+    assert body["mac"] == "Test Mac"
 
 
-def test_test_command_reports_delivered(temp_home, capsys, block_real_keychain, monkeypatch):
+def test_test_command_reports_delivered(
+    temp_home, capsys, block_real_keychain, monkeypatch, test_mac_name,
+):
     _seed(_webhook())
     block_real_keychain.data[(delivery.KEYCHAIN_SERVICE, "wh_1")] = "s3cret"
     monkeypatch.setattr(delivery, "post_once", lambda url, body, secret, *, now: None)
@@ -226,3 +279,47 @@ def test_test_command_reports_an_unreadable_config(temp_home, capsys):
     assert code == 1
     assert "could not be read in full" in err
     assert "No reset events destination" not in err
+
+
+@pytest.mark.parametrize("flag", ["--lead-5h", "--lead-weekly"])
+def test_lead_time_must_be_at_least_one_minute(temp_home, capsys, flag):
+    root = _seed()
+
+    code, _, err = _run(["set", "mac", flag, "0"], capsys)
+
+    assert code == 2
+    assert "1 or more" in err
+    assert load_destinations(root)[0].filter.lead_s == {"five_hour": 1800, "seven_day": 10800}
+
+
+def test_unknown_account_keys_warn_but_are_saved(temp_home, capsys, monkeypatch):
+    root = _seed()
+    known = SimpleNamespace(provider="claude", email="a@example.com", org_uuid="org-1")
+    monkeypatch.setattr(cli, "_known_accounts", lambda switcher, debug: [known])
+
+    code, _, err = _run(
+        ["set", "mac", "--accounts", "claude:a@example.com:org-1,claude:typo@example.com:org-1"], capsys,
+    )
+
+    assert code == 0
+    assert err.strip() == (
+        "Warning: no current account matches claude:typo@example.com:org-1"
+        " (known: claude:a@example.com:org-1)"
+    )
+    assert load_destinations(root)[0].filter.accounts == (
+        "claude:a@example.com:org-1", "claude:typo@example.com:org-1")
+
+    code, _, err = _run(["set", "mac", "--accounts", "claude:a@example.com:org-1"], capsys)
+    assert code == 0 and err == ""
+
+
+def test_set_without_changes_is_an_error(temp_home, capsys):
+    root = _seed()
+    config = root / "reset_events.json"
+    before = config.read_text()
+
+    code, _, err = _run(["set", "mac"], capsys)
+
+    assert code == 2
+    assert "Nothing to change" in err
+    assert config.read_text() == before

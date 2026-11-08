@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import sys
@@ -1104,8 +1105,8 @@ def _minutes_arg(value: str) -> int:
         minutes = int(value)
     except ValueError:
         minutes = -1
-    if minutes < 0:
-        raise argparse.ArgumentTypeError("use a whole number of minutes, 0 or more")
+    if minutes < 1:
+        raise argparse.ArgumentTypeError("use a whole number of minutes, 1 or more")
     return minutes
 
 
@@ -1159,14 +1160,32 @@ def _describe_filter(f) -> str:
     return f"{accounts} · {', '.join(f.windows)} · {events} · {lead} · min left {f.min_left_pct:g}%"
 
 
-def _sample_account_reading(switcher: Engine, debug: bool):
+def _known_accounts(switcher: Engine, debug: bool) -> list:
     from openswap.codex.engine import CodexEngine
+
+    return [
+        *switcher.accounts_snapshot(fetch=set()).accounts,
+        *CodexEngine(debug=debug).accounts_snapshot(fetch=set()).accounts,
+    ]
+
+
+def _warn_unknown_accounts(switcher: Engine, args) -> None:
+    if not args.accounts:
+        return
+    known = [f"{a.provider}:{a.email}:{a.org_uuid}" for a in _known_accounts(switcher, args.debug)]
+    unknown = [key for key in args.accounts if key not in known]
+    if unknown:
+        print(
+            f"Warning: no current account matches {', '.join(unknown)}"
+            f" (known: {', '.join(known) or 'none'})",
+            file=sys.stderr,
+        )
+
+
+def _sample_account_reading(switcher: Engine, debug: bool):
     from openswap.reset_events import AccountReading
 
-    accounts = (
-        switcher.accounts_snapshot(fetch=set()).accounts
-        or CodexEngine(debug=debug).accounts_snapshot(fetch=set()).accounts
-    )
+    accounts = _known_accounts(switcher, debug)
     if not accounts:
         return AccountReading("claude", "sample@example.com", "", "Sample", "", False, True, None, None)
     a = accounts[0]
@@ -1247,6 +1266,11 @@ Examples:
         parser.error("--json can only be used with list or add-webhook")
     if action == "add-webhook" and (problem := delivery.validate_webhook_url(args.url)):
         p_add.error(problem)
+    if action == "set" and all(
+        getattr(args, name) is None
+        for name in ("accounts", "windows", "events", "lead_5h", "lead_weekly", "min_left_pct", "enabled")
+    ):
+        p_set.error("Nothing to change; pass a filter option, --enable or --disable")
 
     def existing(dests):
         if not any(d.id == args.id for d in dests):
@@ -1275,7 +1299,11 @@ Examples:
                 error(problem)
                 sys.exit(1)
         elif action == "add-webhook":
+            _warn_unknown_accounts(switcher, args)
+            taken = {d.id for d in load_destinations(root)}
             dest_id = "wh_" + secrets.token_hex(4)
+            while dest_id in taken:
+                dest_id = "wh_" + secrets.token_hex(4)
             dest = Destination(
                 id=dest_id, kind="webhook", enabled=True, url=args.url,
                 filter=_apply_filter_args(Filter(), args),
@@ -1286,12 +1314,16 @@ Examples:
                     raise ClaudeSwitchError("Generated id is taken; run the command again")
                 return [*dests, dest]
 
-            update_destinations(root, add)
             try:
                 secret = delivery.new_secret(dest_id)
             except macos_keychain.KEYCHAIN_ERRORS as e:
-                update_destinations(root, lambda ds: [d for d in ds if d.id != dest_id])
                 raise ClaudeSwitchError(f"Couldn't save the webhook secret in the Keychain: {e}") from None
+            try:
+                update_destinations(root, add)
+            except BaseException:
+                with contextlib.suppress(*macos_keychain.KEYCHAIN_ERRORS):
+                    delivery.delete_secret(dest_id)
+                raise
             if json_mode:
                 print(json.dumps({"schemaVersion": 1, "id": dest_id, "secret": secret}, indent=2))
             else:
@@ -1299,6 +1331,8 @@ Examples:
                 print(f"Secret: {secret}")
                 print("Save this secret now; it can't be shown again.")
         elif action == "set":
+            _warn_unknown_accounts(switcher, args)
+
             def update(d):
                 d = replace(d, filter=_apply_filter_args(d.filter, args))
                 return d if args.enabled is None else replace(d, enabled=args.enabled)
