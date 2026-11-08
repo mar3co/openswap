@@ -860,13 +860,13 @@ def settings_page_rows(
     desktop_app: str = "claude",
     expanded_sections: set[str] | None = None,
     section: str | None = None,
-    reset_events: list | None = None,
+    reset_events: dict | None = None,
 ) -> list[dict]:
     """Rows for the in-popover settings page. No AppKit.
 
     ``login_item`` feeds General › This Mac (see :func:`this_mac_rows`); it
     is read when the page is built, not stored in ``MenuBarSettings``. So is
-    ``reset_events``, the destinations behind Automation › Reset events.
+    ``reset_events``, the keyword arguments for :func:`reset_events_settings_rows`.
 
     Each dict: ``{"kind": "toggle"|"choice"|"group"|"popup", "id": str, "label": str, ...}``.
     Choice and popup rows include ``options`` ``(value, label)`` and the current
@@ -1209,7 +1209,7 @@ def settings_page_rows(
                 ),
             }
         )
-    automation.extend(reset_events_settings_rows(reset_events or []))
+    automation.extend(reset_events_settings_rows(**(reset_events or {})))
     desktop = []
     if settings.desktop_features_enabled:
         desktop.append({"kind": "popup", "section": SETTINGS_SECTION_DESKTOP,
@@ -1238,11 +1238,23 @@ def settings_page_rows(
     return rows
 
 
-def reset_events_settings_rows(destinations: list) -> list[dict]:
-    """Automation › Reset events, from the destinations in ``reset_events.json``."""
+def reset_events_settings_rows(
+    destinations: list = (), unreadable_config=None, save_error: str = "",
+) -> list[dict]:
+    """Automation › Reset events, from the destinations in ``reset_events.json``.
+
+    ``unreadable_config`` is that file's path when part of it could not be
+    read; ``save_error`` is set while the fired state can't be saved."""
     mac_enabled = any(d.kind == "mac" and d.enabled for d in destinations)
     webhooks = [d for d in destinations if d.kind == "webhook"]
-    if webhooks:
+    notices = []
+    if save_error:
+        notices.append(f"Reset events are paused: can't save their state ({save_error})")
+    if unreadable_config:
+        notices.append(f"Reset events config can't be read: fix or remove {unreadable_config}")
+    if notices:
+        hint = " · ".join(notices)
+    elif webhooks:
         hint = f"{len(webhooks)} webhook(s) · manage with openswap events"
         if any(d.last_error for d in webhooks):
             hint += " · last delivery failed"

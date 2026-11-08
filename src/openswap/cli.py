@@ -1194,6 +1194,7 @@ def _events_command(argv: list[str]) -> None:
         ResetEvent,
         destination_to_json,
         load_destinations,
+        load_destinations_checked,
         payload,
         update_destinations,
     )
@@ -1258,18 +1259,21 @@ Examples:
         root = switcher.backup_dir
 
         if action == "list":
-            dests = load_destinations(root)
+            dests, problem = load_destinations_checked(root)
             if json_mode:
-                print(json.dumps(
-                    {"schemaVersion": 1, "destinations": [destination_to_json(d) for d in dests]},
-                    indent=2,
-                ))
+                data = {"schemaVersion": 1, "destinations": [destination_to_json(d) for d in dests]}
+                if problem:
+                    data["problem"] = problem
+                print(json.dumps(data, indent=2))
             else:
                 for d in dests:
                     print(f"{bolded(d.id)}  {d.kind}  {'on' if d.enabled else 'off'}  {d.url}".rstrip())
                     print(f"  {dimmed(_describe_filter(d.filter))}")
                     if d.last_error:
                         warning(f"  last error: {d.last_error}")
+            if problem:
+                error(problem)
+                sys.exit(1)
         elif action == "add-webhook":
             dest_id = "wh_" + secrets.token_hex(4)
             dest = Destination(
@@ -1313,7 +1317,10 @@ Examples:
         elif action == "test":
             from openswap.worker.connect import computer_name
 
-            dest = next(d for d in existing(load_destinations(root)) if d.id == args.id)
+            dests, problem = load_destinations_checked(root)
+            if problem and not any(d.id == args.id for d in dests):
+                raise ClaudeSwitchError(problem)
+            dest = next(d for d in existing(dests) if d.id == args.id)
             if dest.kind != "webhook":
                 raise ClaudeSwitchError("Only webhooks can be tested; Mac notifications come from the menu bar")
             try:

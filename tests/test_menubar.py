@@ -818,9 +818,10 @@ def test_settings_page_hides_kickoff_time_when_disabled():
     assert ids_on.index("group_schedule") < ids_on.index("kickoff_enabled")
 
 
-def _reset_event_rows(reset_events):
+def _reset_event_rows(destinations, **status):
     rows = menubar.settings_page_rows(
-        menubar.MenuBarSettings(), strategy="best", threshold=90, reset_events=reset_events,
+        menubar.MenuBarSettings(), strategy="best", threshold=90,
+        reset_events={"destinations": destinations, **status},
     )
     return [row["id"] for row in rows], {row["id"]: row for row in rows}
 
@@ -856,7 +857,31 @@ def test_settings_page_reset_events_rows_count_webhooks_and_flag_failures():
     )
 
 
-def _reset_events_app(tmp_path, *, delivered, notified, logged):
+def test_settings_page_reset_events_hint_reports_unreadable_config_and_paused_state(tmp_path):
+    from openswap.reset_events import Destination
+
+    mac = Destination(id="mac", kind="mac", enabled=False)
+    hooks = [Destination(id="h1", kind="webhook", enabled=True, url="https://x.test")]
+    config = tmp_path / "reset_events.json"
+
+    _, by_id = _reset_event_rows([mac, *hooks], unreadable_config=config)
+    assert by_id["reset_events_webhooks"]["label"] == (
+        f"Reset events config can't be read: fix or remove {config}"
+    )
+
+    _, by_id = _reset_event_rows([mac], save_error="disk full")
+    assert by_id["reset_events_webhooks"]["label"] == (
+        "Reset events are paused: can't save their state (disk full)"
+    )
+
+    _, by_id = _reset_event_rows([mac], unreadable_config=config, save_error="disk full")
+    assert by_id["reset_events_webhooks"]["label"] == (
+        "Reset events are paused: can't save their state (disk full)"
+        f" · Reset events config can't be read: fix or remove {config}"
+    )
+
+
+def _reset_events_app(tmp_path, *, delivered, notified, logged, save_state=None):
     from openswap import reset_events
     from tests.menubar_harness import extract_class
 
@@ -870,12 +895,15 @@ def _reset_events_app(tmp_path, *, delivered, notified, logged):
             (dest.id, json.loads(body), json.loads((tmp_path / "reset_events_state.json").read_text()))
         ),
         **{name: getattr(reset_events, name) for name in (
-            "FiredState", "detect", "load_destinations", "load_state", "payload",
+            "CONFIG_FILENAME", "FiredState", "detect", "load_destinations",
+            "load_destinations_checked", "load_state_checked", "payload",
             "readings_from_snapshot", "save_state", "update_destinations",
         )},
     }
+    if save_state is not None:
+        scope["save_state"] = save_state
     names = {"_maybe_reset_events", "_fire_reset_events", "_record_reset_event_delivery",
-             "_toggle_reset_events_mac"}
+             "_toggle_reset_events_mac", "_note_reset_events_condition", "_reset_events_settings"}
     app = extract_class(menubar.__file__, "MenuBarApp", names, scope)()
     app.switcher = SimpleNamespace(
         backup_dir=tmp_path,
@@ -885,6 +913,7 @@ def _reset_events_app(tmp_path, *, delivered, notified, logged):
     app._snapshot_at = 1.0
     app._reset_events_at = float("-inf")
     app._mac_name = "Test Mac"
+    app._reset_events_conditions = {}
     app._dirty = False
     app._notify = notified.append
     return app
@@ -951,6 +980,76 @@ def test_reset_events_pass_logs_failures_at_most_every_15_seconds(tmp_path):
 
     app._maybe_reset_events()
     app._maybe_reset_events()
+    assert len(logged) == 1
+
+
+def _rerun(app):
+    app._reset_events_at = float("-inf")
+    app._maybe_reset_events()
+
+
+def test_reset_events_pass_logs_an_unreadable_config_once_per_problem(tmp_path):
+    config = tmp_path / "reset_events.json"
+    config.write_text("{not json")
+    logged = []
+    app = _reset_events_app(tmp_path, delivered=[], notified=[], logged=logged)
+    app.snapshot = _ending_soon_snapshot()
+
+    for _ in range(3):
+        _rerun(app)
+    assert len(logged) == 1 and str(config) in logged[0][-1]
+
+    config.write_text("[]")
+    for _ in range(2):
+        _rerun(app)
+    assert len(logged) == 2
+    assert app._reset_events_settings()["unreadable_config"] == config
+
+    config.unlink()
+    _rerun(app)
+    assert len(logged) == 2
+    assert app._reset_events_settings()["unreadable_config"] is None
+
+
+def test_reset_events_pass_logs_corrupt_state_once(tmp_path):
+    state_path = tmp_path / "reset_events_state.json"
+    logged = []
+    app = _reset_events_app(tmp_path, delivered=[], notified=[], logged=logged)
+    app.snapshot = _ending_soon_snapshot()
+
+    for _ in range(2):
+        state_path.write_text("{oops")
+        _rerun(app)
+    assert len(logged) == 1 and str(state_path) in logged[0][-1]
+
+
+def test_reset_events_pass_skips_delivery_and_logs_once_while_state_cannot_be_saved(tmp_path):
+    from openswap.reset_events import Destination, save_destinations, save_state
+
+    save_destinations(tmp_path, [Destination(id="h1", kind="webhook", enabled=True, url="https://x.test/h")])
+    failing = [True]
+
+    def flaky_save(root, state, now=None):
+        if failing[0]:
+            raise OSError("disk full")
+        save_state(root, state, now)
+
+    delivered, logged = [], []
+    app = _reset_events_app(tmp_path, delivered=delivered, notified=[], logged=logged,
+                            save_state=flaky_save)
+    app.snapshot = _ending_soon_snapshot()
+
+    for _ in range(3):
+        _rerun(app)
+    assert delivered == []
+    assert len(logged) == 1 and "disk full" in logged[0][-1]
+    assert app._reset_events_settings()["save_error"] == "disk full"
+    assert app._dirty is True
+
+    failing[0] = False
+    _rerun(app)
+    assert [d[0] for d in delivered] == ["h1"]
+    assert app._reset_events_settings()["save_error"] == ""
     assert len(logged) == 1
 
 

@@ -179,10 +179,12 @@ def run(switcher, codex=None) -> int:
     from openswap.snapshot_source import SnapshotSource
     from openswap.claude_desktop_menu import ClaudeDesktopMenu, has_saved_profiles
     from openswap.reset_events import (
+        CONFIG_FILENAME,
         FiredState,
         detect,
         load_destinations,
-        load_state,
+        load_destinations_checked,
+        load_state_checked,
         payload,
         readings_from_snapshot,
         save_state,
@@ -215,6 +217,7 @@ def run(switcher, codex=None) -> int:
             self._update_shown = None
             self._snapshot_at = 0.0
             self._reset_events_at = float("-inf")
+            self._reset_events_conditions: dict[str, str | None] = {}
             self._mac_name = socket.gethostname()
             threading.Thread(target=self._resolve_mac_name, daemon=True).start()
             self._refreshing = False
@@ -1867,7 +1870,7 @@ def run(switcher, codex=None) -> int:
                 login_item=self._login_item_state,
                 status_line=self._status_line_state,
                 bundled_widget=_bundled_widget,
-                reset_events=lambda: load_destinations(self.switcher.backup_dir),
+                reset_events=self._reset_events_settings,
             )
             self._panel.attach(nsitem)
             # Requests left before the observers existed: `openswap setup`
@@ -4178,14 +4181,20 @@ def run(switcher, codex=None) -> int:
         def _fire_reset_events(self):
             root = self.switcher.backup_dir
             now = time.time()
-            state = load_state(root)
+            state, state_problem = load_state_checked(root)
+            self._note_reset_events_condition("state unreadable", state_problem)
+            dests, config_problem = load_destinations_checked(root)
+            self._note_reset_events_condition("config unreadable", config_problem)
             before = FiredState(dict(state.windows), dict(state.sent), dict(state.emitted))
-            fired = detect(
-                readings_from_snapshot(self.snapshot), load_destinations(root), state, now
-            )
+            fired = detect(readings_from_snapshot(self.snapshot), dests, state, now)
             # Saved before delivery so a crash mid-delivery never repeats an event.
             if state != before:
-                save_state(root, state, now)
+                try:
+                    save_state(root, state, now)
+                except OSError as e:
+                    self._note_reset_events_condition("state not saved", str(e))
+                    return
+                self._note_reset_events_condition("state not saved", None)
             for dest, event in fired:
                 try:
                     if dest.kind == "mac":
@@ -4197,6 +4206,24 @@ def run(switcher, codex=None) -> int:
                     self.switcher._logger.warning(
                         "reset event %s to %s failed", event.type, dest.id, exc_info=True
                     )
+
+        def _note_reset_events_condition(self, name: str, problem: str | None) -> None:
+            """Log ``problem`` once per change, not on every 15 s pass."""
+            if self._reset_events_conditions.get(name) == problem:
+                return
+            self._reset_events_conditions[name] = problem
+            self._dirty = True
+            if problem:
+                self.switcher._logger.warning("reset events %s: %s", name, problem)
+
+        def _reset_events_settings(self) -> dict:
+            root = self.switcher.backup_dir
+            dests, problem = load_destinations_checked(root)
+            return {
+                "destinations": dests,
+                "unreadable_config": root / CONFIG_FILENAME if problem else None,
+                "save_error": self._reset_events_conditions.get("state not saved") or "",
+            }
 
         def _record_reset_event_delivery(self, dest_id: str, error: str):
             # Runs on the delivery thread: file writes only, the UI follows via _dirty.

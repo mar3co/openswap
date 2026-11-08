@@ -19,7 +19,9 @@ from openswap.reset_events import (
     ResetEvent,
     detect,
     load_destinations,
+    load_destinations_checked,
     load_state,
+    load_state_checked,
     payload,
     readings_from_snapshot,
     save_destinations,
@@ -569,3 +571,60 @@ def test_five_hour_anchor_moved_earlier_corrects_state_without_started():
 
     assert out == []
     assert state.windows[k] == T + 4 * 3600
+
+
+@pytest.mark.parametrize("filter_text", [
+    '{"leadS": {"five_hour": Infinity}}',
+    '{"leadS": {"seven_day": NaN}}',
+    '{"leadS": {"five_hour": 2592001}}',
+    '{"minLeftPct": NaN}',
+    '{"minLeftPct": Infinity}',
+    '{"minLeftPct": 1e308}',
+    '{"minLeftPct": -1}',
+    '{"minLeftPct": 100.5}',
+])
+def test_non_finite_or_out_of_range_filter_numbers_drop_the_destination(tmp_path, filter_text):
+    (tmp_path / "reset_events.json").write_text(
+        '{"destinations": [{"id": "mac", "kind": "mac", "enabled": true},'
+        ' {"id": "h", "kind": "webhook", "enabled": true, "url": "https://example.com/h",'
+        f' "filter": {filter_text}}}]}}'
+    )
+
+    dests, problem = load_destinations_checked(tmp_path)
+
+    assert [d.id for d in dests] == ["mac"]
+    assert problem is not None
+
+
+def test_filter_numbers_at_the_limits_are_kept(tmp_path):
+    _write_config(tmp_path, [{"id": "mac", "kind": "mac", "enabled": True,
+                              "filter": {"leadS": {"five_hour": 2592000}, "minLeftPct": 100}}])
+
+    assert load_destinations_checked(tmp_path) == (
+        [Destination(id="mac", kind="mac", enabled=True,
+                     filter=Filter(lead_s={"five_hour": 2592000}, min_left_pct=100.0))],
+        None,
+    )
+
+
+def test_load_destinations_checked_reports_problem_with_path(tmp_path):
+    assert load_destinations_checked(tmp_path) == (DEFAULT, None)
+
+    path = tmp_path / "reset_events.json"
+    for text in ("{not json", "[]", '{"destinations": "nope"}',
+                 '{"destinations": [{"id": "x", "kind": "pager", "enabled": true}]}'):
+        path.write_text(text)
+        dests, problem = load_destinations_checked(tmp_path)
+        assert dests == DEFAULT
+        assert str(path) in problem and "could not be read in full" in problem
+
+
+def test_load_state_checked_reports_corrupt_state(tmp_path):
+    assert load_state_checked(tmp_path) == (FiredState(windows={}, sent={}), None)
+
+    path = tmp_path / "reset_events_state.json"
+    path.write_text("{oops")
+    state, problem = load_state_checked(tmp_path)
+
+    assert state == FiredState(windows={}, sent={})
+    assert str(path) in problem

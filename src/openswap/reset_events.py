@@ -9,7 +9,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-import logging
+import math
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -20,8 +20,6 @@ from openswap.locking import FileLock
 from openswap.poll_policy import parse_reset_ts
 from openswap.settings import atomic_write_json
 
-_logger = logging.getLogger(__name__)
-
 EVENT_TYPES = ("window.started", "window.ending_soon", "window.reset")
 WINDOWS = ("five_hour", "seven_day")
 KINDS = ("mac", "webhook")
@@ -30,6 +28,7 @@ CONFIG_FILENAME = "reset_events.json"
 STATE_FILENAME = "reset_events_state.json"
 SENT_RETENTION_S = 8 * 86400
 WEEK_S = 7 * 86400
+MAX_LEAD_S = 30 * 86400
 
 
 def _default_lead_s() -> dict[str, int]:
@@ -73,22 +72,25 @@ def _default_destinations() -> list[Destination]:
     return [Destination(id="mac", kind="mac", enabled=False, filter=Filter())]
 
 
-def _read_object(path: Path) -> dict | None:
+def _read_object(path: Path) -> tuple[dict | None, str | None]:
+    """The JSON object in ``path`` (None when missing or unreadable), and why it was unreadable."""
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return None
+        return None, None
     except (OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
-        _logger.warning("Could not read %s (%s); using defaults", path, e)
-        return None
+        return None, str(e)
     if not isinstance(raw, dict):
-        _logger.warning("%s is not a JSON object; using defaults", path)
-        return None
-    return raw
+        return None, "not a JSON object"
+    return raw, None
 
 
 def _is_number(value) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _is_finite_in(value, low: float, high: float) -> bool:
+    return _is_number(value) and math.isfinite(value) and low <= value <= high
 
 
 def _str_tuple(value, allowed: tuple[str, ...] | None = None) -> tuple[str, ...]:
@@ -105,11 +107,11 @@ def _filter_from_json(raw) -> Filter:
     default = Filter()
     lead_s = raw.get("leadS", {})
     if not isinstance(lead_s, dict) or not all(
-        k in WINDOWS and _is_number(v) and v >= 0 for k, v in lead_s.items()
+        k in WINDOWS and _is_finite_in(v, 0, MAX_LEAD_S) for k, v in lead_s.items()
     ):
         raise ValueError(f"bad leadS {lead_s!r}")
     min_left_pct = raw.get("minLeftPct", default.min_left_pct)
-    if not _is_number(min_left_pct):
+    if not _is_finite_in(min_left_pct, 0, 100):
         raise ValueError(f"bad minLeftPct {min_left_pct!r}")
     return Filter(
         accounts=_str_tuple(raw.get("accounts", list(default.accounts))),
@@ -163,37 +165,38 @@ def destination_to_json(dest: Destination) -> dict:
     }
 
 
-def _load_destinations(root: Path) -> tuple[list[Destination], bool]:
-    """The destinations, and whether anything in the file had to be dropped."""
+def _unreadable(path: Path, reason: str) -> str:
+    return f"Reset events config could not be read in full ({reason}); fix or remove it: {path}"
+
+
+def load_destinations_checked(root: Path) -> tuple[list[Destination], str | None]:
+    """The destinations, and what in ``reset_events.json`` could not be read
+    (None when nothing was dropped)."""
     path = root / CONFIG_FILENAME
-    if not path.exists():
-        return _default_destinations(), False
-    raw = _read_object(path)
+    raw, problem = _read_object(path)
     if raw is None:
-        return _default_destinations(), True
+        return _default_destinations(), None if problem is None else _unreadable(path, problem)
     entries = raw.get("destinations")
     if not isinstance(entries, list):
-        _logger.warning("%s has no destinations list; using defaults", path)
-        return _default_destinations(), True
+        return _default_destinations(), _unreadable(path, "no destinations list")
     dests: list[Destination] = []
-    degraded = False
+    dropped: list[str] = []
     for entry in entries:
         try:
             dest = _destination_from_json(entry)
             if any(d.id == dest.id for d in dests):
                 raise ValueError(f"duplicate id {dest.id!r}")
         except ValueError as e:
-            _logger.warning("Dropping reset-event destination in %s: %s", path, e)
-            degraded = True
+            dropped.append(str(e))
             continue
         dests.append(dest)
     if not any(d.kind == "mac" for d in dests):
         dests = _default_destinations() + dests
-    return dests, degraded
+    return dests, _unreadable(path, "; ".join(dropped)) if dropped else None
 
 
 def load_destinations(root: Path) -> list[Destination]:
-    return _load_destinations(root)[0]
+    return load_destinations_checked(root)[0]
 
 
 def _config_lock(root: Path) -> FileLock:
@@ -221,11 +224,9 @@ def update_destinations(
     Raises :class:`DestinationsUnreadable`, writing nothing, when the file
     could not be read in full."""
     with _config_lock(root):
-        dests, degraded = _load_destinations(root)
-        if degraded:
-            raise DestinationsUnreadable(
-                f"Reset events config could not be read in full; fix or remove it: {root / CONFIG_FILENAME}"
-            )
+        dests, problem = load_destinations_checked(root)
+        if problem:
+            raise DestinationsUnreadable(problem)
         dests = fn(dests)
         _write_destinations(root, dests)
     return dests
@@ -237,13 +238,21 @@ def _number_map(value) -> dict[str, float]:
     return {k: float(v) for k, v in value.items() if isinstance(k, str) and _is_number(v)}
 
 
-def load_state(root: Path) -> FiredState:
-    raw = _read_object(root / STATE_FILENAME) or {}
-    return FiredState(
+def load_state_checked(root: Path) -> tuple[FiredState, str | None]:
+    """The fired state (empty when missing or unreadable), and why it was unreadable."""
+    path = root / STATE_FILENAME
+    raw, problem = _read_object(path)
+    raw = raw or {}
+    state = FiredState(
         windows=_number_map(raw.get("windows")),
         sent=_number_map(raw.get("sent")),
         emitted=_number_map(raw.get("emitted")),
     )
+    return state, None if problem is None else f"{path}: {problem}"
+
+
+def load_state(root: Path) -> FiredState:
+    return load_state_checked(root)[0]
 
 
 def save_state(root: Path, state: FiredState, now: float | None = None) -> None:

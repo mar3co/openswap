@@ -1089,7 +1089,7 @@ class MenuBarPanel:
         self._login_item = login_item
         self._status_line = status_line or (lambda: "off")  # "on" | "other" | "off"
         self._bundled_widget = bundled_widget or (lambda: False)
-        self._reset_events = reset_events or (lambda: [])
+        self._reset_events = reset_events or (lambda: None)
         self._on_worker_view_active = on_worker_view_active
         self._login_alias = ""
         self._login_alias_field = None
@@ -2427,7 +2427,7 @@ class MenuBarPanel:
         try:
             reset_events = self._reset_events()
         except Exception:
-            reset_events = []
+            reset_events = None
         rows = settings_page_rows(
             settings,
             strategy=strategy,

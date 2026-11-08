@@ -188,3 +188,41 @@ def test_test_command_reports_delivered(temp_home, capsys, block_real_keychain, 
 
     assert code == 0
     assert out.strip() == "delivered"
+
+
+def test_list_reports_an_unreadable_config(temp_home, capsys):
+    root = paths.get_backup_root()
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "reset_events.json").write_text("{broken")
+
+    code, out, err = _run(["list"], capsys)
+    assert code == 1
+    assert "could not be read in full" in err and "mac" in out
+
+    code, out, err = _run(["list", "--json"], capsys)
+    assert code == 1
+    data = json.loads(out)
+    assert "could not be read in full" in data["problem"]
+    assert [d["id"] for d in data["destinations"]] == ["mac"]
+    assert "could not be read in full" in err
+
+
+def test_list_json_has_no_problem_when_config_is_fine(temp_home, capsys):
+    _seed()
+
+    code, out, _ = _run(["list", "--json"], capsys)
+
+    assert code == 0
+    assert "problem" not in json.loads(out)
+
+
+def test_test_command_reports_an_unreadable_config(temp_home, capsys):
+    root = paths.get_backup_root()
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "reset_events.json").write_text("{broken")
+
+    code, _, err = _run(["test", "wh_1"], capsys)
+
+    assert code == 1
+    assert "could not be read in full" in err
+    assert "No reset events destination" not in err
