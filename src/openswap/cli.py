@@ -126,7 +126,7 @@ _SUBCOMMAND_FLAGS = {
 # (`openswap account`, `openswap pair`).
 _KNOWN_VERBS = frozenset({
     *_SUBCOMMAND_FLAGS, "switch", "auto", "codex", "claude-desktop", "widget", "statusline", "setup", "uninstall", "config",
-    "unclaimed", "alias", "swap", "move", "worker", "tui", "watch", "run", "map", "unmap", "claude",
+    "events", "unclaimed", "alias", "swap", "move", "worker", "tui", "watch", "run", "map", "unmap", "claude",
 })
 # The worker verbs an owner is likely to type at the top level.
 _WORKER_VERBS = ("setup", "pair", "unpair", "status", "enable", "disable", "pause", "stop", "account",
@@ -1081,6 +1081,321 @@ Examples:
         )
         sys.exit(130)
 
+def _csv_arg(allowed: tuple[str, ...], prefix: str = ""):
+    def parse(value: str) -> tuple[str, ...]:
+        items = tuple(v.strip() for v in value.split(",") if v.strip())
+        if not items or not set(items) <= set(allowed):
+            raise argparse.ArgumentTypeError(f"use a comma-separated list of {', '.join(allowed)}")
+        return tuple(prefix + v for v in items)
+    return parse
+
+
+def _accounts_arg(value: str) -> tuple[str, ...]:
+    if value == "all":
+        return ()
+    items = tuple(v.strip() for v in value.split(",") if v.strip())
+    if not items:
+        raise argparse.ArgumentTypeError("use all or a comma-separated list of account keys")
+    return items
+
+
+def _minutes_arg(value: str) -> int:
+    from openswap.reset_events import MAX_LEAD_S
+
+    try:
+        minutes = int(value)
+    except ValueError:
+        minutes = -1
+    if not 1 <= minutes <= MAX_LEAD_S // 60:
+        raise argparse.ArgumentTypeError(
+            f"use a whole number of minutes, 1 or more and at most {MAX_LEAD_S // 60}"
+        )
+    return minutes
+
+
+def _percent_arg(value: str) -> float:
+    try:
+        pct = float(value)
+    except ValueError:
+        pct = -1.0
+    if not 0 <= pct <= 100:
+        raise argparse.ArgumentTypeError("use a percentage from 0 to 100")
+    return pct
+
+
+def _add_filter_args(p: argparse.ArgumentParser) -> None:
+    from openswap.reset_events import EVENT_TYPES, WINDOWS
+
+    p.add_argument("--accounts", type=_accounts_arg, metavar="KEY,...",
+                   help="Only these accounts (provider:email:org_uuid), or all")
+    p.add_argument("--windows", type=_csv_arg(WINDOWS), metavar="five_hour,seven_day",
+                   help="Which usage windows")
+    p.add_argument("--events", type=_csv_arg(tuple(e.removeprefix("window.") for e in EVENT_TYPES), "window."),
+                   metavar="started,ending_soon,reset", help="Which events")
+    p.add_argument("--lead-5h", type=_minutes_arg, metavar="MIN",
+                   help="Minutes before a 5-hour reset to send ending_soon (default 30)")
+    p.add_argument("--lead-weekly", type=_minutes_arg, metavar="MIN",
+                   help="Minutes before a weekly reset to send ending_soon (default 180)")
+    p.add_argument("--min-left", type=_percent_arg, dest="min_left_pct", metavar="PCT",
+                   help="Send ending_soon only with at least this much left (default 20)")
+
+
+def _apply_filter_args(f, args):
+    changes = {
+        name: getattr(args, name)
+        for name in ("accounts", "windows", "events", "min_left_pct")
+        if getattr(args, name) is not None
+    }
+    lead_s = {
+        window: minutes * 60
+        for window, minutes in (("five_hour", args.lead_5h), ("seven_day", args.lead_weekly))
+        if minutes is not None
+    }
+    if lead_s:
+        changes["lead_s"] = f.lead_s | lead_s
+    return replace(f, **changes)
+
+
+def _describe_filter(f) -> str:
+    accounts = ", ".join(f.accounts) if f.accounts else "all accounts"
+    events = ", ".join(e.removeprefix("window.") for e in f.events)
+    lead = f"lead {f.lead_s['five_hour'] // 60}m 5h, {f.lead_s['seven_day'] // 60}m weekly"
+    return f"{accounts} · {', '.join(f.windows)} · {events} · {lead} · min left {f.min_left_pct:g}%"
+
+
+def _known_accounts(switcher: Engine, debug: bool) -> list:
+    from openswap.codex.engine import CodexEngine
+
+    return [
+        *switcher.accounts_snapshot(fetch=set()).accounts,
+        *CodexEngine(debug=debug).accounts_snapshot(fetch=set()).accounts,
+    ]
+
+
+def _warn_unknown_accounts(switcher: Engine, args) -> None:
+    if not args.accounts:
+        return
+    known = [f"{a.provider}:{a.email}:{a.org_uuid}" for a in _known_accounts(switcher, args.debug)]
+    unknown = [key for key in args.accounts if key not in known]
+    if unknown:
+        print(
+            f"Warning: no current account matches {', '.join(unknown)}"
+            f" (known: {', '.join(known) or 'none'})",
+            file=sys.stderr,
+        )
+
+
+def _sample_account_reading(switcher: Engine, debug: bool):
+    from openswap.reset_events import AccountReading
+
+    accounts = _known_accounts(switcher, debug)
+    if not accounts:
+        return AccountReading("claude", "sample@example.com", "", "Sample", "", False, True, None, None)
+    a = accounts[0]
+    return AccountReading(
+        provider=a.provider, email=a.email, org_uuid=a.org_uuid, label=a.alias or a.email,
+        org_name=a.org_name, is_active=a.is_active, live=True, usage=None, fetched_at=None,
+    )
+
+
+def _events_command(argv: list[str]) -> None:
+    """Handle `openswap events [list|add-webhook|set|remove|test]`.
+
+    Pre-dispatched before the main parser, like `config`. Every write goes
+    through ``update_destinations`` so a config the menu bar could not read in
+    full is reported, never overwritten.
+    """
+    import secrets
+    import time
+
+    from openswap import macos_keychain
+    from openswap import reset_events_delivery as delivery
+    from openswap.reset_events import (
+        Destination,
+        Filter,
+        ResetEvent,
+        destination_to_json,
+        load_destinations,
+        load_destinations_checked,
+        payload,
+        update_destinations,
+    )
+
+    parser = argparse.ArgumentParser(
+        prog="openswap events",
+        description=(
+            "Reset events: send a Mac notification or a signed webhook when an "
+            "account's 5-hour or weekly window starts, is about to end, or resets."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  openswap events                                   # list destinations
+  openswap events add-webhook https://example.com/hook --windows seven_day
+  openswap events set mac --enable --lead-weekly 120
+  openswap events test wh_1a2b3c4d                  # send a sample event now
+  openswap events remove wh_1a2b3c4d
+        """,
+    )
+    parser.add_argument("--json", action="store_true",
+                        help="Emit machine-readable JSON to stdout (with list or add-webhook)")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    sub = parser.add_subparsers(dest="action", metavar="{list,add-webhook,set,remove,test}")
+
+    p_list = sub.add_parser("list", help="Show destinations, their filters and last errors (the default)")
+    p_add = sub.add_parser("add-webhook", help="Add a webhook and print its signing secret once")
+    p_add.add_argument("url", metavar="URL")
+    _add_filter_args(p_add)
+    for p in (p_list, p_add):
+        # SUPPRESS: without it the subparser's False default would clobber a
+        # pre-verb `openswap events --json` in the shared namespace.
+        p.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                       help="Emit machine-readable JSON to stdout")
+    p_set = sub.add_parser("set", help="Change a destination's filter, or turn it on or off")
+    p_set.add_argument("id", metavar="ID")
+    _add_filter_args(p_set)
+    toggle = p_set.add_mutually_exclusive_group()
+    toggle.add_argument("--enable", dest="enabled", action="store_true", default=None, help="Turn the destination on")
+    toggle.add_argument("--disable", dest="enabled", action="store_false", help="Turn the destination off")
+    p_remove = sub.add_parser("remove", help="Delete a webhook and its secret")
+    p_remove.add_argument("id", metavar="ID")
+    p_test = sub.add_parser("test", help="Send a sample window.ending_soon to a webhook now")
+    p_test.add_argument("id", metavar="ID")
+
+    args = parser.parse_args(argv)
+    json_mode = bool(getattr(args, "json", False))
+    action = args.action or "list"
+    if json_mode and action not in ("list", "add-webhook"):
+        parser.error("--json can only be used with list or add-webhook")
+    if action == "add-webhook" and (problem := delivery.validate_webhook_url(args.url)):
+        p_add.error(problem)
+    if action == "set" and all(
+        getattr(args, name) is None
+        for name in ("accounts", "windows", "events", "lead_5h", "lead_weekly", "min_left_pct", "enabled")
+    ):
+        p_set.error("Nothing to change; pass a filter option, --enable or --disable")
+
+    def existing(dests):
+        if not any(d.id == args.id for d in dests):
+            raise ClaudeSwitchError(f"No reset events destination '{args.id}'")
+        return dests
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+        root = switcher.backup_dir
+
+        if action == "list":
+            dests, problem = load_destinations_checked(root)
+            if json_mode:
+                data = {"schemaVersion": 1, "destinations": [destination_to_json(d) for d in dests]}
+                if problem:
+                    data["problem"] = problem
+                print(json.dumps(data, indent=2))
+            else:
+                for d in dests:
+                    print(f"{bolded(d.id)}  {d.kind}  {'on' if d.enabled else 'off'}  {d.url}".rstrip())
+                    print(f"  {dimmed(_describe_filter(d.filter))}")
+                    if d.last_error:
+                        warning(f"  last error: {d.last_error}")
+                    if d.last_failure:
+                        warning(f"  last failure: {d.last_failure}")
+            if problem:
+                error(problem)
+                sys.exit(1)
+        elif action == "add-webhook":
+            _warn_unknown_accounts(switcher, args)
+            taken = {d.id for d in load_destinations(root)}
+            dest_id = "wh_" + secrets.token_hex(4)
+            while dest_id in taken:
+                dest_id = "wh_" + secrets.token_hex(4)
+            dest = Destination(
+                id=dest_id, kind="webhook", enabled=True, url=args.url,
+                filter=_apply_filter_args(Filter(), args),
+            )
+
+            def add(dests):
+                if any(d.id == dest_id for d in dests):
+                    raise ClaudeSwitchError("Generated id is taken; run the command again")
+                return [*dests, dest]
+
+            try:
+                secret = delivery.new_secret(dest_id)
+            except macos_keychain.KEYCHAIN_ERRORS as e:
+                raise ClaudeSwitchError(f"Couldn't save the webhook secret in the Keychain: {e}") from None
+            try:
+                update_destinations(root, add)
+            except BaseException:
+                try:
+                    delivery.delete_secret(dest_id)
+                except macos_keychain.KEYCHAIN_ERRORS as e:
+                    print(
+                        f"Warning: {dest_id} was not added, but its Keychain secret could not be deleted: {e}",
+                        file=sys.stderr,
+                    )
+                raise
+            if json_mode:
+                print(json.dumps({"schemaVersion": 1, "id": dest_id, "secret": secret}, indent=2))
+            else:
+                print(f"{accent('Added')} {dest_id}")
+                print(f"Secret: {secret}")
+                print("Save this secret now; it can't be shown again.")
+        elif action == "set":
+            _warn_unknown_accounts(switcher, args)
+
+            def update(d):
+                d = replace(d, filter=_apply_filter_args(d.filter, args))
+                return d if args.enabled is None else replace(d, enabled=args.enabled)
+
+            update_destinations(root, lambda ds: [update(d) if d.id == args.id else d for d in existing(ds)])
+            print(f"{accent('Updated')} {args.id}")
+        elif action == "remove":
+            if args.id == "mac":
+                raise ClaudeSwitchError("The Mac destination can't be removed; use the Mac toggle in Settings")
+            update_destinations(root, lambda ds: [d for d in existing(ds) if d.id != args.id])
+            try:
+                delivery.delete_secret(args.id)
+            except macos_keychain.KEYCHAIN_ERRORS as e:
+                warning(f"Removed {args.id}, but its Keychain secret could not be deleted: {e}")
+            print(f"{accent('Removed')} {args.id}")
+        elif action == "test":
+            from openswap.worker.connect import computer_name
+
+            dests, problem = load_destinations_checked(root)
+            if problem and not any(d.id == args.id for d in dests):
+                raise ClaudeSwitchError(problem)
+            dest = next(d for d in existing(dests) if d.id == args.id)
+            if dest.kind != "webhook":
+                raise ClaudeSwitchError("Only webhooks can be tested; Mac notifications come from the menu bar")
+            try:
+                secret = delivery.get_secret(dest.id)
+            except macos_keychain.KEYCHAIN_ERRORS as e:
+                raise ClaudeSwitchError(f"Keychain unavailable: {e}") from None
+            if not secret:
+                raise ClaudeSwitchError("secret missing; re-add this webhook")
+            now = time.time()
+            reading = _sample_account_reading(switcher, args.debug)
+            event = ResetEvent("window.ending_soon", "five_hour", reading, now + 1800, 61.0, ())
+            body = json.dumps(payload(event, mac=computer_name(), now=now, test=True)).encode()
+            try:
+                delivery.post_once(dest.url, body, secret, now=now)
+            except delivery.DeliveryError as e:
+                raise ClaudeSwitchError(str(e)) from None
+            print("delivered")
+    except (ClaudeSwitchError, OSError, ValueError) as e:
+        if json_mode:
+            print(json.dumps(error_envelope(e), indent=2))
+        else:
+            error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(
+            f"\n{dimmed('Operation canceled')}",
+            file=sys.stderr if json_mode else sys.stdout,
+        )
+        sys.exit(130)
+
+
 
 def _use_native_tls() -> None:
     """Route TLS trust decisions through the OS-native verifier.
@@ -1716,6 +2031,9 @@ def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "config":
         _config_command(sys.argv[2:])
         return
+    if argv and argv[0] == "events":
+        _events_command(argv[1:])
+        return
     if argv and argv[0] == "unclaimed":
         _unclaimed_command(argv[1:])
         return
@@ -1801,6 +2119,7 @@ Menu bar and widgets:
 
 Other:
   %(prog)s config [set KEY VALUE]     show or change shared policy (settings.json)
+  %(prog)s events [add-webhook URL]   reset event webhooks and Mac notifications
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s purge                      remove all openswap data
   %(prog)s uninstall [--zap]          remove OpenSwap from this Mac (--zap: and its data)

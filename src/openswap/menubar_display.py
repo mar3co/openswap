@@ -20,7 +20,7 @@ from dataclasses import asdict, dataclass, fields, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from openswap import pace, printer
+from openswap import oauth, pace, printer
 from openswap.exceptions import ClaudeSwitchError, CredentialReadError
 from openswap.kickoff import (
     KICKOFF_RETRY_BACKOFF_S,
@@ -860,11 +860,13 @@ def settings_page_rows(
     desktop_app: str = "claude",
     expanded_sections: set[str] | None = None,
     section: str | None = None,
+    reset_events: dict | None = None,
 ) -> list[dict]:
     """Rows for the in-popover settings page. No AppKit.
 
     ``login_item`` feeds General › This Mac (see :func:`this_mac_rows`); it
-    is read when the page is built, not stored in ``MenuBarSettings``.
+    is read when the page is built, not stored in ``MenuBarSettings``. So is
+    ``reset_events``, the keyword arguments for :func:`reset_events_settings_rows`.
 
     Each dict: ``{"kind": "toggle"|"choice"|"group"|"popup", "id": str, "label": str, ...}``.
     Choice and popup rows include ``options`` ``(value, label)`` and the current
@@ -1207,6 +1209,7 @@ def settings_page_rows(
                 ),
             }
         )
+    automation.extend(reset_events_settings_rows(**(reset_events or {})))
     desktop = []
     if settings.desktop_features_enabled:
         desktop.append({"kind": "popup", "section": SETTINGS_SECTION_DESKTOP,
@@ -1232,6 +1235,54 @@ def settings_page_rows(
         if section not in valid_sections:
             section = SETTINGS_SECTION_GENERAL
         rows = [row for row in rows if row["section"] == section]
+    return rows
+
+
+def reset_events_settings_rows(
+    destinations: list = (), unreadable_config=None, save_error: str = "",
+    pass_error: str = "", state_reset: bool = False, unavailable: str = "",
+) -> list[dict]:
+    """Automation › Reset events, from the destinations in ``reset_events.json``.
+
+    ``unreadable_config`` is that file's path when part of it could not be
+    read; ``save_error`` is set while the fired state can't be saved;
+    ``pass_error`` while the event pass itself fails; ``state_reset`` after an
+    unreadable fired state was moved aside; ``unavailable`` when these
+    settings could not be gathered at all, which replaces the toggle."""
+    rows = [
+        {"kind": "group", "style": "section", "section": SETTINGS_SECTION_AUTOMATION,
+         "id": "group_reset_events", "label": "Reset events"},
+    ]
+    if unavailable:
+        hint = f"Reset events settings unavailable: {unavailable}"
+    else:
+        rows.append(
+            {"kind": "toggle", "section": SETTINGS_SECTION_AUTOMATION, "id": "reset_events_mac",
+             "label": "Notify on this Mac",
+             "value": any(d.kind == "mac" and d.enabled for d in destinations)},
+        )
+        webhooks = [d for d in destinations if d.kind == "webhook"]
+        notices = []
+        if pass_error:
+            notices.append(f"Reset events paused: {pass_error}")
+        if save_error:
+            notices.append(f"Reset events are paused: can't save their state ({save_error})")
+        if state_reset:
+            notices.append("Reset events state was unreadable and was reset")
+        if unreadable_config:
+            notices.append(f"Reset events config can't be read: fix or remove {unreadable_config}")
+        if not notices:
+            notices.append(
+                f"{len(webhooks)} webhook(s) · manage with openswap events" if webhooks
+                else "Send events to your own automations with openswap events add-webhook"
+            )
+        if any(d.last_error for d in webhooks):
+            notices.append("last delivery failed")
+        hint = " · ".join(notices)
+    rows.append(
+        {"kind": "group", "style": "hint", "section": SETTINGS_SECTION_AUTOMATION,
+         "id": "reset_events_webhooks", "label": hint, "lines": _hint_lines(hint)},
+    )
     return rows
 
 
@@ -1658,6 +1709,36 @@ class NotificationCopy:
 
     def rumps_args(self) -> tuple[str, str, str]:
         return (self.title, self.subtitle, self.body)
+
+
+_RESET_WINDOW_NAMES = {"five_hour": "5-hour", "seven_day": "weekly"}
+
+
+def notification_copy_for_reset_event(event, now: float) -> NotificationCopy:
+    """Mac banner for a reset event (``openswap.reset_events.ResetEvent``)."""
+    label = event.reading.label
+    window_name = _RESET_WINDOW_NAMES[event.window]
+    remaining = 100 - event.used_pct
+    if event.type == "window.started":
+        clock = oauth.reset_clock_string(
+            datetime.fromtimestamp(event.resets_at, timezone.utc),
+            datetime.fromtimestamp(now, timezone.utc),
+        )
+        return NotificationCopy(
+            title=f"{label}: 5-hour window started",
+            body=f"{remaining:.0f}% left · resets {clock}",
+        )
+    if event.type == "window.ending_soon":
+        countdown = (
+            _live_countdown({"resets_at": event.resets_at_iso}, now)
+            if event.resets_at - now >= 60
+            else "under a minute"
+        )
+        return NotificationCopy(
+            title=f"{label}: {window_name} ends in {countdown}",
+            body=f"{remaining:.0f}% left",
+        )
+    return NotificationCopy(title=f"{label}: {window_name} reset", body="Full quota available")
 
 
 def account_short_name(

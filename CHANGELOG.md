@@ -15,6 +15,7 @@ opensoft.me/swap/changelog shows this file.
 
 ### New
 
+- Reset events: OpenSwap can tell you, or your own automations, when an account's 5-hour or weekly window starts, is about to end with quota left, or resets. Turn on Settings › Automation › Reset events › Notify on this Mac, or send signed webhooks with `openswap events add-webhook`. Both are off until you set them up.
 - Settings › Remote lists the folders remote tasks may work in, with Add Folder… and Remove for each.
 - Settings › Remote › Sessions can tell your control service when a Claude Code or Codex session waits for your approval, when a Claude Code session asks a question or sits idle, and when a Codex turn ends, with or without details. Off until you turn it on. Codex asks you once to trust OpenSwap's hooks.
 - Sessions you start with `openswap claude` can be answered from your phone and watch: allow or deny a tool, answer a question, or send a quick reply to an idle session. Turn on Settings › Remote › Sessions › Allow replies from my phone and watch on the Mac first; it is off until you do.

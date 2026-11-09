@@ -14,6 +14,7 @@ import os
 import plistlib
 import sys
 import threading
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -815,6 +816,425 @@ def test_settings_page_hides_kickoff_time_when_disabled():
     ids_on = [row["id"] for row in on]
     assert ids_on.index("kickoff_enabled") < ids_on.index("kickoff_time")
     assert ids_on.index("group_schedule") < ids_on.index("kickoff_enabled")
+
+
+def _reset_event_rows(destinations, **status):
+    rows = menubar.settings_page_rows(
+        menubar.MenuBarSettings(), strategy="best", threshold=90,
+        reset_events={"destinations": destinations, **status},
+    )
+    return [row["id"] for row in rows], {row["id"]: row for row in rows}
+
+
+def test_settings_page_reset_events_rows_without_webhooks():
+    from openswap.reset_events import Destination
+
+    ids, by_id = _reset_event_rows([Destination(id="mac", kind="mac", enabled=True)])
+    assert by_id["group_reset_events"]["label"] == "Reset events"
+    assert by_id["group_reset_events"]["section"] == menubar.SETTINGS_SECTION_AUTOMATION
+    assert by_id["reset_events_mac"]["label"] == "Notify on this Mac"
+    assert by_id["reset_events_mac"]["value"] is True
+    assert by_id["reset_events_webhooks"]["label"] == (
+        "Send events to your own automations with openswap events add-webhook"
+    )
+    assert ids.index("group_schedule") < ids.index("group_reset_events")
+    assert ids.index("group_reset_events") < ids.index("reset_events_mac") < ids.index("reset_events_webhooks")
+
+
+def test_settings_page_reset_events_rows_count_webhooks_and_flag_failures():
+    from openswap.reset_events import Destination
+
+    mac = Destination(id="mac", kind="mac", enabled=False)
+    hooks = [Destination(id=f"h{i}", kind="webhook", enabled=True, url="https://x.test") for i in (1, 2)]
+    _, by_id = _reset_event_rows([mac, *hooks])
+    assert by_id["reset_events_mac"]["value"] is False
+    assert by_id["reset_events_webhooks"]["label"] == "2 webhook(s) · manage with openswap events"
+
+    hooks[1] = replace(hooks[1], last_error="HTTP 500")
+    _, by_id = _reset_event_rows([mac, *hooks])
+    assert by_id["reset_events_webhooks"]["label"] == (
+        "2 webhook(s) · manage with openswap events · last delivery failed"
+    )
+
+
+def test_settings_page_reset_events_hint_reports_unreadable_config_and_paused_state(tmp_path):
+    from openswap.reset_events import Destination
+
+    mac = Destination(id="mac", kind="mac", enabled=False)
+    hooks = [Destination(id="h1", kind="webhook", enabled=True, url="https://x.test")]
+    config = tmp_path / "reset_events.json"
+
+    _, by_id = _reset_event_rows([mac, *hooks], unreadable_config=config)
+    assert by_id["reset_events_webhooks"]["label"] == (
+        f"Reset events config can't be read: fix or remove {config}"
+    )
+
+    _, by_id = _reset_event_rows([mac], save_error="disk full")
+    assert by_id["reset_events_webhooks"]["label"] == (
+        "Reset events are paused: can't save their state (disk full)"
+    )
+
+    _, by_id = _reset_event_rows([mac], unreadable_config=config, save_error="disk full")
+    assert by_id["reset_events_webhooks"]["label"] == (
+        "Reset events are paused: can't save their state (disk full)"
+        f" · Reset events config can't be read: fix or remove {config}"
+    )
+
+
+def test_settings_page_reset_events_hint_shows_a_failed_delivery_alongside_notices(tmp_path):
+    from openswap.reset_events import Destination
+
+    mac = Destination(id="mac", kind="mac", enabled=False)
+    hook = Destination(id="h1", kind="webhook", enabled=True, url="https://x.test", last_error="HTTP 500")
+
+    _, by_id = _reset_event_rows([mac, hook], save_error="disk full")
+    assert by_id["reset_events_webhooks"]["label"] == (
+        "Reset events are paused: can't save their state (disk full) · last delivery failed"
+    )
+
+
+def test_settings_page_reset_events_hint_reports_a_failed_pass_and_a_reset_state():
+    from openswap.reset_events import Destination
+
+    mac = Destination(id="mac", kind="mac", enabled=True)
+
+    _, by_id = _reset_event_rows([mac], pass_error="RuntimeError: boom")
+    assert by_id["reset_events_webhooks"]["label"] == "Reset events paused: RuntimeError: boom"
+
+    _, by_id = _reset_event_rows([mac], state_reset=True)
+    assert by_id["reset_events_webhooks"]["label"] == (
+        "Reset events state was unreadable and was reset"
+    )
+
+
+def test_settings_page_reset_events_reports_unavailable_settings_instead_of_defaults():
+    rows = menubar.settings_page_rows(
+        menubar.MenuBarSettings(), strategy="best", threshold=90,
+        reset_events={"unavailable": "PermissionError: denied"},
+    )
+    by_id = {row["id"]: row for row in rows}
+    assert "reset_events_mac" not in by_id
+    assert by_id["reset_events_webhooks"]["label"] == (
+        "Reset events settings unavailable: PermissionError: denied"
+    )
+
+
+def _reset_events_app(tmp_path, *, delivered, notified, logged, save_state=None):
+    from openswap import reset_events
+    from tests.menubar_harness import extract_class
+
+    scope = {
+        "time": __import__("time"),
+        "json": json,
+        "replace": replace,
+        "ClaudeSwitchError": menubar.ClaudeSwitchError,
+        "notification_copy_for_reset_event": menubar.notification_copy_for_reset_event,
+        "deliver_async": lambda dest, body, *, on_result: delivered.append(
+            (dest.id, json.loads(body), json.loads((tmp_path / "reset_events_state.json").read_text()))
+        ),
+        **{name: getattr(reset_events, name) for name in (
+            "CONFIG_FILENAME", "CORRUPT_STATE_FILENAME", "STATE_FILENAME", "FiredState", "detect",
+            "load_destinations_checked", "load_state_checked", "payload",
+            "readings_from_snapshot", "save_state", "update_destinations",
+            "with_delivery_result",
+        )},
+    }
+    if save_state is not None:
+        scope["save_state"] = save_state
+    names = {"_maybe_reset_events", "_fire_reset_events", "_record_reset_event_delivery",
+             "_toggle_reset_events_mac", "_note_reset_events_condition", "_reset_events_settings"}
+    app = extract_class(menubar.__file__, "MenuBarApp", names, scope)()
+    app.switcher = SimpleNamespace(
+        backup_dir=tmp_path,
+        _logger=SimpleNamespace(warning=lambda *a, **k: logged.append(a)),
+    )
+    app._desktop_switching = False
+    app._snapshot_at = 1.0
+    app._reset_events_at = float("-inf")
+    app._mac_name = "Test Mac"
+    app._reset_events_conditions = {}
+    app._dirty = False
+    app._notify = notified.append
+    return app
+
+
+def _ending_soon_snapshot():
+    import time as _time
+
+    now = _time.time()
+    resets_at = _dt.datetime.fromtimestamp(now + 600, _dt.timezone.utc).isoformat()
+    usage = {"five_hour": {"pct": 40.0, "resets_at": resets_at}}
+    return {
+        "accounts": [(1, "a@example.com", True, usage, None, "Work", "Acme", False, now)],
+        "identities": {"1": ("a@example.com", "org-1")},
+    }
+
+
+def test_reset_events_pass_saves_state_before_delivering_and_fires_once(tmp_path):
+    from openswap.reset_events import Destination, save_destinations
+
+    save_destinations(tmp_path, [
+        Destination(id="mac", kind="mac", enabled=True),
+        Destination(id="h1", kind="webhook", enabled=True, url="https://x.test/h"),
+    ])
+    delivered, notified, logged = [], [], []
+    app = _reset_events_app(tmp_path, delivered=delivered, notified=notified, logged=logged)
+    app.snapshot = _ending_soon_snapshot()
+
+    app._maybe_reset_events()
+    assert [c.title for c in notified] == ["Work: 5-hour ends in 9m"]
+    [(dest_id, body, state_at_delivery)] = delivered
+    assert (dest_id, body["type"], body["mac"]) == ("h1", "window.ending_soon", "Test Mac")
+    assert f"h1|{body['id']}" in state_at_delivery["sent"]
+
+    app._reset_events_at = float("-inf")
+    app._maybe_reset_events()
+    assert len(notified) == 1 and len(delivered) == 1
+    assert logged == []
+
+
+def test_reset_events_pass_still_delivers_webhooks_when_the_mac_banner_fails(tmp_path):
+    from openswap.reset_events import Destination, save_destinations
+
+    save_destinations(tmp_path, [
+        Destination(id="mac", kind="mac", enabled=True),
+        Destination(id="h1", kind="webhook", enabled=True, url="https://x.test/h"),
+    ])
+    delivered, logged = [], []
+    app = _reset_events_app(tmp_path, delivered=delivered, notified=[], logged=logged)
+    app.snapshot = _ending_soon_snapshot()
+
+    def boom(_copy):
+        raise RuntimeError("no notification center")
+
+    app._notify = boom
+    app._maybe_reset_events()
+    assert [d[0] for d in delivered] == ["h1"]
+    assert len(logged) == 1
+
+
+def test_reset_events_pass_logs_failures_at_most_every_15_seconds(tmp_path):
+    delivered, notified, logged = [], [], []
+    app = _reset_events_app(tmp_path, delivered=delivered, notified=notified, logged=logged)
+    app.snapshot = None
+
+    app._maybe_reset_events()
+    app._maybe_reset_events()
+    assert len(logged) == 1
+
+
+def _rerun(app):
+    app._reset_events_at = float("-inf")
+    app._maybe_reset_events()
+
+
+def test_reset_events_pass_logs_an_unreadable_config_once_per_problem(tmp_path):
+    config = tmp_path / "reset_events.json"
+    config.write_text("{not json")
+    logged = []
+    app = _reset_events_app(tmp_path, delivered=[], notified=[], logged=logged)
+    app.snapshot = _ending_soon_snapshot()
+
+    for _ in range(3):
+        _rerun(app)
+    assert len(logged) == 1 and str(config) in logged[0][-1]
+
+    config.write_text("[]")
+    for _ in range(2):
+        _rerun(app)
+    assert len(logged) == 2
+    assert app._reset_events_settings()["unreadable_config"] == config
+
+    config.unlink()
+    _rerun(app)
+    assert len(logged) == 2
+    assert app._reset_events_settings()["unreadable_config"] is None
+
+
+def test_reset_events_pass_logs_corrupt_state_once(tmp_path):
+    state_path = tmp_path / "reset_events_state.json"
+    logged = []
+    app = _reset_events_app(tmp_path, delivered=[], notified=[], logged=logged)
+    app.snapshot = _ending_soon_snapshot()
+
+    for _ in range(2):
+        state_path.write_text("{oops")
+        _rerun(app)
+    assert len(logged) == 1 and str(state_path) in logged[0][-1]
+
+
+def test_reset_events_pass_skips_delivery_and_logs_once_while_state_cannot_be_saved(tmp_path):
+    from openswap.reset_events import Destination, save_destinations, save_state
+
+    save_destinations(tmp_path, [Destination(id="h1", kind="webhook", enabled=True, url="https://x.test/h")])
+    failing = [True]
+
+    def flaky_save(root, state, now=None):
+        if failing[0]:
+            raise OSError("disk full")
+        save_state(root, state, now)
+
+    delivered, logged = [], []
+    app = _reset_events_app(tmp_path, delivered=delivered, notified=[], logged=logged,
+                            save_state=flaky_save)
+    app.snapshot = _ending_soon_snapshot()
+
+    for _ in range(3):
+        _rerun(app)
+    assert delivered == []
+    assert len(logged) == 1 and "disk full" in logged[0][-1]
+    assert app._reset_events_settings()["save_error"] == "disk full"
+    assert app._dirty is True
+
+    failing[0] = False
+    _rerun(app)
+    assert [d[0] for d in delivered] == ["h1"]
+    assert app._reset_events_settings()["save_error"] == ""
+    assert len(logged) == 1
+
+
+def test_reset_events_pass_moves_a_corrupt_state_aside_and_notes_it_until_the_next_pass(tmp_path):
+    state_path = tmp_path / "reset_events_state.json"
+    corrupt = tmp_path / "reset_events_state.corrupt.json"
+    corrupt.write_text("older")
+    state_path.write_text("{oops")
+    logged = []
+    app = _reset_events_app(tmp_path, delivered=[], notified=[], logged=logged)
+    app.snapshot = _ending_soon_snapshot()
+
+    _rerun(app)
+    assert corrupt.read_text() == "{oops"
+    assert isinstance(json.loads(state_path.read_text()), dict)
+    assert app._reset_events_settings()["state_reset"] is True
+    assert len(logged) == 1 and str(corrupt) in logged[0][-1]
+
+    _rerun(app)
+    assert app._reset_events_settings()["state_reset"] is False
+    assert len(logged) == 1
+
+
+def test_reset_events_pass_keeps_what_survived_a_partly_malformed_state(tmp_path):
+    state_path = tmp_path / "reset_events_state.json"
+    state_path.write_text('{"windows": {"k": 1}, "sent": {"h|evt_1": 5, "h|evt_2": "x"}}')
+    app = _reset_events_app(tmp_path, delivered=[], notified=[], logged=[])
+    app.snapshot = {"accounts": [], "identities": {}}
+
+    _rerun(app)
+
+    saved = json.loads(state_path.read_text())
+    assert saved["windows"] == {"k": 1.0}
+    assert app._reset_events_settings()["state_reset"] is True
+
+
+def test_reset_events_pass_failure_is_logged_once_and_shown_until_a_pass_succeeds(tmp_path):
+    logged = []
+    app = _reset_events_app(tmp_path, delivered=[], notified=[], logged=logged)
+    app.snapshot = None
+
+    for _ in range(3):
+        _rerun(app)
+    assert len(logged) == 1
+    assert app._reset_events_settings()["pass_error"].startswith("AttributeError: ")
+
+    app.snapshot = _ending_soon_snapshot()
+    _rerun(app)
+    assert app._reset_events_settings()["pass_error"] == ""
+    assert len(logged) == 1
+
+
+def test_reset_events_pass_skips_a_malformed_row_and_logs_it_once(tmp_path):
+    from openswap.reset_events import Destination, save_destinations
+
+    save_destinations(tmp_path, [Destination(id="h1", kind="webhook", enabled=True, url="https://x.test/h")])
+    delivered, logged = [], []
+    app = _reset_events_app(tmp_path, delivered=delivered, notified=[], logged=logged)
+    app.snapshot = _ending_soon_snapshot()
+    app.snapshot["accounts"].insert(0, (2, "broken@example.com"))
+
+    for _ in range(2):
+        _rerun(app)
+    assert [d[0] for d in delivered] == ["h1"]
+    assert len(logged) == 1
+    assert app._reset_events_settings()["pass_error"] == ""
+
+
+def test_reset_events_save_failure_clears_once_nothing_is_pending(tmp_path):
+    def failing_save(root, state, now=None):
+        raise OSError("disk full")
+
+    logged = []
+    app = _reset_events_app(tmp_path, delivered=[], notified=[], logged=logged, save_state=failing_save)
+    app.snapshot = _ending_soon_snapshot()
+
+    _rerun(app)
+    assert app._reset_events_settings()["save_error"] == "disk full"
+
+    app.snapshot = {"accounts": [], "identities": {}}
+    _rerun(app)
+    assert app._reset_events_settings()["save_error"] == ""
+
+
+def test_reset_events_writes_never_clobber_an_unreadable_config(tmp_path):
+    config = tmp_path / "reset_events.json"
+    config.write_text("{not json")
+    logged, errors = [], []
+    app = _reset_events_app(tmp_path, delivered=[], notified=[], logged=logged)
+    app._show_error = errors.append
+
+    app._toggle_reset_events_mac()
+    assert len(errors) == 1 and errors[0].startswith("Couldn't change Mac notifications:")
+
+    assert config.read_text() == "{not json"
+
+    text = json.dumps({"destinations": [
+        {"id": "h1", "kind": "webhook", "enabled": True, "url": "https://x.test/h"},
+        {"id": "h2", "kind": "webhook", "enabled": "yes"},
+    ]})
+    config.write_text(text)
+    app._record_reset_event_delivery("h1", "HTTP 500")
+    assert app._dirty is False
+    assert any("could not record" in a[0] for a in logged)
+    assert config.read_text() == text
+
+
+def test_reset_events_mac_toggle_flips_the_saved_destination(tmp_path):
+    from openswap.reset_events import load_destinations
+
+    app = _reset_events_app(tmp_path, delivered=[], notified=[], logged=[])
+    app._toggle_reset_events_mac()
+    assert [d.enabled for d in load_destinations(tmp_path) if d.kind == "mac"] == [True]
+
+
+def test_reset_events_delivery_result_keeps_the_last_failure_and_skips_unchanged_writes(tmp_path):
+    from openswap.reset_events import Destination, load_destinations, save_destinations
+
+    save_destinations(tmp_path, [Destination(id="h1", kind="webhook", enabled=True, url="https://x.test/h")])
+    config = tmp_path / "reset_events.json"
+    app = _reset_events_app(tmp_path, delivered=[], notified=[], logged=[])
+
+    def hook():
+        return {d.id: d for d in load_destinations(tmp_path)}["h1"]
+
+    mtime = config.stat().st_mtime_ns
+    app._record_reset_event_delivery("h1", "")
+    assert app._dirty is False and config.stat().st_mtime_ns == mtime
+
+    app._record_reset_event_delivery("h1", "HTTP 500")
+    assert hook().last_error == "HTTP 500" and hook().last_failure.endswith("Z HTTP 500")
+    assert app._dirty is True
+
+    app._dirty = False
+    app._record_reset_event_delivery("h1", "")
+    assert hook().last_error == "" and hook().last_failure.endswith("Z HTTP 500")
+    assert app._dirty is True
+
+    app._dirty = False
+    mtime = config.stat().st_mtime_ns
+    app._record_reset_event_delivery("h1", "")
+    assert app._dirty is False and config.stat().st_mtime_ns == mtime
+
+    app._record_reset_event_delivery("gone", "HTTP 500")
+    assert app._dirty is False
 
 
 @pytest.mark.parametrize("title_pct", ["off", "both"])

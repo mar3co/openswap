@@ -1,0 +1,169 @@
+"""Webhook delivery for reset events: signed POSTs on a background thread.
+
+Each destination's signing secret lives in the Keychain, keyed by its id.
+A delivery makes three attempts, then gives up and reports the last error;
+a redirect or a 4xx other than 408 and 429 is reported at once, since
+retrying it would get the same answer.
+"""
+
+from __future__ import annotations
+
+import http.client
+import logging
+import secrets
+import threading
+import time
+import urllib.error
+import urllib.request
+from collections.abc import Callable
+from urllib.parse import urlsplit
+
+from openswap import macos_keychain
+from openswap.reset_events import Destination, signature_header
+
+KEYCHAIN_SERVICE = "OpenSwap reset events"
+RETRY_DELAYS_S = (30, 60)
+TIMEOUT_S = 10
+_LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+_logger = logging.getLogger(__name__)
+
+
+class DeliveryError(Exception):
+    def __init__(self, message: str, *, permanent: bool = False):
+        super().__init__(message)
+        self.permanent = permanent
+
+
+def _http_error(code: int) -> DeliveryError:
+    if 300 <= code < 400:
+        return DeliveryError(f"HTTP {code}: the URL redirects; use the final URL", permanent=True)
+    if code in (401, 403):
+        return DeliveryError(
+            f"HTTP {code}: the receiver rejected the request (check the secret)", permanent=True
+        )
+    return DeliveryError(f"HTTP {code}", permanent=400 <= code < 500 and code not in (408, 429))
+
+
+class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def _open_without_redirects(request: urllib.request.Request, timeout: float):
+    # Built per call so the HTTPS context picks up the truststore injection
+    # even when this module is imported before it.
+    return urllib.request.build_opener(_RefuseRedirect).open(request, timeout=timeout)
+
+
+def validate_webhook_url(url: str) -> str | None:
+    if not url.isascii():
+        return "Use an ASCII URL (percent-encode other characters)"
+    if any(c <= " " or c == "\x7f" for c in url):
+        return "Webhook URL can't contain spaces or control characters."
+    try:
+        parts = urlsplit(url)
+        host, _port = parts.hostname, parts.port
+    except ValueError:
+        return "Webhook URL is not valid."
+    if parts.scheme not in ("http", "https"):
+        return "Webhook URL must start with https://."
+    if not host:
+        return "Webhook URL needs a host."
+    if parts.scheme == "http" and host not in _LOCAL_HOSTS:
+        return "Webhook URL must use https:// unless the host is localhost."
+    return None
+
+
+def new_secret(dest_id: str) -> str:
+    secret = secrets.token_urlsafe(32)
+    macos_keychain.set_password(KEYCHAIN_SERVICE, dest_id, secret)
+    return secret
+
+
+def get_secret(dest_id: str) -> str | None:
+    return macos_keychain.get_password(KEYCHAIN_SERVICE, dest_id)
+
+
+def delete_secret(dest_id: str) -> None:
+    macos_keychain.delete_password(KEYCHAIN_SERVICE, dest_id)
+
+
+def post_once(
+    url: str, body: bytes, secret: str, *, now: float, opener=_open_without_redirects
+) -> None:
+    if problem := validate_webhook_url(url):
+        raise DeliveryError(problem, permanent=True)
+    try:
+        request = urllib.request.Request(
+            url,
+            data=body,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "OpenSwap-Signature": signature_header(secret, body, int(now)),
+            },
+        )
+        with opener(request, timeout=TIMEOUT_S):
+            pass
+    except urllib.error.HTTPError as e:
+        raise _http_error(e.code) from None
+    except TimeoutError:
+        raise DeliveryError(f"timed out after {TIMEOUT_S} s") from None
+    except urllib.error.URLError as e:
+        raise DeliveryError(str(e.reason) or "connection failed") from None
+    except (OSError, http.client.HTTPException, ValueError) as e:
+        raise DeliveryError(str(e) or type(e).__name__) from None
+
+
+def deliver_async(
+    dest: Destination,
+    body: bytes,
+    *,
+    on_result: Callable[[str, str], None],
+    sleep=time.sleep,
+    opener=_open_without_redirects,
+) -> threading.Thread:
+    thread = threading.Thread(
+        target=_run,
+        args=(dest, body, on_result, sleep, opener),
+        name=f"reset-webhook-{dest.id}",
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
+def _run(dest, body, on_result, sleep, opener) -> None:
+    try:
+        error = _deliver(dest, body, sleep, opener)
+    except Exception as e:
+        error = f"{type(e).__name__}: {e}"
+    try:
+        on_result(dest.id, error)
+    except Exception:
+        _logger.warning("Reset event delivery callback failed for %s", dest.id, exc_info=True)
+
+
+def _deliver(dest, body, sleep, opener) -> str:
+    try:
+        secret = get_secret(dest.id)
+    except macos_keychain.KEYCHAIN_ERRORS as e:
+        return f"Keychain unavailable: {e}"
+    if not secret:
+        return "secret missing; re-add this webhook"
+    error = ""
+    for delay in (0, *RETRY_DELAYS_S):
+        if delay:
+            sleep(delay)
+        try:
+            post_once(dest.url, body, secret, now=time.time(), opener=opener)
+        except DeliveryError as e:
+            error = str(e)
+            if e.permanent:
+                return error
+            if not delay:
+                _logger.warning("Reset event webhook %s failed, retrying: %s", dest.id, error)
+        else:
+            return ""
+    return error
