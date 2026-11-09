@@ -47,6 +47,7 @@
 | Extra display knobs | `menubar_display.MenuBarSettings` | `menubar_settings.json` only (popover Settings) |
 | Popover UI | `menubar_panel.py` | AppKit, imported after rumps |
 | 5h kickoff policy | `kickoff.py` | Pure; extra decides *when* |
+| Reset events | `reset_events.py`, `reset_events_delivery.py` | Detection, filters, payload and signing over the extra's snapshot, plus the config and state files; the extra runs a pass every 15 s and never forces a usage fetch. Webhook POSTs run on background threads; secrets in Keychain service `"OpenSwap reset events"`. CLI: `openswap events`. [Details](menubar.md#reset-events) |
 | Widget JSON | `widget_snapshot.py` | Extra writes cards plus combined remaining; `updated_at` is last usage measurement, not extra paint time |
 | Widget build | `widget_install.py` | `xcodebuild` + LaunchAgent |
 | Claude Code status line | `statusline.py` | Opt-in wrap of `~/.claude/settings.json` `statusLine`. Paint reads live `.claude.json` + roster only (no Engine, no network). Wrap target lives in `settings.json` `statusline` (not a fourth file). `openswap statusline --codex` is paint-only (live `auth.json` + `codex/sequence.json`); Codex TUI has no command hook, so `config.toml` is never wrapped. |
@@ -66,6 +67,7 @@ MIT / Cetinkol remains on `LICENSE` while inherited files (`oauth.py`, parts of 
 | --- | --- |
 | `~/Library/Application Support/OpenSwap/settings.json` | CLI + extra policy (`openswap config`). First run moves `~/.claude-swap-backup` here |
 | `~/Library/Application Support/OpenSwap/menubar_settings.json` | Extra display + kickoff (popover Settings). Atomic 0600 write |
+| `~/Library/Application Support/OpenSwap/reset_events.json` | Reset event destinations and filters (`openswap events`, Settings Mac toggle). `reset_events_state.json` records what fired |
 | `~/Library/Application Support/OpenSwap/autoswitch_state.json` | Engine cooldown, last switch, quarantine. Extra stamps `lastSwitchAt` after a hand switch |
 | `~/Library/Application Support/OpenSwap/codex/` | Codex roster (`sequence.json`), slot homes (`slots/<n>/auth.json`), usage cache, Codex autoswitch state |
 | `~/Library/Application Support/OpenSwap/widget-snapshot.json` | Extra → widget |

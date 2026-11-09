@@ -215,7 +215,7 @@ missing), `observed_at` comes from `now`, and `account` =
     - ending_soon: title `"{label}: {window_name} ends in {countdown}"`, body `"{remaining:.0f}% left"`
     - reset: title `"{label}: {window_name} reset"`, body `"Full quota available"`
 
-    `window_name` is `5-hour` / `weekly`. `countdown` reuses `_live_countdown`. `clock` is the local `%-I:%M %p`.
+    `window_name` is `5-hour` / `weekly`. `countdown` reuses `_live_countdown`. `clock` is `oauth.reset_clock_string` (local 24-hour time, with the date when it isn't today).
   - Settings rows (section `SETTINGS_SECTION_AUTOMATION`):
     - group `"group_reset_events"`, labeled `"Reset events"`
     - toggle `"reset_events_mac"`, `"Notify on this Mac"`

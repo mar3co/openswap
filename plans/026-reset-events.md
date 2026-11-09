@@ -1,6 +1,8 @@
 # OpenSwap feature proposal: reset events for people, webhooks and OpenTag routines
 
-Status: ACCEPTED 2026-11-07 with every call in Decisions. Extends kickoff (the 5-hour start timer) and
+Status: ACCEPTED 2026-11-07 with every call in Decisions. S1 (event engine, Mac
+notification, webhooks, CLI) built and review-settled 2026-11-08 in
+mar3co/openswap#187; S2 and O1 not started (tracking: mar3co/openswap#186). Extends kickoff (the 5-hour start timer) and
 reuses plan 017's worker protocol, plan 022's pairing and plan 025's local
 handoff from other OpenSwap processes to the worker.
 
@@ -124,7 +126,9 @@ paths, no session content.
 ## Destinations
 
 Settings → Automation gains a **Reset events** section beside kickoff. It
-lists destinations, and each destination has the same filter:
+lists destinations, and each destination has the same filter (S1 ships the
+Mac toggle and a webhook count there; webhooks and every filter are managed
+with `openswap events`):
 
 - **Accounts:** all, or a chosen set.
 - **Windows:** 5-hour, weekly, or both.
@@ -177,6 +181,7 @@ A matching CLI covers headless use and testing:
 
 - `openswap events list`
 - `openswap events add-webhook <url> [filter flags]`
+- `openswap events set <id> [filter flags] [--enable|--disable]`
 - `openswap events remove <id>`
 - `openswap events test <id>`, which sends a sample event marked `"test": true`.
 
