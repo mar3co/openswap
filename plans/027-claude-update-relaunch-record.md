@@ -65,3 +65,12 @@ Cold seat 4 (Opus, diff only, on the extra round), 2026-11-12. Under the budget,
 - Important: the marker's contents are never read. Claude also writes it for a user quit with a saved page (`userQuit`) and for a navigation-restore relaunch (`navOnly`), and a check can land in Claude's own relaunch gap. Filed as mar3co/openswap#190.
 - Important: a marker whose tries are used up still gets the waiting notice on a later update. Filed as mar3co/openswap#191.
 - Minor: Claude treats its own marker as stale after 5 minutes, while OpenSwap honors it for 7 days. This is deliberate, per the user's 7-day ruling: OpenSwap acts later, after the install, which Claude's own relaunch never waits for.
+
+Cold seat 5 (Opus, diff only, requested by the user before merge), 2026-11-12:
+- Important, narrow reach: a failed full check sets `_check_failed`, which also stops the reopen until a later check passes. This is reachable only by running Check during the seconds of an install. Filed as mar3co/openswap#193.
+- Minor: notice copy was wrong for one or several names ("Work, Personal … reopens", a plural title for one profile). Fixed, and the fix got its own cold seat.
+- Minor: `update_label` has no docstring after the split. Declined: it is a two-line pure function, and the file documents only its non-obvious helpers.
+- Copy fix, cold seat 6 (Opus, diff only): clean. Minors declined:
+  - no test for the plural wording, since it is string formatting and the singular case is already pinned;
+  - names joined with ", " is the existing style;
+  - helper variable naming.

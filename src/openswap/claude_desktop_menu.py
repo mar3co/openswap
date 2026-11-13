@@ -889,17 +889,20 @@ class ClaudeDesktopMenu:
                 self._update_label = label
                 self.changed()
             if reopened:
-                self._notify("Claude profiles reopened", f"{', '.join(reopened)} reopened. Claude had closed {'them' if len(reopened) > 1 else 'it'} to install an update.")
+                many = len(reopened) > 1
+                self._notify(f"Claude profile{'s' if many else ''} reopened",
+                             f"{', '.join(reopened)} reopened. Claude had closed {'them' if many else 'it'} to install an update.")
             if failed:
-                self._notify("Claude profiles didn't reopen",
+                them = "them" if len(failed) > 1 else "it"
+                self._notify(f"Claude profile{'s' if len(failed) > 1 else ''} didn't reopen",
                              f"Claude closed {', '.join(failed)} to install an update, and OpenSwap couldn't reopen "
-                             f"{'them' if len(failed) > 1 else 'it'}. Open {'them' if len(failed) > 1 else 'it'} from OpenSwap.")
+                             f"{them}. Open {them} from OpenSwap.")
             fresh = [(i, name, mtime) for i, name, mtime in waiting if (i, mtime) not in self._relaunch_noticed]
             if fresh and generation == self._check_generation and self.enabled():
                 self._relaunch_noticed.update((i, mtime) for i, _, mtime in fresh)
                 names = ", ".join(name for _, name, _ in fresh)
                 self._notify("Claude is waiting to update",
-                             f"{names} closed for Claude's update and reopens once it installs. "
+                             f"{names} closed for Claude's update and {'reopen' if len(fresh) > 1 else 'reopens'} once it installs. "
                              "To install now, choose Update Claude in OpenSwap.")
         try:
             generation, message, states, update, checked_at, verified = self._checks.get_nowait()

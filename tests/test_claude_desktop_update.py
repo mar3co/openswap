@@ -1054,7 +1054,7 @@ def test_poll_reopens_an_update_closed_profile_once_installed(passive, setup, mo
     p.menu.poll()
     p.app.open.assert_called_once()
     attach.assert_called_once_with(setup.store, work.id)
-    p.menu.notify.assert_called_once_with("Claude profiles reopened", "Work reopened. Claude had closed it to install an update.")
+    p.menu.notify.assert_called_once_with("Claude profile reopened", "Work reopened. Claude had closed it to install an update.")
     p.now[0] += 61
     p.menu.poll()
     p.menu.poll()
@@ -1096,7 +1096,7 @@ def test_poll_retries_a_reopen_that_did_not_launch_a_few_times(passive, setup, o
         p.menu.notify.assert_not_called()
     else:
         p.menu.notify.assert_called_once()
-        assert p.menu.notify.call_args.args[0] == "Claude profiles didn't reopen"
+        assert p.menu.notify.call_args.args[0] == "Claude profile didn't reopen"
 
 
 def test_poll_leaves_default_to_claudes_own_relaunch(passive, setup):
