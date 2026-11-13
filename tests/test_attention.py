@@ -2540,8 +2540,18 @@ def test_a1_the_replies_switch_never_turns_codex_hooks_on(codex_home):
         assert (home / "config.toml").read_text() == "[features]\nhooks = false\n"
 
 
-def test_a2_an_owners_own_bin_codex_hook_is_never_taken_for_openswaps(codex_home):
+def _installed_program(tmp_path, monkeypatch) -> str:
+    exe = tmp_path / "OpenSwap.app" / "Contents" / "MacOS" / "OpenSwap"
+    exe.parent.mkdir(parents=True)
+    exe.write_text("")
+    exe.chmod(0o755)
+    monkeypatch.setattr(attention, "program", lambda: str(exe))
+    return str(exe)
+
+
+def test_a2_an_owners_own_bin_codex_hook_is_never_taken_for_openswaps(codex_home, tmp_path, monkeypatch):
     home, root = codex_home
+    _installed_program(tmp_path, monkeypatch)
     attention.apply(root, True)
     theirs = {"hooks": [{"type": "command", "command": "/Users/o/bin/codex-hook Stop"}]}
     data = json.loads((home / "hooks.json").read_text())
@@ -2553,11 +2563,12 @@ def test_a2_an_owners_own_bin_codex_hook_is_never_taken_for_openswaps(codex_home
     assert not (root / attention.HOOKS_RECORD).exists() and not attention.codex_launcher(root).exists()
 
 
-def test_a2_another_openswaps_launcher_is_named_only_while_it_is_there(codex_home, tmp_path):
+def test_a2_another_openswaps_launcher_is_named_only_while_it_is_there(codex_home, tmp_path, monkeypatch):
     home, root = codex_home
+    exe = _installed_program(tmp_path, monkeypatch)
     attention.apply(root, True)
     other = tmp_path / "other-backup"
-    attention._write_launcher(other, EXE)
+    attention._write_launcher(other, exe)
     data = json.loads((home / "hooks.json").read_text())
     data["hooks"]["Stop"].append({"hooks": [attention.codex_hook_entry("Stop", attention.codex_launcher(other))]})
     (home / "hooks.json").write_text(json.dumps(data))
