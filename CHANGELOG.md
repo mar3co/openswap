@@ -23,6 +23,7 @@ opensoft.me/swap/changelog shows this file.
 ### Improved
 
 - The Claude Desktop update row now shows when Claude has downloaded an update that is ready to install, or that no update is downloaded yet.
+- When Claude closes a profile on its own to install an update, OpenSwap now reopens it once the update is installed. Before, only the Default profile came back. If the update is still waiting on another open profile, OpenSwap tells you once, and Update Claude installs it now.
 - Settings › Remote is tidier: Remote tasks, Account, Folders and Status sections with short labels, each folder shown by name with its path, the status in one plain line with the full fields under Details, and a refused control saying what failed and why.
 - Adding a folder like ~/GitHub whose repos sit in organization folders now adds each of those folders, in Settings and in the setup window.
 - Set Up… and Connect to OpenTag… in Settings › Remote now finish in OpenSwap's setup window, one step per page with real controls: start the worker, pick the account, check the folders tasks may use (or add one), then a checklist of what's ready and which Settings control fixes the rest.

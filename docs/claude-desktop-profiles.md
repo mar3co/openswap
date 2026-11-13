@@ -336,6 +336,16 @@ each one's menu.
 Dock pins, sign-ins and profile data are preserved. Claude's own updater may also open
 the ordinary Default window; OpenSwap leaves that window alone.
 
+Claude also installs a downloaded update by itself after a profile has been idle
+for a while, and then reopens only the ordinary app, which is Default. OpenSwap
+recognizes a profile Claude closed this way by the relaunch note Claude leaves in
+that profile's folder. Once the update is installed, OpenSwap reopens the profile
+(once, checked about every minute) and attaches its Dock shortcut. While the
+update still waits on another open profile, the closed profile stays closed and
+OpenSwap notifies you once; choose **Update Claude…** to install it now. Archived
+profiles, and profiles Claude closed more than a week ago, are not reopened. If a profile still won't open after a few tries,
+OpenSwap tells you so you can open it yourself.
+
 If quitting is canceled, installation stalls, a profile fails to reopen, Desktop
 features are disabled, or OpenSwap exits, the recovery record remains. Choose
 **Resume update…** to continue after resolving the issue. Recovery requires a

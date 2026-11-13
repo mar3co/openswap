@@ -1,5 +1,6 @@
 """Shared-install update coordination; never launch or quit the real Claude app."""
 import json
+import os
 import plistlib
 import sys
 from pathlib import Path
@@ -349,6 +350,12 @@ def test_downloaded_update_reads_staged_version_without_signature_check(stage, s
     run.assert_not_called()
 
 
+def test_a_state_file_left_after_install_means_no_update_downloaded(stage):
+    stage.staged.rmdir()
+    assert update.downloaded_update(stage.app, "4.4212.0", cache=stage.cache, app_factory=stage.factory) == ""
+    stage.factory.assert_not_called()
+
+
 def test_no_state_file_means_no_update_downloaded(stage):
     stage.state.unlink()
     assert update.downloaded_update(stage.app, "4.4212.0", cache=stage.cache, app_factory=stage.factory) == ""
@@ -471,7 +478,7 @@ def test_failed_check_stops_the_label_until_a_check_passes(passive):
 def test_stale_check_cannot_set_update_label(menu):
     menu._label_checked_at = menu.clock()
     menu._checks.put((menu._check_generation - 1, "Old result", {}, "Claude 4.1.0 is ready to install", "old", True))
-    menu._labels.put((menu._check_generation - 1, "Claude 4.1.0 is ready to install"))
+    menu._labels.put((menu._check_generation - 1, "Claude 4.1.0 is ready to install", [], [], []))
     menu.poll()
     menu.poll()
     assert menu.settings_state()["update_label"] is None
@@ -974,3 +981,130 @@ def test_panel_update_rows_dispatch_their_actions(row, action):
     panel._desktop_profile_action = Mock()
     panel._emit_setting(row, None)
     panel._desktop_profile_action.assert_called_once_with(action)
+
+
+def mark(store, profile):
+    marker = store.paths(profile)[0] / update.RELAUNCH_MARKER
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("{}")
+    return marker.stat().st_mtime
+
+
+def states_app(states):
+    app = launcher()
+    app.profile_states.return_value = states
+    return app
+
+
+@pytest.mark.parametrize("staged, others, expect", [
+    ("", "Running", "reopen"),
+    ("", "Not running", "reopen"),
+    ("4.16336.0", "Running", "waiting"),
+    ("4.16336.0", "Not running", "nothing"),  # every instance is closed: ShipIt is installing
+    (None, "Running", "nothing"),
+])
+def test_update_closed_by_download_state(setup, staged, others, expect):
+    default, work = setup.profiles
+    mtime = mark(setup.store, work)
+    app = states_app({default.id: others, work.id: "Not running"})
+    reopen, waiting = update.update_closed(setup.store, app, staged)
+    assert (reopen, waiting) == {"reopen": ([(work, mtime)], []), "waiting": ([], [(work, mtime)]),
+                                 "nothing": ([], [])}[expect]
+
+
+@pytest.mark.parametrize("case", ["running", "unconfirmed", "old", "archived", "unmarked"])
+def test_update_closed_ignores_profiles_it_should_not_touch(setup, case):
+    default, work = setup.profiles
+    mark(setup.store, work)
+    if case == "old":
+        marker = setup.store.paths(work)[0] / update.RELAUNCH_MARKER
+        os.utime(marker, (marker.stat().st_mtime - update.RELAUNCH_MAX_AGE - 60,) * 2)
+    if case == "archived":
+        setup.store.update(work.id, archived=True)
+    if case == "unmarked":
+        (setup.store.paths(work)[0] / update.RELAUNCH_MARKER).unlink()
+    state = {"running": "Running", "unconfirmed": "Could not confirm"}.get(case, "Not running")
+    app = states_app({default.id: "Running", work.id: state})
+    assert update.update_closed(setup.store, app, "") == ([], [])
+    assert update.update_closed(setup.store, app, "4.16336.0") == ([], [])
+
+
+def test_update_closed_leaves_default_to_claudes_relaunch_but_reports_its_wait(setup):
+    default, work = setup.profiles
+    mtime = mark(setup.store, default)
+    app = states_app({default.id: "Not running", work.id: "Running"})
+    assert update.update_closed(setup.store, app, "") == ([], [])
+    assert update.update_closed(setup.store, app, "4.16336.0") == ([], [(default, mtime)])
+
+
+def test_update_closed_reads_no_processes_without_a_marker(setup):
+    app = states_app({})
+    assert update.update_closed(setup.store, app, "") == ([], [])
+    app.profile_states.assert_not_called()
+
+
+def test_poll_reopens_an_update_closed_profile_once_installed(passive, setup, monkeypatch):
+    p = passive
+    attach = Mock()
+    monkeypatch.setattr("openswap.claude_desktop_presence.attach_presence", attach)
+    default, work = setup.profiles
+    mark(setup.store, work)
+    p.downloaded.return_value = ""
+    p.app.profile_states.return_value = {default.id: "Running", work.id: "Not running"}
+    p.menu.poll()
+    p.app.open.assert_called_once()
+    attach.assert_called_once_with(setup.store, work.id)
+    p.menu.notify.assert_called_once_with("Claude profiles reopened", "Work reopened. Claude had closed it to install an update.")
+    p.now[0] += 61
+    p.menu.poll()
+    p.menu.poll()
+    p.app.open.assert_called_once()  # one attempt per marker
+
+
+def test_poll_notifies_once_while_the_update_waits_on_another_profile(passive, setup):
+    p = passive
+    default, work = setup.profiles
+    mark(setup.store, work)
+    p.app.profile_states.return_value = {default.id: "Running", work.id: "Not running"}
+    p.menu.poll()
+    p.now[0] += 61
+    p.menu.poll()
+    p.menu.poll()
+    p.app.open.assert_not_called()
+    p.menu.notify.assert_called_once()
+    title, body = p.menu.notify.call_args.args
+    assert title == "Claude is waiting to update" and body.startswith("Work closed for Claude's update")
+
+
+@pytest.mark.parametrize("outcome, opens", [("raises", 3), ("already_opening", 3), ("already_running", 1)])
+def test_poll_retries_a_reopen_that_did_not_launch_a_few_times(passive, setup, outcome, opens):
+    p = passive
+    default, work = setup.profiles
+    mark(setup.store, work)
+    p.downloaded.return_value = ""
+    p.app.profile_states.return_value = {default.id: "Running", work.id: "Not running"}
+    if outcome == "raises":
+        p.app.open.side_effect = cd.ClaudeDesktopError("Claude changed during validation.")
+    else:
+        p.app.open.side_effect = None
+        p.app.open.return_value = {"state": outcome, "pid": None}
+    for _ in range(5):
+        p.menu.poll()
+        p.now[0] += 61
+    assert p.app.open.call_count == opens
+    if outcome == "already_running":
+        p.menu.notify.assert_not_called()
+    else:
+        p.menu.notify.assert_called_once()
+        assert p.menu.notify.call_args.args[0] == "Claude profiles didn't reopen"
+
+
+def test_poll_leaves_default_to_claudes_own_relaunch(passive, setup):
+    p = passive
+    default, work = setup.profiles
+    mark(setup.store, default)
+    p.downloaded.return_value = ""
+    p.app.profile_states.return_value = {default.id: "Not running", work.id: "Running"}
+    p.menu.poll()
+    p.app.open.assert_not_called()
+    p.menu.notify.assert_not_called()

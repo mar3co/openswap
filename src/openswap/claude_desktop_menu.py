@@ -13,6 +13,8 @@ from openswap.claude_desktop import BADGE_COLORS, BUNDLE_ID, ClaudeDesktopApp, C
 from openswap.exceptions import ClaudeSwitchError
 from openswap.claude_desktop_monitor import PAUSED_STATUS, ProfileIdentityMonitor
 
+RELAUNCH_TRIES = 3
+
 
 def focus_profile(pid: int) -> None:
     # Focus the specific process, not the bundle ID (shared by all profiles).
@@ -30,13 +32,16 @@ def reveal_shortcut(path: str) -> None:
     AppKit.NSWorkspace.sharedWorkspace().activateFileViewerSelectingURLs_([NSURL.fileURLWithPath_(path)])
 
 
-def update_label(app, installed):
+def downloaded(app, installed):
     """Passive: reads Info.plist files only, never signatures or processes."""
     try:
         from openswap.claude_desktop_update import downloaded_update
-        staged = downloaded_update(app, installed)
+        return downloaded_update(app, installed)
     except Exception:
         return None
+
+
+def update_label(installed, staged):
     if staged:
         return f"Claude {staged} is ready to install"
     return None if staged is None else f"Claude {installed} · No update downloaded"
@@ -100,6 +105,8 @@ class ClaudeDesktopMenu:
         from openswap.claude_desktop_update import DesktopUpdate
         self.updater = updater or DesktopUpdate(self.store)
         self._update_observed = False
+        self._relaunch_tries = {}
+        self._relaunch_noticed = set()
 
     def _update_pending(self):
         try:
@@ -183,7 +190,7 @@ class ClaudeDesktopMenu:
                 info = app.validate()
                 validated = True
                 message = f"Claude {info['version']} · Publisher verified."
-                update = update_label(app, info["version"])
+                update = update_label(info["version"], downloaded(app, info["version"]))
             except Exception as exc:
                 message = str(exc) if isinstance(exc, ClaudeSwitchError) else "Could not check Claude Desktop. Try again."
             if app is not None:
@@ -214,17 +221,54 @@ class ClaudeDesktopMenu:
         generation = self._check_generation
 
         def check():
+            reopened, failed, waiting = [], [], []
             try:
                 app = self._app_factory()
-                label = update_label(app, app.bundle_info()["CFBundleShortVersionString"])
+                installed = app.bundle_info()["CFBundleShortVersionString"]
+                staged = downloaded(app, installed)
+                label = update_label(installed, staged)
             except Exception:
                 label = None
-            self._labels.put((generation, label))
+            else:
+                try:
+                    reopened, failed, waiting = self._reopen_update_closed(app, staged, generation)
+                except Exception:
+                    pass  # the next check retries; a passive check never shows an error
+            self._labels.put((generation, label, reopened, failed, waiting))
 
         try:
             threading.Thread(target=check, daemon=True, name="claude-desktop-update-label").start()
         except Exception:
             pass  # the next refresh retries
+
+    def _reopen_update_closed(self, app, staged, generation):
+        """Label thread: reopen each profile Claude closed for an update that is now installed, once."""
+        from openswap.claude_desktop_presence import attach_presence
+        from openswap.claude_desktop_update import update_closed
+
+        reopen, waiting = update_closed(self.store, app, staged)
+        reopened, failed = [], []
+        for profile, mtime in reopen:
+            key = (profile.id, mtime)
+            if self._relaunch_tries.get(key, 0) >= RELAUNCH_TRIES or generation != self._check_generation or not self.enabled():
+                continue
+            self._relaunch_tries[key] = self._relaunch_tries.get(key, 0) + 1
+            try:
+                state = self.store.open(profile.id, app=app)["state"]
+            except Exception:
+                state = None  # right after an install the app may still be settling
+            if state in {"launched", "already_running"}:
+                self._relaunch_tries[key] = RELAUNCH_TRIES
+            elif self._relaunch_tries[key] >= RELAUNCH_TRIES:
+                failed.append(profile.name)
+            if state != "launched":
+                continue
+            reopened.append(profile.name)
+            try:
+                attach_presence(self.store, profile.id)
+            except Exception:
+                pass  # the Dock icon is optional; the profile is open and must still be reported
+        return reopened, failed, [(p.id, p.name, mtime) for p, mtime in waiting]
 
     def _notify(self, title, body):
         try:
@@ -837,13 +881,26 @@ class ClaudeDesktopMenu:
         if self.code and self.code.poll(enabled=self.enabled(), idle=not (self.busy or updating or self.blocked() or self._editing_details) and self.code_login_allowed()):
             self.changed()
         try:
-            generation, label = self._labels.get_nowait()
+            generation, label, reopened, failed, waiting = self._labels.get_nowait()
         except queue.Empty:
             pass
         else:
             if generation == self._check_generation and self.enabled() and label != self._update_label:
                 self._update_label = label
                 self.changed()
+            if reopened:
+                self._notify("Claude profiles reopened", f"{', '.join(reopened)} reopened. Claude had closed {'them' if len(reopened) > 1 else 'it'} to install an update.")
+            if failed:
+                self._notify("Claude profiles didn't reopen",
+                             f"Claude closed {', '.join(failed)} to install an update, and OpenSwap couldn't reopen "
+                             f"{'them' if len(failed) > 1 else 'it'}. Open {'them' if len(failed) > 1 else 'it'} from OpenSwap.")
+            fresh = [(i, name, mtime) for i, name, mtime in waiting if (i, mtime) not in self._relaunch_noticed]
+            if fresh and generation == self._check_generation and self.enabled():
+                self._relaunch_noticed.update((i, mtime) for i, _, mtime in fresh)
+                names = ", ".join(name for _, name, _ in fresh)
+                self._notify("Claude is waiting to update",
+                             f"{names} closed for Claude's update and reopens once it installs. "
+                             "To install now, choose Update Claude in OpenSwap.")
         try:
             generation, message, states, update, checked_at, verified = self._checks.get_nowait()
         except queue.Empty:

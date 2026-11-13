@@ -22,6 +22,8 @@ from openswap import claude_desktop as cd
 
 WAIT_SECONDS = 120
 SHIPIT_ID = cd.BUNDLE_ID + ".ShipIt"
+RELAUNCH_MARKER = "stealth-relaunch"
+RELAUNCH_MAX_AGE = 7 * 24 * 3600
 BLOCKED = "Claude's update is unfinished. Choose Resume update or Cancel update in OpenSwap before opening profiles."
 
 
@@ -141,10 +143,43 @@ def downloaded_update(app, installed, *, cache=None, app_factory=cd.ClaudeDeskto
     if not os.path.lexists(cache / "ShipItState.plist"):
         return ""
     try:
-        staged = app_factory(_staged_bundle(app, cache)).bundle_info().get("CFBundleShortVersionString")
+        bundle = _staged_bundle(app, cache)
+        # Squirrel keeps its state file after moving the update into place.
+        if not os.path.lexists(bundle):
+            return ""
+        staged = app_factory(bundle).bundle_info().get("CFBundleShortVersionString")
         return staged if version(staged) > version(installed) else ""
     except (cd.ClaudeDesktopError, OSError, ValueError, KeyError, TypeError, ExpatError):
         return None
+
+
+def update_closed(store, app, staged, *, now=time.time):
+    """Profiles Claude quit for its own update that nothing has reopened.
+
+    Claude writes its relaunch marker before quitting to install an update and
+    removes it when that profile next starts, but ShipIt relaunches only the
+    ordinary app, which is Default. ``staged`` is ``downloaded_update``'s answer.
+    Returns ``(reopen, waiting)``, each a list of ``(profile, marker_mtime)``.
+    """
+    if staged is None:
+        return [], []
+    marked = []
+    for profile in store.list():
+        try:
+            mtime = (store.paths(profile)[0] / RELAUNCH_MARKER).stat().st_mtime
+        except OSError:
+            continue
+        # A profile left closed for long must not reopen by surprise.
+        if now() - mtime <= RELAUNCH_MAX_AGE:
+            marked.append((profile, mtime))
+    if not marked:
+        return [], []
+    states = app.profile_states(store)
+    closed = [(p, m) for p, m in marked if states.get(p.id) == "Not running"]
+    if not staged:
+        return [(p, m) for p, m in closed if p.kind != "default"], []
+    # With nothing else open, ShipIt is installing right now.
+    return ([], closed) if "Running" in states.values() else ([], [])
 
 
 class MacUpdateBackend:
