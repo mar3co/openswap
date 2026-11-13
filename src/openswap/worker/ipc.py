@@ -389,8 +389,9 @@ def _listen_again(path: Path, bound_info, stop_event: Event):
     wait = 0.1
     while not stop_event.is_set():
         _unlink_ours(path, bound_info)
-        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server = None
         try:
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             _verify_private_parent(path)
             server.bind(str(path))
             bound_info = path.lstat()
@@ -399,7 +400,8 @@ def _listen_again(path: Path, bound_info, stop_event: Event):
             server.settimeout(0.2)
             return server, bound_info
         except (OSError, IpcError) as exc:
-            server.close()
+            if server is not None:
+                server.close()
             log_limited("ipc_listen", "Worker socket could not be opened again (%r); retrying", exc)
             stop_event.wait(wait)
             wait = min(wait * 2, LISTEN_RETRY_MAX_SECONDS)

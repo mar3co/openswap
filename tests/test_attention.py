@@ -2780,6 +2780,41 @@ def test_f4_prompts_waiting_while_the_settings_are_unreadable_publish_once_they_
     assert sorted(e["provider"] for e in published(items)) == ["claude", "codex"]
 
 
+def test_f4_held_queued_prompts_survive_one_answered_at_the_mac(tmp_path):
+    switch, clock = _Switch(), Clock()
+    items = AttentionStore(tmp_path, clock=clock, enabled=switch.enabled, switches=switch.switches,
+                           codex_answers=Answers())
+    t = clock.now
+    switch.readable = False
+    items.notice(permission(command="a", agent_id="sub1") | at(clock, 0))
+    items.notice(permission(command="b", agent_id="sub2") | at(clock, 0.1))
+    items.notice(notification("permission_prompt") | at(clock, 6))
+    items.notice(notification("permission_prompt") | at(clock, 6.1))
+    items.observe(record("busy", t + 20), True)
+    items.observe(record("waiting", t + 20.5, waiting_for="permission prompt"), True)  # the queued one shows
+    clock.now += 25
+    items.tick()
+    switch.readable = True
+    items.tick()
+    assert len(published(items)) == 2
+
+
+def test_f4_a_held_prompt_answered_at_the_mac_is_never_published(tmp_path):
+    switch, clock = _Switch(), Clock()
+    items = AttentionStore(tmp_path, clock=clock, enabled=switch.enabled, switches=switch.switches,
+                           codex_answers=Answers())
+    t = clock.now
+    switch.readable = False
+    items.notice(permission() | at(clock, 0))
+    items.notice(notification("permission_prompt") | at(clock, 6))
+    clock.now = t + 20
+    items.observe(record("busy", t + 20), True)  # answered at the Mac
+    clock.now = t + 20.5
+    switch.readable = True
+    items.tick()  # inside its grace
+    assert published(items) == []
+
+
 def test_f5_a_413_any_time_after_the_budget_came_back_shrinks_it_for_good(reporting):
     from openswap.worker import remote
     from openswap.worker.attention import REPORT_BUDGET

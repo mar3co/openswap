@@ -1278,7 +1278,7 @@ class AttentionStore:
                     if self._won([item], record.status_at, "allow" if record.status == "busy" else "deny"):
                         won.append(item)
                         continue
-                if not item.published:
+                if not self._shown(item):
                     changed = self._close([item], "answered_on_mac") or changed
                 elif item.id not in self._due:
                     self._due[item.id] = now + SESSION_END_GRACE_SECONDS
@@ -1316,12 +1316,13 @@ class AttentionStore:
             changed = self._close(expired, "expired") or changed
             waited = [i for i in self._items if i.provider == "codex" and not i.published and now - i.created_at >= (
                 CODEX_FINISHED_SECONDS if i.kind == "finished" else CODEX_PROMPT_SECONDS)]
-            held = [i for i in self._items if i.id in self._held]
+            # A held prompt already answered at the Mac (awaiting its close) never goes.
+            held = [i for i in self._items if i.id in self._held and i.id not in self._due]
             # Nothing new goes while the settings cannot be read.
             if (waited or held) and self.enabled() is True:
                 for item in waited + held:
                     item.published = True
-                self._held.clear()
+                    self._held.discard(item.id)
                 changed = True
             if changed:
                 self._commit()

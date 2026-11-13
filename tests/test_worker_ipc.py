@@ -267,6 +267,26 @@ def test_a_broken_listening_socket_is_opened_again_in_place_and_open_connections
     assert thread.is_alive() and control.status_calls == 2
 
 
+def test_a_listener_whose_new_socket_cannot_be_made_yet_is_retried(running_server, monkeypatch):
+    path, *_ = running_server
+    real_socket, refused, refusing = socket.socket, threading.Event(), threading.Event()
+    refusing.set()
+
+    def make(*args, **kwargs):
+        if refusing.is_set():
+            refused.set()
+            raise OSError(errno.EMFILE, os.strerror(errno.EMFILE))
+        return real_socket(*args, **kwargs)
+
+    failed = _accept_fails_once(monkeypatch, errno.EBADF)
+    monkeypatch.setattr(socket, "socket", make)
+    assert failed.wait(1)
+    assert refused.wait(2)
+    refusing.clear()
+    monkeypatch.setattr(socket, "socket", real_socket)
+    assert _status_soon(path, 4)["ok"] is True
+
+
 def test_a_listener_that_cannot_be_opened_again_is_retried_with_a_growing_wait(running_server, monkeypatch):
     path, *_ = running_server
     real_bind, attempts, refusing = socket.socket.bind, [], threading.Event()
