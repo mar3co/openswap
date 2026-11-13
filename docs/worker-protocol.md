@@ -744,7 +744,10 @@ reference servers predating this extension) stops it until the next
 registration; other failures are retried every 5 seconds, and logged at
 most every 10 minutes per error. A 403 (`forbidden`) is asked again only
 every 15 minutes, and the worker's status says why. A 413 halves the next
-report's size (oldest details, then oldest items, left out). A 400 is taken
+report's size (oldest details, then oldest items, left out); the full size
+comes back once the service has taken 5 reports since (a report left unsent
+because nothing changed does not count), only once: any 413 after that keeps
+the smaller size for the worker's life. A 400 is taken
 as one item's fault: the next report leaves out the items' detail, then adds
 each back one report at a time and keeps out for good the one refused again;
 failing that, generic labels; failing that, the report carries only closes.
@@ -754,6 +757,10 @@ was accepted, when notices are turned off, or, past 200 waiting while no
 report gets through, oldest first; its item still leaves `items`. An
 unreadable settings file is not "off": the worker keeps its open items and
 sends waiting closes, with no detail and no actions, and its status says so.
+Each hook event is applied as usual meanwhile (one read of the settings
+decides it), but nothing new is published: an item replacing one the phone
+shows (a new idle item, a Codex turn) is, and every prompt or item still open
+publishes once the file reads again with notices on.
 
 ### Replies
 
@@ -1721,7 +1728,10 @@ left `waiting` after a prompt was recorded answered it (an idle item closes
 only on a typed prompt: a channel or background turn also leaves `idle`). With
 several prompts open in a session, a status that is `waiting` again when the
 grace ends closes none of them (queued dialogs: the one answered cannot be
-told from the one now shown); each closes on its own signal. A
+told from the one now shown); each closes on its own signal. Until then, none
+of that process's prompts recorded before the session left `waiting` takes a
+reply (`refused`); once one is left, it takes replies again while the session
+waits. A
 `permission_prompt` that finds the session not waiting publishes nothing only
 when that status was set after the dialog showed.
 Those closes wait 1.5 seconds,
@@ -1817,7 +1827,9 @@ questions (details off, or the detail cut for size):
   question and option is sent whole (none past the caps, cut or cleaned to
   nothing) while details are on. Any command a session runs can connect as a
   question hook; it gains nothing (a second one only keeps the question from
-  taking an answer), and at most 4 wait per Claude Code process. That hook
+  taking an answer), and at most 4 wait per Claude Code process, so such
+  commands can also keep that process's questions from taking answers until
+  they leave. That hook
   (`openswap attention question`, a `PermissionRequest` hook on
   `AskUserQuestion` with a 600-second timeout) is installed in every managed
   config home only while replies are on. It is served only in a session whose
@@ -1842,10 +1854,14 @@ the question hook took the reply; one that never got there (the hook left,
 the send failed) settles as `refused` (`item_closed` if the item closed) and
 the item takes a reply again. A reply a worker restart left between the two
 is never reported `refused` or `item_closed` (it may have landed), and its
-item takes no other reply until it closes. A
+item takes no other reply until it closes. It is not acknowledged while its
+item is open; once the item closes, it is acknowledged `sent` if the service
+sends it again before it expires. A
 reply counts as `applied` only on the session's own signal for it: the
 dialog closing within 2 seconds of the verdict as an approval or a decline, the
-call's `PostToolUse` or `PostToolUseFailure` after an allow, the `Stop` that
+call's `PostToolUse` or `PostToolUseFailure` after an allow (also when the
+turn's `Stop` or the subagent's `SubagentStop` comes first; without it the
+item closes 1.5 seconds later as `answered_on_mac`), the `Stop` that
 follows a channel deny (a "No" at the Mac fires none), a subagent's next call
 after a deny of its prompt, a `PostToolUse` carrying the chosen options, or
 the channel turn carrying the message's own token. Otherwise the item closes

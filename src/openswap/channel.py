@@ -44,7 +44,6 @@ class Channel:
         self._worker = None  # the registered connection, while there is one
         self._worker_lock = threading.Lock()
         self.stopped = threading.Event()
-        self.refused = False
 
     # --- Claude Code side --------------------------------------------------------
 
@@ -129,7 +128,6 @@ class Channel:
             answer = json.loads(reader.readline() or b"{}")
             if not isinstance(answer, dict) or answer.get("ok") is not True:
                 connection.close()
-                self.refused = isinstance(answer, dict) and answer.get("error") == "channel_refused"
                 return None, None
             connection.settimeout(None)
             return connection, reader
@@ -140,7 +138,6 @@ class Channel:
     def worker_loop(self) -> None:
         """Keep one registered connection to the worker while Claude Code runs."""
         while not self.stopped.is_set():
-            self.refused = False
             try:
                 connection, reader = self._connect()
             except Exception:  # noqa: BLE001 - keep trying; Claude Code is still served meanwhile

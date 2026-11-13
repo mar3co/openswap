@@ -2647,3 +2647,149 @@ def test_minor_a_file_recorded_under_two_config_home_paths_is_deleted_once(tmp_p
     assert len(_recorded(root)) == 2
     attention.remove(root)
     assert not (home / "settings.json").exists() and not (root / attention.HOOKS_RECORD).exists()
+
+
+# --- follow-ups from the S fix round's final review (mar3co/openswap#183) ----------------
+
+
+class _Switch:
+    """The owner's switches as the worker reads them; ``readable`` False: the file cannot be read."""
+    readable = True
+
+    def enabled(self):
+        return True if self.readable else None
+
+    def switches(self):
+        return AttentionSettings(notices=self.readable, readable=self.readable)
+
+
+def test_b3_unreadable_settings_still_close_and_update_what_the_phone_shows(tmp_path):
+    switch, clock = _Switch(), Clock()
+    items = AttentionStore(tmp_path, clock=clock, enabled=switch.enabled, switches=switch.switches)
+    items.notice(permission(command="a") | at(clock, 0))
+    items.notice(notification("permission_prompt"))
+    items.notice(hook("Stop", session=OTHER, last_assistant_message="one") | at(clock, 1))
+    items.notice(notification("idle_prompt", session=OTHER) | at(clock, 61))
+    items.notice(permission(command="b") | at(clock, 70))
+    assert len(published(items)) == 2
+    switch.readable = False
+    items.notice(permission(command="c") | at(clock, 71))
+    items.notice(notification("idle_prompt", session="third") | at(clock, 72))
+    items.notice(hook("Stop", session=OTHER, last_assistant_message="two") | at(clock, 73))  # replaces the idle item
+    items.notice(post(command="a", event="PostToolUseFailure") | at(clock, 74))
+    items.notice(notification("permission_prompt") | at(clock, 76))  # b's: not published now
+    assert [e["detail"]["last_message"] for e in published(items)] == ["two"]
+    assert sorted(c["reason"] for c in closes(items)) == ["answered_on_mac", "superseded"]
+    assert len(items._items) == 4  # b, c and the third session's idle item wait, unpublished
+    items.notice(hook("UserPromptSubmit", session=OTHER, prompt="typed") | at(clock, 80))
+    assert published(items) == []
+
+
+def test_b3_codex_hooks_with_unreadable_settings_publish_only_a_replacement(tmp_path):
+    switch, clock = _Switch(), Clock()
+    items = AttentionStore(tmp_path, clock=clock, enabled=switch.enabled, switches=switch.switches)
+    items.notice(codex_stop("first") | {"at": START})
+    wait(items, clock, 61)
+    items.notice(codex_permission() | {"at": START + 62})
+    switch.readable = False
+    items.notice(codex_permission(command="touch other") | {"at": START + 62.5})
+    items.notice(codex_post() | {"at": START + 63})
+    items.notice(codex_stop("second") | {"at": START + 64})
+    items.notice(codex_stop("elsewhere", thread=SUBAGENT) | {"at": START + 64})
+    assert [e["detail"]["last_message"] for e in published(items)] == ["second"]
+    assert [c["reason"] for c in closes(items)] == ["superseded"] and len(items._items) == 2
+
+
+def test_b4_the_report_budget_comes_back_after_a_run_of_taken_reports(reporting):
+    from openswap.worker import remote
+    from openswap.worker.attention import REPORT_BUDGET
+
+    client, items, service, worker, transport, _ = reporting
+    shape = client._attention_shape
+    refusing = client.transport = _Refusing(transport, 413, "body_too_large")
+    items.notice(notification("idle_prompt"))
+    client.sync_attention()
+    assert shape.budget < REPORT_BUDGET
+    refusing.status = None
+    for _ in range(remote.ATTENTION_BUDGET_RECOVERY + 2):
+        client.sync_attention()  # one report taken; the same report again is never sent
+    assert shape.budget < REPORT_BUDGET
+    for n in range(remote.ATTENTION_BUDGET_RECOVERY - 1):
+        items.notice(notification("idle_prompt", session=f"s{n}"))
+        client.sync_attention()
+    assert shape.budget == REPORT_BUDGET
+    refusing.status = 413  # straight after it came back: shrunk for good
+    items.notice(notification("idle_prompt", session="again"))
+    client.sync_attention()
+    refusing.status = None
+    for n in range(remote.ATTENTION_BUDGET_RECOVERY * 2):
+        items.notice(notification("idle_prompt", session=f"later{n}"))
+        client.sync_attention()
+    assert shape.budget < REPORT_BUDGET
+
+
+# --- fix round 1 -----------------------------------------------------------------------
+
+
+def test_f3_one_read_of_the_settings_decides_a_notice(tmp_path, monkeypatch):
+    from openswap import settings
+    from openswap.worker import runtime
+
+    monkeypatch.setattr(attention, "reconcile", lambda *a, **k: [])
+    reads, racing = [], []
+
+    def load(root, **kwargs):
+        reads.append(1)
+        if racing and len(reads) % 2:
+            return AttentionSettings(notices=False, details=False, readable=False)
+        return AttentionSettings(notices=True)  # readable again by the next read
+
+    monkeypatch.setattr(settings, "load_attention_settings", load)
+    items = runtime._attention_store(tmp_path)
+    items.notice(notification("idle_prompt"))
+    assert len(published(items)) == 1
+    racing.append(True)
+    reads.clear()
+    items.notice(hook("UserPromptSubmit", prompt="typed"))
+    assert published(items) == [] and len(reads) == 1
+
+
+def test_f4_prompts_waiting_while_the_settings_are_unreadable_publish_once_they_read_again(tmp_path):
+    switch, clock = _Switch(), Clock()
+    items = AttentionStore(tmp_path, clock=clock, enabled=switch.enabled, switches=switch.switches,
+                           codex_answers=Answers())
+    switch.readable = False
+    items.notice(permission() | at(clock, 0))
+    items.notice(notification("permission_prompt"))
+    items.notice(codex_permission() | at(clock, 0))
+    wait(items, clock, 10)
+    assert published(items) == []
+    switch.readable = True
+    items.tick()
+    assert sorted(e["provider"] for e in published(items)) == ["claude", "codex"]
+
+
+def test_f5_a_413_any_time_after_the_budget_came_back_shrinks_it_for_good(reporting):
+    from openswap.worker import remote
+    from openswap.worker.attention import REPORT_BUDGET
+
+    client, items, service, worker, transport, _ = reporting
+    shape = client._attention_shape
+    refusing = client.transport = _Refusing(transport, None, "body_too_large")
+    sessions = iter(range(1000))
+
+    def report(status=None):
+        refusing.status = status
+        items.notice(notification("idle_prompt", session=f"s{next(sessions)}"))
+        client.sync_attention()
+
+    report(413)
+    for _ in range(remote.ATTENTION_BUDGET_RECOVERY):
+        report()
+    assert shape.budget == REPORT_BUDGET
+    for _ in range(3):
+        report()  # taken: the proxy's limit lies in between
+    report(413)
+    for _ in range(remote.ATTENTION_BUDGET_RECOVERY * 3):
+        report()
+    assert shape.budget < REPORT_BUDGET
