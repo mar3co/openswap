@@ -19,7 +19,7 @@ from openswap import attention, channel
 from openswap.settings import AttentionSettings, configure_worker_service, update_worker_settings, \
     write_attention_settings
 from openswap.worker import channel_link, ipc, peers
-from openswap.worker.attention import AttentionStore, SessionRecord, validate_notice
+from openswap.worker.attention import SESSION_END_GRACE_SECONDS, AttentionStore, SessionRecord, validate_notice
 from openswap.worker.peers import Process
 from openswap.worker.protocol import ProtocolError, attention_reply, attention_report
 from openswap.worker.refserver import ControlStore
@@ -1515,3 +1515,92 @@ def test_review_a_takeover_never_follows_another_candidates_in_the_same_moment(e
     env.store.unregister_channel(PID, env.link)
     assert not env.store.register_channel(second, CLAUDE, FakeLink())
     assert env.store._channels[PID].contested
+
+
+# --- follow-ups from the S fix round's final review (mar3co/openswap#183) -------------------
+
+
+def _queued(env):
+    """Two subagents' prompts waiting at once, each paired with its own channel request."""
+    x = env.prompt("npm test", agent="a1")
+    env.clock.now = x.created_at + 0.3
+    env.relay(bash("npm run lint"), request_id="fghij")
+    env.store.notice(hook("PermissionRequest", tool_name="Bash", tool_input=bash("npm run lint"), agent_id="a2")
+                     | {"at": x.created_at + 0.4})
+    env.store.notice(hook("Notification", notification_type="permission_prompt") | {"at": x.created_at + 6.4})
+    env.clock.now = x.created_at + 8
+    return x, next(i for i in env.store._items if i is not x)
+
+
+def test_b1_a_subagent_allow_waits_past_subagent_stop_for_its_call(env):
+    item = env.prompt("npm test", agent="a7")
+    env.reply(item.id, "allow")
+    env.store.notice(hook("SubagentStop", agent_id="a7") | env.at(0.6))
+    assert item in env.store._items
+    env.store.notice(hook("PostToolUse", tool_name="Bash", tool_input=bash("npm test"), agent_id="a7") | env.at(0.5))
+    assert env.closes() == {item.id: "answered_from_watch"}
+    assert env.outcomes() == {"r1": "applied"}
+
+
+def test_b1_a_shared_subagent_allow_closes_as_answered_on_the_mac_while_another_waits(env):
+    x, z = _queued(env)
+    env.reply(x.id, "allow")
+    env.store.notice(hook("SubagentStop", agent_id="a1") | env.at(0.6))
+    assert x in env.store._items
+    env.clock.now += SESSION_END_GRACE_SECONDS + 0.5
+    env.store.tick()  # the session still waits, for the other subagent's prompt
+    assert env.closes() == {x.id: "answered_on_mac"}
+    assert env.outcomes() == {"r1": "sent"}
+
+
+def test_b2_queued_prompts_take_no_reply_until_their_own_signal_tells_which_was_answered(env):
+    x, z = _queued(env)
+    env.accepted()  # the phone offers both Allow
+    t = env.clock.now
+    env.status("busy", t + 0.1)  # one of them was answered at the Mac
+    env.status("waiting", t + 0.5)  # and the other shows
+    env.clock.now = t + 0.6
+    env.reply(z.id, "allow", reply_id="r1", offered=False)
+    env.clock.now = t + 0.6 + SESSION_END_GRACE_SECONDS + 0.5
+    env.store.tick()
+    assert x in env.store._items and z in env.store._items
+    assert env.actions(x) == [] and env.actions(z) == []
+    env.reply(z.id, "allow", reply_id="r2")
+    assert env.link.sent == [] and env.outcomes() == {"r1": "refused", "r2": "refused"}
+    env.store.notice(hook("PostToolUse", tool_name="Bash", tool_input=bash("npm test"), agent_id="a1") | env.at(0.1))
+    assert env.closes() == {x.id: "answered_on_mac"}
+    assert env.actions(z) == ["allow", "deny"]
+    env.reply(z.id, "allow", reply_id="r3")
+    assert env.link.sent == [{"verdict": {"request_id": "fghij", "behavior": "allow"}}]
+    assert env.outcomes() == {"r3": "sent"}
+
+
+# --- fix round 1 ---------------------------------------------------------------------------
+
+
+def test_f2_an_allow_already_due_waits_a_full_grace_from_its_own_subagent_stop(env):
+    item = env.prompt("npm test", agent="a7")
+    env.reply(item.id, "allow")
+    env.clock.now += 30
+    env.status("busy", env.clock.now)  # the dialog closed long after the verdict: an answer is due
+    env.clock.now += SESSION_END_GRACE_SECONDS - 0.2
+    env.store.notice(hook("SubagentStop", agent_id="a7") | env.at(0))
+    env.clock.now += 0.5  # past the earlier due, within the grace from SubagentStop
+    env.store.tick()
+    assert item in env.store._items
+    env.store.notice(hook("PostToolUse", tool_name="Bash", tool_input=bash("npm test"), agent_id="a7") | env.at(0))
+    assert env.closes() == {item.id: "answered_on_mac"}  # the dialog closed outside the verdict's window
+    assert env.outcomes() == {"r1": "sent"}
+
+
+def test_f2_a_queued_prompts_waiting_never_keeps_an_allow_open_after_its_subagent_stop(env):
+    x, z = _queued(env)
+    env.reply(x.id, "allow")
+    t = env.clock.now
+    env.status("busy", t + 0.1)  # one of them closed: both due
+    env.store.notice(hook("SubagentStop", agent_id="a1") | {"at": t + 0.2})
+    env.status("waiting", t + 0.5)  # the other one shows
+    env.clock.now = t + 0.2 + SESSION_END_GRACE_SECONDS + 0.5
+    env.store.tick()
+    assert env.closes() == {x.id: "answered_on_mac"} and z in env.store._items
+    assert env.outcomes() == {"r1": "sent"}

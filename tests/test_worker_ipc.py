@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import stat
@@ -223,3 +224,108 @@ def test_existing_active_socket_is_not_removed_or_replaced(running_server):
 
     assert path.lstat().st_ino == inode
     assert WorkerClient(path).status()["enabled"] is True
+
+
+def _status_soon(path: Path, seconds: float = 3) -> dict:
+    """``status`` over a fresh connection, tried until the socket answers."""
+    deadline = time.monotonic() + seconds
+    while True:
+        try:
+            return json.loads(_exchange(path, b'{"version":1,"command":"status"}\n').splitlines()[0])
+        except (OSError, IndexError):
+            if time.monotonic() > deadline:
+                raise
+            time.sleep(0.05)
+
+
+def _accept_fails_once(monkeypatch, error):
+    real, failed = socket.socket.accept, threading.Event()
+
+    def accept(self):
+        if not failed.is_set():
+            failed.set()
+            raise OSError(error, os.strerror(error))
+        return real(self)
+
+    monkeypatch.setattr(socket.socket, "accept", accept)
+    return failed
+
+
+@pytest.mark.parametrize("error", [errno.EBADF, errno.EINVAL, errno.ENOTSOCK])
+def test_a_broken_listening_socket_is_opened_again_in_place_and_open_connections_go_on(
+        running_server, monkeypatch, error):
+    path, control, _stop, thread, _errors = running_server
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as held:
+        held.settimeout(2)
+        held.connect(str(path))
+        held.sendall(b'{"version":1,')  # a connection already open when the listener breaks
+        time.sleep(0.3)
+        assert _accept_fails_once(monkeypatch, error).wait(1)
+        assert _status_soon(path)["ok"] is True  # the same path answers again
+        held.sendall(b'"command":"status"}\n')
+        assert json.loads(held.recv(ipc.MAX_RESPONSE_BYTES).splitlines()[0])["ok"] is True
+    assert thread.is_alive() and control.status_calls == 2
+
+
+def test_a_listener_whose_new_socket_cannot_be_made_yet_is_retried(running_server, monkeypatch):
+    path, *_ = running_server
+    real_socket, refused, refusing = socket.socket, threading.Event(), threading.Event()
+    refusing.set()
+
+    def make(*args, **kwargs):
+        if refusing.is_set():
+            refused.set()
+            raise OSError(errno.EMFILE, os.strerror(errno.EMFILE))
+        return real_socket(*args, **kwargs)
+
+    failed = _accept_fails_once(monkeypatch, errno.EBADF)
+    monkeypatch.setattr(socket, "socket", make)
+    assert failed.wait(1)
+    assert refused.wait(2)
+    refusing.clear()
+    monkeypatch.setattr(socket, "socket", real_socket)
+    assert _status_soon(path, 4)["ok"] is True
+
+
+def test_a_socket_file_left_by_a_failed_attempt_never_blocks_the_next(running_server, monkeypatch):
+    path, *_ = running_server
+    real_bind, real_lstat = socket.socket.bind, Path.lstat
+    just_bound, failed_once = threading.Event(), threading.Event()
+
+    def bind(self, address):
+        real_bind(self, address)
+        if not failed_once.is_set():
+            just_bound.set()
+
+    def lstat(self, *args, **kwargs):
+        if just_bound.is_set() and self == path:  # the check right after this attempt's bind
+            just_bound.clear()
+            failed_once.set()
+            raise OSError(errno.EIO, os.strerror(errno.EIO))
+        return real_lstat(self, *args, **kwargs)
+
+    monkeypatch.setattr(socket.socket, "bind", bind)
+    monkeypatch.setattr(Path, "lstat", lstat)
+    failed = _accept_fails_once(monkeypatch, errno.EBADF)
+    assert failed.wait(1)
+    assert failed_once.wait(2)
+    assert _status_soon(path, 4)["ok"] is True
+
+
+def test_a_listener_that_cannot_be_opened_again_is_retried_with_a_growing_wait(running_server, monkeypatch):
+    path, *_ = running_server
+    real_bind, attempts, refusing = socket.socket.bind, [], threading.Event()
+    refusing.set()
+
+    def bind(self, address):
+        attempts.append(time.monotonic())
+        if refusing.is_set():
+            raise OSError(errno.EADDRNOTAVAIL, os.strerror(errno.EADDRNOTAVAIL))
+        return real_bind(self, address)
+
+    monkeypatch.setattr(socket.socket, "bind", bind)
+    assert _accept_fails_once(monkeypatch, errno.EBADF).wait(1)
+    time.sleep(1)
+    assert 2 <= len(attempts) <= 5  # never a hot loop
+    refusing.clear()
+    assert _status_soon(path, 4)["ok"] is True

@@ -569,7 +569,8 @@ class AttentionStore:
         self.backup_root = Path(backup_root)
         self.path = self.backup_root / STATE_FILE
         self.clock = clock
-        # Whether the owner turned notices on; read for every notice, so one
+        # Whether the owner turned notices on (True, False, or None while the
+        # settings cannot be read); read once for every notice, so one
         # arriving after the switch went off is dropped.
         self.enabled = enabled if enabled is not None else (lambda: True)
         self.changed = threading.Event()
@@ -622,6 +623,7 @@ class AttentionStore:
         self._reported = False  # a report was accepted since this start
         self._inflight: dict[str, str] = {}  # reply ID -> item ID, marked sent but not yet handed over
         self._unknown: set[str] = set()  # items with a reply whose hand-over a restart left unknown
+        self._held: set[str] = set()  # Claude items to publish once the settings read again
         self._reset_until = 0.0  # replies may predate a set-aside state until then (by ``clock``)
         self._seen: dict[str, dict[int, float]] = {}  # session -> process (0: unknown) -> when last seen
         self._install = install  # puts hooks into config homes created since; returns problems
@@ -696,9 +698,11 @@ class AttentionStore:
                 raise ValueError("invalid attention state")
             saved, handled, acks = data.get("channels", {}), data.get("handled", {}), data.get("acks", {})
             inflight, codex_seen = data.get("inflight", {}), data.get("codex_seen", {})
+            held = data.get("held", [])
             if (not isinstance(saved, dict) or not isinstance(handled, dict) or not isinstance(acks, dict)
                     or not isinstance(inflight, dict) or not all(isinstance(v, str) for v in inflight.values())
                     or not isinstance(codex_seen, dict)
+                    or not isinstance(held, list) or not all(isinstance(i, str) for i in held)
                     or not all(type(v) in (int, float) for v in codex_seen.values())):
                 raise ValueError("invalid attention state")
             channels = {int(pid): Channel.from_saved(int(pid), entry) for pid, entry in saved.items()}
@@ -741,6 +745,7 @@ class AttentionStore:
         open_ids = {item.id for item in items}
         self._inflight = {r: i for r, i in inflight.items() if i in open_ids}
         self._unknown, self._codex_seen = set(self._inflight.values()), dict(codex_seen)
+        self._held = {i for i in held if i in open_ids}
         self.ready = True
         self.note_problem("state", None)
 
@@ -750,7 +755,8 @@ class AttentionStore:
         data = {"version": STATE_VERSION, "secret": self._secret.hex(),
                 "items": [asdict(item) for item in self._items], "closed": self._closed,
                 "channels": {str(pid): c.saved() for pid, c in self._channels.items()},
-                "handled": self._handled, "inflight": self._inflight, "codex_seen": self._codex_seen}
+                "handled": self._handled, "inflight": self._inflight, "codex_seen": self._codex_seen,
+                "held": sorted(self._held)}
         with self._ack_lock:
             data["acks"] = dict(self._acks)
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -792,6 +798,7 @@ class AttentionStore:
             self._due_exit.pop(item.id, None)
             self._attached.pop(item.id, None)
             self._tainted.discard(item.id)
+            self._held.discard(item.id)
             self._offered.pop(item.id, None)
             if item.id in self._unknown:
                 self._unknown.discard(item.id)
@@ -873,11 +880,17 @@ class AttentionStore:
     def notice(self, notice: dict) -> None:
         """Apply one validated notice (see ``validate_notice``) to the items.
 
-        Dropped while notices are off. A ``permission_prompt`` is applied
+        Dropped while notices are off. While the settings cannot be read it is
+        applied, but nothing new is published until they read again (an item
+        replacing one the phone shows is). A ``permission_prompt`` is applied
         against a fresh read of the session files, so only a prompt still
         waiting is published."""
-        if not self._ensure_ready() or not self.enabled():
+        if not self._ensure_ready():
             return
+        on = self.enabled()
+        if on is False:
+            return
+        publishes = on is True
         self._learn_start(notice.get("pid", 0))
         if notice.get("provider") == "claude":
             with self._lock:
@@ -885,14 +898,26 @@ class AttentionStore:
         # A reply in flight is settled against what the session file says now.
         if notice.get("event") == "Notification" or (notice.get("provider") == "claude" and any(
                 i.session == notice.get("session_id") for i in self._items if i.id in self._sent)):
-            self.refresh()
+            self.refresh(for_notice=True)
         with self._lock:
-            if self._apply(notice):
+            if self._apply(notice, publishes):
                 self._commit()
 
-    def _apply(self, notice: dict) -> bool:
+    def _shown(self, item: Item) -> bool:
+        """Published, or held only until the settings read again."""
+        return item.published or item.id in self._held
+
+    def _publish(self, item: Item, publishes: bool) -> None:
+        if publishes:
+            item.published = True
+        else:
+            self._held.add(item.id)
+
+    def _apply(self, notice: dict, publishes: bool) -> bool:
+        """One notice; without ``publishes``, what it would publish is held
+        (``_held``) until the settings read again."""
         if notice["provider"] == "codex":
-            return self._apply_codex(notice)
+            return self._apply_codex(notice, publishes)
         event, session, at = notice["event"], notice["session_id"], self._at(notice)
         pid = notice.get("pid", 0)
         key = (session, pid)
@@ -919,7 +944,7 @@ class AttentionStore:
         if event == "Notification":
             kind = notice.get("notification_type")
             if kind == "permission_prompt":
-                recorded = [i for i in prompts if not i.published]
+                recorded = [i for i in prompts if not self._shown(i)]
                 shown_at = at - PROMPT_NOTICE_SECONDS
                 changed = False
                 if record is not None and record.status in NOT_WAITING:
@@ -939,9 +964,9 @@ class AttentionStore:
                                 and abs(i.created_at - shown_at) <= PROMPT_MATCH_SECONDS),
                                key=lambda i: abs(i.created_at - shown_at))[:1]
                 if match:
-                    match[0].published = True
+                    self._publish(match[0], publishes)
                     return True
-                if any(i.published for i in prompts):
+                if any(self._shown(i) for i in prompts):
                     # This prompt's notice again: a queued subagent dialog gets a
                     # second one when it finally shows. The owner already knows.
                     return changed
@@ -950,7 +975,8 @@ class AttentionStore:
                 question = record is not None and record.waiting_for == "input needed"
                 # Dated when its dialog showed, like a recorded call.
                 self._open("question" if question else "permission", "claude", session,
-                           {**notice, "at": shown_at}, published=True)
+                           {**notice, "at": shown_at}, published=False)
+                self._publish(self._items[-1], publishes)
                 return True
             if kind == "idle_prompt":
                 if at < self._prompted.get(key, 0.0):
@@ -963,7 +989,8 @@ class AttentionStore:
                 if idle is not None:
                     # Still idle: a new item only for a turn that ended since it opened.
                     return said_at > idle.created_at and self._idle_again(idle, notice, last)
-                self._open("idle", "claude", session, notice, published=True, detail={"last_message": last})
+                self._open("idle", "claude", session, notice, published=False, detail={"last_message": last})
+                self._publish(self._items[-1], publishes)
                 return True
             return False
         if event == "Stop":
@@ -982,19 +1009,14 @@ class AttentionStore:
             # The main thread's turn ended: its own prompts were answered. A
             # background subagent's prompt may still wait, and a late Stop of an
             # earlier turn says nothing about this turn's prompts.
-            ended = [i for i in prompts if not i.agent and i.created_at <= at]
-            # A Stop follows a channel deny (a "No" at the Mac fires none); after
-            # an allow, the call's PostToolUse may still be on its way.
-            waiting = [i for i in ended if self._sent_action(i) == "allow"]
-            for item in waiting:
-                self._due.setdefault(item.id, self.clock() + SESSION_END_GRACE_SECONDS)
-            ended = [i for i in ended if i not in waiting]
+            ended = self._await_allowed([i for i in prompts if not i.agent and i.created_at <= at])
+            # A Stop follows a channel deny (a "No" at the Mac fires none).
             return self._close(ended, "answered_on_mac", won=self._won(ended, at, "deny")) or changed
         if event == "SubagentStop":
             # That subagent ended (a "No" or Esc on its prompt ends it too): its
             # prompts are gone. Another subagent's, or the main thread's, may still wait.
             agent = notice.get("agent_id", "")
-            ended = [i for i in prompts if agent and i.agent == agent and i.created_at <= at]
+            ended = self._await_allowed([i for i in prompts if agent and i.agent == agent and i.created_at <= at])
             return self._close(ended, "answered_on_mac", won=self._won(ended, at, "deny"))
         if event == "UserPromptSubmit":
             prompt = notice.get("prompt_kind")
@@ -1041,17 +1063,32 @@ class AttentionStore:
         # failing call was still allowed).
         return self._close(match, "answered_on_mac", won=self._won(match, at, "allow")) or moved_on
 
+    def _await_allowed(self, ended: list[Item]) -> list[Item]:
+        """``ended`` (prompts whose turn or subagent ended) without those the
+        watch allowed: the call's PostToolUse may still be on its way, so they
+        close ``SESSION_END_GRACE_SECONDS`` after this event unless it comes,
+        whether or not an answer was already due. The session waiting again
+        meanwhile is another dialog: it never keeps them open."""
+        waiting = [i for i in ended if self._sent_action(i) == "allow"]
+        for item in waiting:
+            self._due[item.id] = self.clock() + SESSION_END_GRACE_SECONDS
+            self._due_exit[item.id] = math.inf
+        return [i for i in ended if i not in waiting]
+
     def _idle_again(self, idle: Item, notice: dict, last: str) -> bool:
         """The session is idle after another turn: the item the owner saw closes
         as ``superseded`` and a new one (a new ID) stands for this turn, so a
         message sent to the old one can never land after a turn it did not see."""
+        held = idle.id in self._held
         self._close([idle], "superseded")
         self._open("idle", "claude", idle.session, {**notice, "cwd": idle.cwd, "pid": idle.pid,
-                                                   "entrypoint": idle.entrypoint}, published=True,
+                                                   "entrypoint": idle.entrypoint}, published=idle.published,
                    detail={"last_message": last})
+        if held:
+            self._held.add(self._items[-1].id)
         return True
 
-    def _apply_codex(self, notice: dict) -> bool:
+    def _apply_codex(self, notice: dict, publishes: bool) -> bool:
         """One Codex hook. ``Stop``, ``UserPromptSubmit`` and ``Interrupt`` run
         only for a thread the owner works in (Codex runs ``SubagentStop`` for a
         subagent and no hook for its own helper threads), so they open and
@@ -1077,8 +1114,12 @@ class AttentionStore:
             changed = self._close([i for i in prompts if i.created_at <= at], "answered_on_mac")
             if at < self._prompted.get(thread, 0.0) or any(i.kind == "finished" and i.created_at > at for i in own):
                 return changed  # a late Stop of an earlier turn
-            self._close([i for i in own if i.kind == "finished"], "superseded")
-            self._open("finished", "codex", thread, notice, published=False,
+            finished = [i for i in own if i.kind == "finished"]
+            self._close(finished, "superseded")
+            # While the settings cannot be read, ``tick`` publishes nothing: a turn
+            # replacing one the phone shows goes at once.
+            self._open("finished", "codex", thread, notice,
+                       published=not publishes and any(i.published for i in finished),
                        detail={"last_message": notice.get("last_message", "")})
             return True
         if event == "UserPromptSubmit":
@@ -1089,13 +1130,16 @@ class AttentionStore:
         # Interrupt: Esc or "No" at the prompt ends the turn.
         return self._close([i for i in prompts if i.created_at <= at], "answered_on_mac")
 
-    def refresh(self) -> None:
-        """Read the session files and Codex's log (outside the lock) and apply what they say."""
+    def refresh(self, *, for_notice: bool = False) -> None:
+        """Read the session files and Codex's log (outside the lock) and apply what they say.
+
+        ``for_notice``: a notice the settings already let through needs this
+        read, so the settings are not read again."""
         if not self._ensure_ready():
             return
         with self._lock:
             idle = not self._items and not self._channels
-        if idle and not self.enabled():
+        if idle and not for_notice and not self.enabled():
             return  # notices off and nothing open: nothing to read for
         # One read at a time, so an older read is never applied after a newer one.
         with self._refresh_lock:
@@ -1237,7 +1281,7 @@ class AttentionStore:
                     if self._won([item], record.status_at, "allow" if record.status == "busy" else "deny"):
                         won.append(item)
                         continue
-                if not item.published:
+                if not self._shown(item):
                     changed = self._close([item], "answered_on_mac") or changed
                 elif item.id not in self._due:
                     self._due[item.id] = now + SESSION_END_GRACE_SECONDS
@@ -1262,14 +1306,8 @@ class AttentionStore:
             now = self.clock()
             due = [i for i in self._items if self._due.get(i.id, now + 1) <= now]
             for item in list(due):
-                # Waiting again with other prompts open: queued dialogs, and the one
-                # answered cannot be told from the one now shown; their own
-                # signals (PostToolUse, SubagentStop, Stop) close them.
-                record = self._record_for(item.session, item.pid)
-                others = [i for i in self._items if i is not item and i.session == item.session
-                          and i.kind in ("permission", "question") and self._same_process(i.session, i.pid, item.pid)]
-                if (record is not None and record.status == "waiting"
-                        and record.status_at > self._due_exit.get(item.id, 0.0) and others):
+                # Their own signals (PostToolUse, SubagentStop, Stop) close them.
+                if self._waiting_again(item):
                     due.remove(item)
                     del self._due[item.id]
                     self._due_exit.pop(item.id, None)
@@ -1279,10 +1317,16 @@ class AttentionStore:
             changed = self._close(ended, "session_ended") or changed
             expired = [i for i in codex if i not in ended and now - i.created_at >= CODEX_ITEM_SECONDS]
             changed = self._close(expired, "expired") or changed
-            for item in self._items:
-                wait = CODEX_FINISHED_SECONDS if item.kind == "finished" else CODEX_PROMPT_SECONDS
-                if item.provider == "codex" and not item.published and now - item.created_at >= wait:
-                    item.published = changed = True
+            waited = [i for i in self._items if i.provider == "codex" and not i.published and now - i.created_at >= (
+                CODEX_FINISHED_SECONDS if i.kind == "finished" else CODEX_PROMPT_SECONDS)]
+            # A held prompt already answered at the Mac (awaiting its close) never goes.
+            held = [i for i in self._items if i.id in self._held and i.id not in self._due]
+            # Nothing new goes while the settings cannot be read.
+            if (waited or held) and self.enabled() is True:
+                for item in waited + held:
+                    item.published = True
+                    self._held.discard(item.id)
+                changed = True
             if changed:
                 self._commit()
 
@@ -1297,9 +1341,34 @@ class AttentionStore:
                 self._inflight = {r: i for r, i in self._inflight.items() if i not in self._unknown}
                 self._unknown = set()
                 self._tainted.clear()
+                self._held.clear()
                 self._commit()
 
     # --- replies: channels, prompts and questions ------------------------------
+
+    def _queued_with(self, item: Item, before: float) -> bool:
+        """Whether another prompt of the item's process, recorded before
+        ``before``, is open: queued dialogs."""
+        return any(i.id != item.id and i.provider == "claude" and i.session == item.session
+                   and i.kind in ("permission", "question") and self._same_process(i.session, i.pid, item.pid)
+                   and i.created_at < before for i in self._items)
+
+    def _waiting_again(self, item: Item) -> bool:
+        """Whether the item's session, having left ``waiting`` (its answer is
+        due), waits again while another prompt recorded before then is open:
+        queued dialogs, and the one answered cannot be told from the one now
+        shown."""
+        record = self._record_for(item.session, item.pid)
+        exit_at = self._due_exit.get(item.id, 0.0)
+        return (record is not None and record.status == "waiting" and record.status_at > exit_at
+                and self._queued_with(item, exit_at))
+
+    def _unsure(self, item: Item) -> bool:
+        """Whether the item is one of several queued prompts of its process
+        recorded before its session last left ``waiting``: one of them was
+        answered at the Mac, and which one shows only on its own signal."""
+        left = self._left_since(item.session, item.pid)
+        return item.kind in ("permission", "question") and left > item.created_at and self._queued_with(item, left)
 
     def _sent_action(self, item: Item) -> str:
         sent = self._sent.get(item.id)
@@ -1534,7 +1603,9 @@ class AttentionStore:
         Any command the session runs can connect as a question hook too. It
         gains nothing: an answer reaches a waiter only while exactly one waits
         for that question (so an extra one only keeps the question from taking
-        an answer), and the answer is what the transcript records anyway."""
+        an answer), and the answer is what the transcript records anyway. Such
+        commands can also take all ``MAX_WAITERS_PER_PROCESS`` places, and that
+        process's questions then take no answer until they leave."""
         switches = self.switches()
         if (not self._ensure_ready() or not (switches.notices and switches.replies) or not isinstance(session, str)
                 or not isinstance(tool_key, str) or not isinstance(agent, str)):
@@ -1618,7 +1689,8 @@ class AttentionStore:
         nothing else shows what it would allow), a question shown whole whose one
         synchronous hook waits for it, an idle session."""
         if (not (switches.notices and switches.replies) or item.provider != "claude" or not item.published
-                or item.id in self._unknown or not self._alone(item) or self._live_channel(item) is None):
+                or item.id in self._unknown or not self._alone(item) or self._live_channel(item) is None
+                or self._unsure(item)):
             return []
         if item.kind == "permission":
             request = self._attached.get(item.id)
@@ -1729,7 +1801,8 @@ class AttentionStore:
             # After the saved state was set aside, a reply may predate this start.
             return ("refused" if self.clock() < self._reset_until else "item_closed"), None
         if item.id in self._due:
-            return "item_closed", None  # answered at the Mac; it closes after its grace
+            # Answered at the Mac (it closes after its grace), unless queued dialogs hide which.
+            return ("refused" if self._waiting_again(item) else "item_closed"), None
         if (reply["action"] not in self._offered.get(item.id, ()) or reply["action"] not in self._actions(item, switches)
                 or item.id in self._sent):
             return "refused", None
@@ -1774,8 +1847,10 @@ class AttentionStore:
                 # opened at a turn's own Stop may be dated just before its status.
                 if record.status_at > item.created_at + SESSION_END_GRACE_SECONDS:
                     return "item_closed"
-            elif record.status != "waiting" or self._left_since(item.session, pid) > item.created_at:
+            elif record.status != "waiting":
                 return "item_closed"  # the prompt was answered at the Mac
+            elif self._unsure(item):
+                return "refused"  # queued dialogs: which was answered is not known yet
             sent = Sent(reply["id"], action, self.clock(), shared=action != "message" and any(
                 i is not item and i.session == item.session and i.kind in ("permission", "question")
                 for i in self._items))
@@ -1846,7 +1921,9 @@ class AttentionStore:
                 if self._acks.get(ack["id"]) == ack["outcome"]:
                     del self._acks[ack["id"]]
         if acks:
-            self.changed.set()  # saved by the attention thread
+            # Saved with the store's next change: outcomes taken just before a
+            # restart may go again, which the service ignores.
+            self.changed.set()
 
     def acks_refused(self, acks: list[dict]) -> None:
         """The service refused a heartbeat for carrying ``acks``. One tried alone

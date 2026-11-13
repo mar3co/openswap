@@ -1782,12 +1782,16 @@ def _attention_store(backup_root: Path):
     from openswap.settings import load_attention_settings
     from openswap.worker.attention import AttentionStore, read_codex_answers
 
+    def notices():
+        switches = load_attention_settings(backup_root)
+        return switches.notices if switches.readable else None
+
     try:
         for problem in hooks.reconcile(backup_root):
             logger.warning("Session notices: %s", problem)
     except Exception:
         logger.warning("Session notice hooks could not be checked", exc_info=True)
-    return AttentionStore(backup_root, enabled=lambda: load_attention_settings(backup_root).notices,
+    return AttentionStore(backup_root, enabled=notices,
                           records=_session_records(backup_root),
                           codex_answers=lambda threads: read_codex_answers([codex_home()], threads),
                           switches=lambda: load_attention_settings(backup_root),

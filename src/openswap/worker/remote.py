@@ -57,6 +57,8 @@ ATTENTION_FORBIDDEN_SECONDS = 900.0
 ATTENTION_INSTALL_SECONDS = 30.0
 # A report the service refuses as too large shrinks, but never below this.
 ATTENTION_MIN_BUDGET = 8192
+# Once the service has taken this many reports since, a shrunk budget is whole again.
+ATTENTION_BUDGET_RECOVERY = 5
 # Validation failures the service (or the local export check) reports for one
 # artifact. They never clear on retry, so they end that artifact, not the claim.
 ARTIFACT_REJECTIONS = frozenset({"artifact_too_large", "artifact_limit", "artifact_conflict",
@@ -776,7 +778,7 @@ class RemoteClient:
             except ProtocolError:
                 return
             store.acknowledge(closed_ids, body["items"])
-            shape.accepted()
+            shape.took()
             store.note_problem("refused", None)
             # Without the closes the same open set needs no resend.
             body["closed"] = []
@@ -787,7 +789,8 @@ class RemoteClient:
 
     def _attention_refused(self, store, exc: ProtocolError, body: dict) -> None:
         """The service refused a report. 403: ask again only every
-        ``ATTENTION_FORBIDDEN_SECONDS`` and say why. 413: the next one is smaller.
+        ``ATTENTION_FORBIDDEN_SECONDS`` and say why. 413: the next ones are smaller
+        (``_ReportShape.too_large``).
         400: the next one leaves out what may be the cause, an item's detail
         first (then each is tried again alone), then its labels, and as a last
         resort every item, so the closes get through. Anything else is retried
@@ -801,14 +804,9 @@ class RemoteClient:
                                f"({exc.code}); OpenSwap asks again every {int(ATTENTION_FORBIDDEN_SECONDS // 60)} "
                                "minutes.")
         elif exc.status == 413:
-            if shape.budget <= ATTENTION_MIN_BUDGET:
-                shape.only_closes()
-            sent = len(json.dumps(body, allow_nan=False).encode())
-            shape.budget = max(ATTENTION_MIN_BUDGET, min(shape.budget, sent) // 2)
+            shape.too_large(len(json.dumps(body, allow_nan=False).encode()))
         elif exc.status == 400 and exc.code == "invalid_request":
             shape.refused(body)  # the service's own refusal of the report, never a proxy's error page
-
-
 
     def _attention_loop(self):
         from openswap.settings import load_attention_settings
@@ -1367,13 +1365,17 @@ class RemoteClient:
                 # process lifetime; the next pass retries at the usual cadence.
                 self._connectivity(exc)
             self.stop_event.wait(HEARTBEAT_SECONDS)
+
+
 class _ReportShape:
     """How the next ``attention`` report is cut after the service refused one."""
 
     def __init__(self):
         from openswap.worker.attention import REPORT_BUDGET
 
-        self.budget = REPORT_BUDGET
+        self.full = self.budget = REPORT_BUDGET
+        self.taken = 0  # reports the service took since the budget last shrank
+        self.restored = False  # made whole once: a later 413 shrinks it for good
         self.plain: set[str] = set()  # items sent without detail
         self.bare: set[str] = set()  # items sent with generic labels too
         self.suspects: list[str] = []  # items whose detail is tried again, one report at a time
@@ -1421,6 +1423,21 @@ class _ReportShape:
             logger.warning("Session notices sent with generic labels: the control service refused the report")
         else:
             self.only_closes()
+
+    def too_large(self, sent: int) -> None:
+        """The service refused a report of ``sent`` bytes as too large."""
+        if self.budget <= ATTENTION_MIN_BUDGET:
+            self.only_closes()
+        self.taken = 0
+        self.budget = max(ATTENTION_MIN_BUDGET, min(self.budget, sent) // 2)
+
+    def took(self) -> None:
+        """The service took a report it was sent."""
+        self.accepted()
+        if self.budget < self.full and not self.restored:
+            self.taken += 1
+            if self.taken >= ATTENTION_BUDGET_RECOVERY:
+                self.budget, self.taken, self.restored = self.full, 0, True
 
     def accepted(self) -> None:
         if self.trying:

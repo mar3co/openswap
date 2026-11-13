@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
+import errno
 import hashlib
 import json
+import logging
 import os
 import socket
 import stat
@@ -15,6 +18,8 @@ from threading import Event
 from typing import TYPE_CHECKING, Protocol
 
 from openswap.worker.attention import log_limited
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from openswap.worker.attention import AttentionStore
@@ -32,6 +37,10 @@ MAX_CONNECTIONS = 32
 # Of those, kept for status, pause and stop: notices, channels and question
 # hooks never take the last of them.
 CONTROL_RESERVED = 2
+# ``accept()`` errors that mean the listening socket itself is unusable.
+PERMANENT_ACCEPT_ERRORS = frozenset({errno.EBADF, errno.EINVAL, errno.ENOTSOCK})
+# A listening socket that cannot be opened again is retried at most this far apart.
+LISTEN_RETRY_MAX_SECONDS = 5.0
 CONTROL_COMMANDS = frozenset({"status", "stop", "pause"})
 _JOB_ID_LIMIT = 128
 
@@ -318,7 +327,18 @@ def serve(
                     connection, _ = server.accept()
                 except socket.timeout:
                     continue
-                except OSError as exc:  # out of descriptors, say: the server keeps serving
+                except OSError as exc:
+                    if exc.errno in PERMANENT_ACCEPT_ERRORS:
+                        # The listening socket itself is broken: a new one at the same
+                        # path brings status, pause, stop and notices back, while the
+                        # worker, a running job and the connections already open go on.
+                        logger.error("Worker socket can no longer accept connections (%s); opening it again", exc)
+                        server.close()
+                        server, bound_info = _listen_again(path, bound_info, stop_event)
+                        if server is None:
+                            break
+                        continue
+                    # Out of descriptors, say: the server keeps serving.
                     log_limited("ipc_accept", "Worker socket could not accept a connection: %s", exc)
                     stop_event.wait(0.05)
                     continue
@@ -339,21 +359,57 @@ def serve(
                     continue
                 handlers.append(thread)
         finally:
-            server.close()
+            if server is not None:
+                server.close()
             for thread in handlers:
                 thread.join()
     finally:
+        _unlink_ours(path, bound_info)
+
+
+def _unlink_ours(path: Path, bound_info) -> None:
+    """Remove the socket file at ``path`` if it is still the one this server bound."""
+    try:
+        info = path.lstat()
+        if (
+            bound_info is not None
+            and info.st_dev == bound_info.st_dev
+            and info.st_ino == bound_info.st_ino
+            and stat.S_ISSOCK(info.st_mode)
+            and info.st_uid == os.getuid()
+        ):
+            path.unlink()
+    except OSError:
+        pass
+
+
+def _listen_again(path: Path, bound_info, stop_event: Event):
+    """A new listening socket at ``path`` in place of a broken one, tried again
+    with a growing wait until it works or the worker stops. Returns (socket,
+    the file it bound), or (None, the last file bound) once stopping."""
+    wait = 0.1
+    while not stop_event.is_set():
+        _unlink_ours(path, bound_info)
+        server, bound_now = None, False
         try:
-            info = path.lstat()
-            if (
-                bound_info is not None
-                and info.st_dev == bound_info.st_dev
-                and info.st_ino == bound_info.st_ino
-                and stat.S_ISSOCK(info.st_mode)
-                and info.st_uid == os.getuid()
-            ):
-                path.unlink()
-        except FileNotFoundError:
-            pass
-        except OSError:
-            pass
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            _verify_private_parent(path)
+            server.bind(str(path))
+            bound_now = True
+            bound_info = path.lstat()
+            bound_now = False  # bound_info now names it, so _unlink_ours removes it
+            os.chmod(path, 0o600, follow_symlinks=False)
+            server.listen(MAX_CONNECTIONS)
+            server.settimeout(0.2)
+            return server, bound_info
+        except (OSError, IpcError) as exc:
+            if server is not None:
+                server.close()
+            if bound_now:
+                # This attempt's socket file, unrecorded: left behind, every retry would hit EADDRINUSE.
+                with contextlib.suppress(OSError):
+                    path.unlink()
+            log_limited("ipc_listen", "Worker socket could not be opened again (%r); retrying", exc)
+            stop_event.wait(wait)
+            wait = min(wait * 2, LISTEN_RETRY_MAX_SECONDS)
+    return None, bound_info

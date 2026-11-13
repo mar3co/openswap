@@ -2274,7 +2274,7 @@ def test_w8_state_is_synced_and_only_a_file_that_parses_wrong_is_set_aside(tmp_p
     monkeypatch.setattr(Path, "read_text", flaky)
     again = AttentionStore(tmp_path, clock=Clock())
     again.notice(notification("idle_prompt", session=OTHER))  # not taken while the file cannot be read
-    assert not again.ready and (tmp_path / worker_attention.STATE_FILE).read_text.__self__  # file untouched
+    assert not again.ready
     monkeypatch.setattr(Path, "read_text", real_read)
     assert (tmp_path / worker_attention.STATE_FILE).read_text() == saved
     again.refresh()
@@ -2526,3 +2526,330 @@ def test_review_an_item_without_detail_never_stalls_the_items_tried_after_a_refu
         client.sync_attention()
     shown = {e["detail"]["last_message"] for e in service.attention(worker)["items"] if "detail" in e}
     assert shown == {"fine"} and refusing.sent  # the new item's detail went; only the refused one is kept out
+
+
+# --- follow-ups from the S fix round's final review (mar3co/openswap#182) ----------------
+
+
+def test_a1_the_replies_switch_never_turns_codex_hooks_on(codex_home):
+    home, root = codex_home
+    attention.set_notices(root, True)
+    (home / "config.toml").write_text("[features]\nhooks = false\n")  # the owner turns Codex's hooks off since
+    for replies in (True, False):
+        attention.set_replies(root, replies)
+        assert (home / "config.toml").read_text() == "[features]\nhooks = false\n"
+
+
+def _installed_program(tmp_path, monkeypatch) -> str:
+    exe = tmp_path / "OpenSwap.app" / "Contents" / "MacOS" / "OpenSwap"
+    exe.parent.mkdir(parents=True)
+    exe.write_text("")
+    exe.chmod(0o755)
+    monkeypatch.setattr(attention, "program", lambda: str(exe))
+    return str(exe)
+
+
+def test_a2_an_owners_own_bin_codex_hook_is_never_taken_for_openswaps(codex_home, tmp_path, monkeypatch):
+    home, root = codex_home
+    _installed_program(tmp_path, monkeypatch)
+    attention.apply(root, True)
+    theirs = {"hooks": [{"type": "command", "command": "/Users/o/bin/codex-hook Stop"}]}
+    data = json.loads((home / "hooks.json").read_text())
+    data["hooks"]["Stop"].append(theirs)
+    (home / "hooks.json").write_text(json.dumps(data))
+    assert attention.recorded_programs(root) == [] and attention.other_launchers(root) == []
+    attention.remove(root)
+    assert json.loads((home / "hooks.json").read_text()) == {"hooks": {"Stop": [theirs]}}
+    assert not (root / attention.HOOKS_RECORD).exists() and not attention.codex_launcher(root).exists()
+
+
+def test_a2_another_openswaps_launcher_is_named_only_while_it_is_there(codex_home, tmp_path, monkeypatch):
+    home, root = codex_home
+    exe = _installed_program(tmp_path, monkeypatch)
+    attention.apply(root, True)
+    other = tmp_path / "other-backup"
+    attention._write_launcher(other, exe)
+    data = json.loads((home / "hooks.json").read_text())
+    data["hooks"]["Stop"].append({"hooks": [attention.codex_hook_entry("Stop", attention.codex_launcher(other))]})
+    (home / "hooks.json").write_text(json.dumps(data))
+    assert attention.other_launchers(root) == [str(attention.codex_launcher(other))]
+    attention.codex_launcher(other).write_text("#!/bin/sh\nexec ~/bin/mine\n")
+    assert attention.other_launchers(root) == [] and attention.recorded_programs(root) == []
+    attention.codex_launcher(other).unlink()
+    assert attention.other_launchers(root) == [] and attention.recorded_programs(root) == []
+
+
+def test_a2_settings_names_another_openswaps_launcher():
+    from openswap.menubar_display import remote_attention_rows
+
+    rows = remote_attention_rows({"attention": {"notices": True, "details": True,
+                                                "others": ["/b/bin/codex-hook"]}}, enabled=True)
+    assert any(r["id"] == "remote_attention_others" and "/b/bin/codex-hook" in r["label"] for r in rows)
+
+
+def test_f6_a_recorded_file_that_cannot_be_checked_is_named_and_kept_and_the_rest_go(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "no-codex"))
+    monkeypatch.setattr(attention, "program", lambda: EXE)
+    root = tmp_path / "backup"
+    homes = [tmp_path / "a", tmp_path / "b"]
+    for home in homes:
+        home.mkdir()
+        attention.set_hooks(home, EXE, backup_root=root)
+    write_attention_settings(root, notices=True)
+    blocked = homes[0] / "settings.json"
+    real = Path.is_symlink
+
+    def is_symlink(self):
+        if self == blocked:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self)
+
+    monkeypatch.setattr(Path, "is_symlink", is_symlink)
+    problems = attention.set_notices(root, False)
+    assert len(problems) == 1 and str(blocked) in problems[0]
+    assert list(_recorded(root)) == [str(blocked)] and not (homes[1] / "settings.json").exists()
+    assert any(str(blocked) in p for p in attention.reconcile(root))
+    with pytest.raises(ConfigError, match="Permission denied"):
+        attention.remove(root)
+    monkeypatch.setattr(Path, "is_symlink", real)
+    assert attention.reconcile(root) == [] and not blocked.exists()
+
+
+def _after_an_empty_group(home, root, state_before, state_after):
+    """Stop: an empty group, then OpenSwap's entry, then the owner's hook,
+    which taking OpenSwap's out moves from 2:0 to 1:0."""
+    attention.apply(root, True)
+    data = json.loads((home / "hooks.json").read_text())
+    theirs = {"type": "command", "command": "~/bin/log", "timeout": 10, "async": False}
+    data["hooks"]["Stop"] = [{"hooks": []}, *data["hooks"]["Stop"], {"hooks": [theirs]}]
+    (home / "hooks.json").write_text(json.dumps(data))
+    source = os.path.join(os.path.realpath(home), "hooks.json")
+    lines = [f'[hooks.state."{source}:stop:{at}"]\n{state}\n'
+             for at, state in (("2:0", state_before), ("1:0", state_after)) if state]
+    (home / "config.toml").write_text("\n".join(lines))
+    return theirs
+
+
+def test_a3_no_move_past_an_empty_group_lets_a_codex_hook_gain_trust(codex_home):
+    home, root = codex_home
+    hooked = {"type": "command", "command": "~/bin/log", "timeout": 10, "async": False}
+    theirs = _after_an_empty_group(home, root, "", f'trusted_hash = "{attention.codex_hook_hash("Stop", hooked)}"')
+    problems = attention.set_notices(root, False)
+    assert any("left in hooks.json" in p for p in problems)
+    assert json.loads((home / "hooks.json").read_text())["hooks"]["Stop"][2] == {"hooks": [theirs]}
+
+
+def test_a3_the_note_past_an_empty_group_names_the_hook_that_moves(codex_home):
+    home, root = codex_home
+    theirs = _after_an_empty_group(home, root, "", "enabled = false")
+    assert attention.set_notices(root, False) == ["Codex will turn your hook off (Stop: ~/bin/log)"]
+    assert json.loads((home / "hooks.json").read_text())["hooks"]["Stop"] == [{"hooks": []}, {"hooks": [theirs]}]
+
+
+def test_minor_a_file_recorded_under_two_config_home_paths_is_deleted_once(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "no-codex"))
+    root = tmp_path / "backup"
+    home = tmp_path / "home"
+    home.mkdir()
+    linked = tmp_path / "a-link"  # sorts first: changed before the path OpenSwap created the file through
+    linked.symlink_to(home)
+    attention.set_hooks(home, EXE, backup_root=root)
+    attention.set_hooks(linked, EXE, backup_root=root)
+    assert len(_recorded(root)) == 2
+    attention.remove(root)
+    assert not (home / "settings.json").exists() and not (root / attention.HOOKS_RECORD).exists()
+
+
+# --- follow-ups from the S fix round's final review (mar3co/openswap#183) ----------------
+
+
+class _Switch:
+    """The owner's switches as the worker reads them; ``readable`` False: the file cannot be read."""
+    readable = True
+
+    def enabled(self):
+        return True if self.readable else None
+
+    def switches(self):
+        return AttentionSettings(notices=self.readable, readable=self.readable)
+
+
+def test_b3_unreadable_settings_still_close_and_update_what_the_phone_shows(tmp_path):
+    switch, clock = _Switch(), Clock()
+    items = AttentionStore(tmp_path, clock=clock, enabled=switch.enabled, switches=switch.switches)
+    items.notice(permission(command="a") | at(clock, 0))
+    items.notice(notification("permission_prompt"))
+    items.notice(hook("Stop", session=OTHER, last_assistant_message="one") | at(clock, 1))
+    items.notice(notification("idle_prompt", session=OTHER) | at(clock, 61))
+    items.notice(permission(command="b") | at(clock, 70))
+    assert len(published(items)) == 2
+    switch.readable = False
+    items.notice(permission(command="c") | at(clock, 71))
+    items.notice(notification("idle_prompt", session="third") | at(clock, 72))
+    items.notice(hook("Stop", session=OTHER, last_assistant_message="two") | at(clock, 73))  # replaces the idle item
+    items.notice(post(command="a", event="PostToolUseFailure") | at(clock, 74))
+    items.notice(notification("permission_prompt") | at(clock, 76))  # b's: not published now
+    assert [e["detail"]["last_message"] for e in published(items)] == ["two"]
+    assert sorted(c["reason"] for c in closes(items)) == ["answered_on_mac", "superseded"]
+    assert len(items._items) == 4  # b, c and the third session's idle item wait, unpublished
+    items.notice(hook("UserPromptSubmit", session=OTHER, prompt="typed") | at(clock, 80))
+    assert published(items) == []
+
+
+def test_b3_codex_hooks_with_unreadable_settings_publish_only_a_replacement(tmp_path):
+    switch, clock = _Switch(), Clock()
+    items = AttentionStore(tmp_path, clock=clock, enabled=switch.enabled, switches=switch.switches)
+    items.notice(codex_stop("first") | {"at": START})
+    wait(items, clock, 61)
+    items.notice(codex_permission() | {"at": START + 62})
+    switch.readable = False
+    items.notice(codex_permission(command="touch other") | {"at": START + 62.5})
+    items.notice(codex_post() | {"at": START + 63})
+    items.notice(codex_stop("second") | {"at": START + 64})
+    items.notice(codex_stop("elsewhere", thread=SUBAGENT) | {"at": START + 64})
+    assert [e["detail"]["last_message"] for e in published(items)] == ["second"]
+    assert [c["reason"] for c in closes(items)] == ["superseded"] and len(items._items) == 2
+
+
+def test_b4_the_report_budget_comes_back_after_a_run_of_taken_reports(reporting):
+    from openswap.worker import remote
+    from openswap.worker.attention import REPORT_BUDGET
+
+    client, items, service, worker, transport, _ = reporting
+    shape = client._attention_shape
+    refusing = client.transport = _Refusing(transport, 413, "body_too_large")
+    items.notice(notification("idle_prompt"))
+    client.sync_attention()
+    assert shape.budget < REPORT_BUDGET
+    refusing.status = None
+    for _ in range(remote.ATTENTION_BUDGET_RECOVERY + 2):
+        client.sync_attention()  # one report taken; the same report again is never sent
+    assert shape.budget < REPORT_BUDGET
+    for n in range(remote.ATTENTION_BUDGET_RECOVERY - 1):
+        items.notice(notification("idle_prompt", session=f"s{n}"))
+        client.sync_attention()
+    assert shape.budget == REPORT_BUDGET
+    refusing.status = 413  # straight after it came back: shrunk for good
+    items.notice(notification("idle_prompt", session="again"))
+    client.sync_attention()
+    refusing.status = None
+    for n in range(remote.ATTENTION_BUDGET_RECOVERY * 2):
+        items.notice(notification("idle_prompt", session=f"later{n}"))
+        client.sync_attention()
+    assert shape.budget < REPORT_BUDGET
+
+
+# --- fix round 1 -----------------------------------------------------------------------
+
+
+def test_f3_one_read_of_the_settings_decides_a_notice(tmp_path, monkeypatch):
+    from openswap import settings
+    from openswap.worker import runtime
+
+    monkeypatch.setattr(attention, "reconcile", lambda *a, **k: [])
+    reads, racing = [], []
+
+    def load(root, **kwargs):
+        reads.append(1)
+        if racing and len(reads) % 2:
+            return AttentionSettings(notices=False, details=False, readable=False)
+        return AttentionSettings(notices=True)  # readable again by the next read
+
+    monkeypatch.setattr(settings, "load_attention_settings", load)
+    items = runtime._attention_store(tmp_path)
+    items.notice(notification("idle_prompt"))
+    assert len(published(items)) == 1
+    racing.append(True)
+    reads.clear()
+    items.notice(hook("UserPromptSubmit", prompt="typed"))
+    assert published(items) == [] and len(reads) == 1
+
+
+def test_f4_prompts_waiting_while_the_settings_are_unreadable_publish_once_they_read_again(tmp_path):
+    switch, clock = _Switch(), Clock()
+    items = AttentionStore(tmp_path, clock=clock, enabled=switch.enabled, switches=switch.switches,
+                           codex_answers=Answers())
+    switch.readable = False
+    items.notice(permission() | at(clock, 0))
+    items.notice(notification("permission_prompt"))
+    items.notice(codex_permission() | at(clock, 0))
+    wait(items, clock, 10)
+    assert published(items) == []
+    switch.readable = True
+    items.tick()
+    assert sorted(e["provider"] for e in published(items)) == ["claude", "codex"]
+
+
+def test_f4_held_queued_prompts_survive_one_answered_at_the_mac(tmp_path):
+    switch, clock = _Switch(), Clock()
+    items = AttentionStore(tmp_path, clock=clock, enabled=switch.enabled, switches=switch.switches,
+                           codex_answers=Answers())
+    t = clock.now
+    switch.readable = False
+    items.notice(permission(command="a", agent_id="sub1") | at(clock, 0))
+    items.notice(permission(command="b", agent_id="sub2") | at(clock, 0.1))
+    items.notice(notification("permission_prompt") | at(clock, 6))
+    items.notice(notification("permission_prompt") | at(clock, 6.1))
+    items.observe(record("busy", t + 20), True)
+    items.observe(record("waiting", t + 20.5, waiting_for="permission prompt"), True)  # the queued one shows
+    clock.now += 25
+    items.tick()
+    switch.readable = True
+    items.tick()
+    assert len(published(items)) == 2
+
+
+def test_f4_a_held_prompt_answered_at_the_mac_is_never_published(tmp_path):
+    switch, clock = _Switch(), Clock()
+    items = AttentionStore(tmp_path, clock=clock, enabled=switch.enabled, switches=switch.switches,
+                           codex_answers=Answers())
+    t = clock.now
+    switch.readable = False
+    items.notice(permission() | at(clock, 0))
+    items.notice(notification("permission_prompt") | at(clock, 6))
+    clock.now = t + 20
+    items.observe(record("busy", t + 20), True)  # answered at the Mac
+    clock.now = t + 20.5
+    switch.readable = True
+    items.tick()  # inside its grace
+    assert published(items) == []
+
+
+def test_f3_a_notice_reads_the_settings_once_even_when_the_store_is_idle(tmp_path):
+    reads = []
+
+    def enabled():
+        reads.append(1)
+        return True if len(reads) == 1 else None  # a second read would race the file
+
+    looked = []
+    items = AttentionStore(tmp_path, clock=Clock(), enabled=enabled,
+                           records=lambda: (looked.append(1) or [], True))
+    items.notice(notification("permission_prompt"))
+    assert len(reads) == 1 and looked
+
+
+def test_f5_a_413_any_time_after_the_budget_came_back_shrinks_it_for_good(reporting):
+    from openswap.worker import remote
+    from openswap.worker.attention import REPORT_BUDGET
+
+    client, items, service, worker, transport, _ = reporting
+    shape = client._attention_shape
+    refusing = client.transport = _Refusing(transport, None, "body_too_large")
+    sessions = iter(range(1000))
+
+    def report(status=None):
+        refusing.status = status
+        items.notice(notification("idle_prompt", session=f"s{next(sessions)}"))
+        client.sync_attention()
+
+    report(413)
+    for _ in range(remote.ATTENTION_BUDGET_RECOVERY):
+        report()
+    assert shape.budget == REPORT_BUDGET
+    for _ in range(3):
+        report()  # taken: the proxy's limit lies in between
+    report(413)
+    for _ in range(remote.ATTENTION_BUDGET_RECOVERY * 3):
+        report()
+    assert shape.budget < REPORT_BUDGET
