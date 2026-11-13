@@ -287,6 +287,31 @@ def test_a_listener_whose_new_socket_cannot_be_made_yet_is_retried(running_serve
     assert _status_soon(path, 4)["ok"] is True
 
 
+def test_a_socket_file_left_by_a_failed_attempt_never_blocks_the_next(running_server, monkeypatch):
+    path, *_ = running_server
+    real_bind, real_lstat = socket.socket.bind, Path.lstat
+    just_bound, failed_once = threading.Event(), threading.Event()
+
+    def bind(self, address):
+        real_bind(self, address)
+        if not failed_once.is_set():
+            just_bound.set()
+
+    def lstat(self, *args, **kwargs):
+        if just_bound.is_set() and self == path:  # the check right after this attempt's bind
+            just_bound.clear()
+            failed_once.set()
+            raise OSError(errno.EIO, os.strerror(errno.EIO))
+        return real_lstat(self, *args, **kwargs)
+
+    monkeypatch.setattr(socket.socket, "bind", bind)
+    monkeypatch.setattr(Path, "lstat", lstat)
+    failed = _accept_fails_once(monkeypatch, errno.EBADF)
+    assert failed.wait(1)
+    assert failed_once.wait(2)
+    assert _status_soon(path, 4)["ok"] is True
+
+
 def test_a_listener_that_cannot_be_opened_again_is_retried_with_a_growing_wait(running_server, monkeypatch):
     path, *_ = running_server
     real_bind, attempts, refusing = socket.socket.bind, [], threading.Event()

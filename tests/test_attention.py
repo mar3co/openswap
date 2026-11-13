@@ -2815,6 +2815,20 @@ def test_f4_a_held_prompt_answered_at_the_mac_is_never_published(tmp_path):
     assert published(items) == []
 
 
+def test_f3_a_notice_reads_the_settings_once_even_when_the_store_is_idle(tmp_path):
+    reads = []
+
+    def enabled():
+        reads.append(1)
+        return True if len(reads) == 1 else None  # a second read would race the file
+
+    looked = []
+    items = AttentionStore(tmp_path, clock=Clock(), enabled=enabled,
+                           records=lambda: (looked.append(1) or [], True))
+    items.notice(notification("permission_prompt"))
+    assert len(reads) == 1 and looked
+
+
 def test_f5_a_413_any_time_after_the_budget_came_back_shrinks_it_for_good(reporting):
     from openswap.worker import remote
     from openswap.worker.attention import REPORT_BUDGET

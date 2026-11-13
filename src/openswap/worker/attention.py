@@ -898,7 +898,7 @@ class AttentionStore:
         # A reply in flight is settled against what the session file says now.
         if notice.get("event") == "Notification" or (notice.get("provider") == "claude" and any(
                 i.session == notice.get("session_id") for i in self._items if i.id in self._sent)):
-            self.refresh()
+            self.refresh(for_notice=True)
         with self._lock:
             if self._apply(notice, publishes):
                 self._commit()
@@ -1130,13 +1130,16 @@ class AttentionStore:
         # Interrupt: Esc or "No" at the prompt ends the turn.
         return self._close([i for i in prompts if i.created_at <= at], "answered_on_mac")
 
-    def refresh(self) -> None:
-        """Read the session files and Codex's log (outside the lock) and apply what they say."""
+    def refresh(self, *, for_notice: bool = False) -> None:
+        """Read the session files and Codex's log (outside the lock) and apply what they say.
+
+        ``for_notice``: a notice the settings already let through needs this
+        read, so the settings are not read again."""
         if not self._ensure_ready():
             return
         with self._lock:
             idle = not self._items and not self._channels
-        if idle and not self.enabled():
+        if idle and not for_notice and not self.enabled():
             return  # notices off and nothing open: nothing to read for
         # One read at a time, so an older read is never applied after a newer one.
         with self._refresh_lock:

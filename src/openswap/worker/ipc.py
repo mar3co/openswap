@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import hashlib
 import json
@@ -389,12 +390,14 @@ def _listen_again(path: Path, bound_info, stop_event: Event):
     wait = 0.1
     while not stop_event.is_set():
         _unlink_ours(path, bound_info)
-        server = None
+        server, bound_now = None, False
         try:
             server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             _verify_private_parent(path)
             server.bind(str(path))
+            bound_now = True
             bound_info = path.lstat()
+            bound_now = False  # bound_info now names it, so _unlink_ours removes it
             os.chmod(path, 0o600, follow_symlinks=False)
             server.listen(MAX_CONNECTIONS)
             server.settimeout(0.2)
@@ -402,6 +405,10 @@ def _listen_again(path: Path, bound_info, stop_event: Event):
         except (OSError, IpcError) as exc:
             if server is not None:
                 server.close()
+            if bound_now:
+                # This attempt's socket file, unrecorded: left behind, every retry would hit EADDRINUSE.
+                with contextlib.suppress(OSError):
+                    path.unlink()
             log_limited("ipc_listen", "Worker socket could not be opened again (%r); retrying", exc)
             stop_event.wait(wait)
             wait = min(wait * 2, LISTEN_RETRY_MAX_SECONDS)
