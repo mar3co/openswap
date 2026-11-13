@@ -2274,7 +2274,7 @@ def test_w8_state_is_synced_and_only_a_file_that_parses_wrong_is_set_aside(tmp_p
     monkeypatch.setattr(Path, "read_text", flaky)
     again = AttentionStore(tmp_path, clock=Clock())
     again.notice(notification("idle_prompt", session=OTHER))  # not taken while the file cannot be read
-    assert not again.ready and (tmp_path / worker_attention.STATE_FILE).read_text.__self__  # file untouched
+    assert not again.ready
     monkeypatch.setattr(Path, "read_text", real_read)
     assert (tmp_path / worker_attention.STATE_FILE).read_text() == saved
     again.refresh()
@@ -2526,3 +2526,124 @@ def test_review_an_item_without_detail_never_stalls_the_items_tried_after_a_refu
         client.sync_attention()
     shown = {e["detail"]["last_message"] for e in service.attention(worker)["items"] if "detail" in e}
     assert shown == {"fine"} and refusing.sent  # the new item's detail went; only the refused one is kept out
+
+
+# --- follow-ups from the S fix round's final review (mar3co/openswap#182) ----------------
+
+
+def test_a1_the_replies_switch_never_turns_codex_hooks_on(codex_home):
+    home, root = codex_home
+    attention.set_notices(root, True)
+    (home / "config.toml").write_text("[features]\nhooks = false\n")  # the owner turns Codex's hooks off since
+    for replies in (True, False):
+        attention.set_replies(root, replies)
+        assert (home / "config.toml").read_text() == "[features]\nhooks = false\n"
+
+
+def test_a2_an_owners_own_bin_codex_hook_is_never_taken_for_openswaps(codex_home):
+    home, root = codex_home
+    attention.apply(root, True)
+    theirs = {"hooks": [{"type": "command", "command": "/Users/o/bin/codex-hook Stop"}]}
+    data = json.loads((home / "hooks.json").read_text())
+    data["hooks"]["Stop"].append(theirs)
+    (home / "hooks.json").write_text(json.dumps(data))
+    assert attention.recorded_programs(root) == [] and attention.other_launchers(root) == []
+    attention.remove(root)
+    assert json.loads((home / "hooks.json").read_text()) == {"hooks": {"Stop": [theirs]}}
+    assert not (root / attention.HOOKS_RECORD).exists() and not attention.codex_launcher(root).exists()
+
+
+def test_a2_another_openswaps_launcher_is_named_only_while_it_is_there(codex_home, tmp_path):
+    home, root = codex_home
+    attention.apply(root, True)
+    other = tmp_path / "other-backup"
+    attention._write_launcher(other, EXE)
+    data = json.loads((home / "hooks.json").read_text())
+    data["hooks"]["Stop"].append({"hooks": [attention.codex_hook_entry("Stop", attention.codex_launcher(other))]})
+    (home / "hooks.json").write_text(json.dumps(data))
+    assert attention.other_launchers(root) == [str(attention.codex_launcher(other))]
+    attention.codex_launcher(other).write_text("#!/bin/sh\nexec ~/bin/mine\n")
+    assert attention.other_launchers(root) == [] and attention.recorded_programs(root) == []
+    attention.codex_launcher(other).unlink()
+    assert attention.other_launchers(root) == [] and attention.recorded_programs(root) == []
+
+
+def test_a2_settings_names_another_openswaps_launcher():
+    from openswap.menubar_display import remote_attention_rows
+
+    rows = remote_attention_rows({"attention": {"notices": True, "details": True,
+                                                "others": ["/b/bin/codex-hook"]}}, enabled=True)
+    assert any(r["id"] == "remote_attention_others" and "/b/bin/codex-hook" in r["label"] for r in rows)
+
+
+def test_f6_a_recorded_file_that_cannot_be_checked_is_named_and_kept_and_the_rest_go(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "no-codex"))
+    monkeypatch.setattr(attention, "program", lambda: EXE)
+    root = tmp_path / "backup"
+    homes = [tmp_path / "a", tmp_path / "b"]
+    for home in homes:
+        home.mkdir()
+        attention.set_hooks(home, EXE, backup_root=root)
+    write_attention_settings(root, notices=True)
+    blocked = homes[0] / "settings.json"
+    real = Path.is_symlink
+
+    def is_symlink(self):
+        if self == blocked:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self)
+
+    monkeypatch.setattr(Path, "is_symlink", is_symlink)
+    problems = attention.set_notices(root, False)
+    assert len(problems) == 1 and str(blocked) in problems[0]
+    assert list(_recorded(root)) == [str(blocked)] and not (homes[1] / "settings.json").exists()
+    assert any(str(blocked) in p for p in attention.reconcile(root))
+    with pytest.raises(ConfigError, match="Permission denied"):
+        attention.remove(root)
+    monkeypatch.setattr(Path, "is_symlink", real)
+    assert attention.reconcile(root) == [] and not blocked.exists()
+
+
+def _after_an_empty_group(home, root, state_before, state_after):
+    """Stop: an empty group, then OpenSwap's entry, then the owner's hook,
+    which taking OpenSwap's out moves from 2:0 to 1:0."""
+    attention.apply(root, True)
+    data = json.loads((home / "hooks.json").read_text())
+    theirs = {"type": "command", "command": "~/bin/log", "timeout": 10, "async": False}
+    data["hooks"]["Stop"] = [{"hooks": []}, *data["hooks"]["Stop"], {"hooks": [theirs]}]
+    (home / "hooks.json").write_text(json.dumps(data))
+    source = os.path.join(os.path.realpath(home), "hooks.json")
+    lines = [f'[hooks.state."{source}:stop:{at}"]\n{state}\n'
+             for at, state in (("2:0", state_before), ("1:0", state_after)) if state]
+    (home / "config.toml").write_text("\n".join(lines))
+    return theirs
+
+
+def test_a3_no_move_past_an_empty_group_lets_a_codex_hook_gain_trust(codex_home):
+    home, root = codex_home
+    hooked = {"type": "command", "command": "~/bin/log", "timeout": 10, "async": False}
+    theirs = _after_an_empty_group(home, root, "", f'trusted_hash = "{attention.codex_hook_hash("Stop", hooked)}"')
+    problems = attention.set_notices(root, False)
+    assert any("left in hooks.json" in p for p in problems)
+    assert json.loads((home / "hooks.json").read_text())["hooks"]["Stop"][2] == {"hooks": [theirs]}
+
+
+def test_a3_the_note_past_an_empty_group_names_the_hook_that_moves(codex_home):
+    home, root = codex_home
+    theirs = _after_an_empty_group(home, root, "", "enabled = false")
+    assert attention.set_notices(root, False) == ["Codex will turn your hook off (Stop: ~/bin/log)"]
+    assert json.loads((home / "hooks.json").read_text())["hooks"]["Stop"] == [{"hooks": []}, {"hooks": [theirs]}]
+
+
+def test_minor_a_file_recorded_under_two_config_home_paths_is_deleted_once(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "no-codex"))
+    root = tmp_path / "backup"
+    home = tmp_path / "home"
+    home.mkdir()
+    linked = tmp_path / "a-link"  # sorts first: changed before the path OpenSwap created the file through
+    linked.symlink_to(home)
+    attention.set_hooks(home, EXE, backup_root=root)
+    attention.set_hooks(linked, EXE, backup_root=root)
+    assert len(_recorded(root)) == 2
+    attention.remove(root)
+    assert not (home / "settings.json").exists() and not (root / attention.HOOKS_RECORD).exists()

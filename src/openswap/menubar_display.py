@@ -739,6 +739,8 @@ REMOTE_ATTENTION_UNREADABLE = ("OpenSwap can't read its settings file, so these 
                                "send nothing new until it can.")
 REMOTE_ATTENTION_MISSING = ("Some session hooks run {program}, which is gone{more}; sessions skip them quietly. "
                             "Turn notices off and on to point them at this copy of OpenSwap.")
+REMOTE_ATTENTION_OTHERS = ("A file holding OpenSwap's session hooks also runs {program}, the session hooks of "
+                           "another copy of OpenSwap{more}. Turn notices off in that copy to take them out.")
 CODEX_REVIEW = ("Codex shows “Hooks need review” the next time it starts. Choose “Trust all and "
                 "continue” so Codex sessions can tell you when they need you.")
 # Codex's state for OpenSwap's hooks (``attention.codex_hooks_status``), in words.
@@ -792,6 +794,10 @@ def remote_attention_rows(worker_status: dict, *, enabled: bool) -> list[dict]:
     if notices and missing:
         rows.append(_remote_hint("remote_attention_missing", REMOTE_ATTENTION_MISSING.format(
             program=missing[0], more=f" (and {len(missing) - 1} more)" if len(missing) > 1 else "")))
+    others = switches.get("others") or []
+    if notices and others:
+        rows.append(_remote_hint("remote_attention_others", REMOTE_ATTENTION_OTHERS.format(
+            program=others[0], more=f" (and {len(others) - 1} more)" if len(others) > 1 else "")))
     for n, problem in enumerate(switches.get("problems") or []):
         rows.append(_remote_hint(f"remote_attention_problem_{n}", problem))
     codex = CODEX_HOOKS_STATUS.get(switches.get("codex"))

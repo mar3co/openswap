@@ -965,7 +965,7 @@ def run(switcher, codex=None) -> int:
             from openswap.attention import program
             from openswap.settings import load_attention_settings
 
-            from openswap.attention import recorded_programs
+            from openswap.attention import other_launchers, recorded_programs
             from openswap.worker.attention import read_problems
 
             root = self.switcher.backup_dir
@@ -976,6 +976,7 @@ def run(switcher, codex=None) -> int:
                                    "replies": switches.replies, "launcher": f"{shlex.quote(program())} claude",
                                    "readable": switches.readable,
                                    "missing": recorded_programs(root) if switches.notices else [],
+                                   "others": other_launchers(root) if switches.notices else [],
                                    "problems": read_problems(root)}
             if self._setup_changing_folders():
                 status["setup_changing_folders"] = True

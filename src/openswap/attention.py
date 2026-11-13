@@ -597,6 +597,13 @@ def _read_document(path: Path) -> dict | None:
     return data
 
 
+def _created_by_us(path: Path, entry: dict | None) -> bool:
+    """Whether OpenSwap created ``path`` at its latest install, nobody replaced
+    it since, and it is not a link."""
+    return entry is not None and entry.get("created") is True and entry.get("identity") == _identity(path) \
+        and not path.is_symlink()
+
+
 def _strip_file(path: Path, strip, entry: dict | None) -> bool:
     """Take OpenSwap's hooks out of one file with ``strip(document)``. The file
     goes only when OpenSwap created it at its latest install, nobody replaced it
@@ -609,8 +616,7 @@ def _strip_file(path: Path, strip, entry: dict | None) -> bool:
     updated = strip(document)
     if updated == document:
         return False
-    if (not updated or updated == {"hooks": {}}) and entry is not None and entry.get("created") is True \
-            and entry.get("identity") == _identity(path) and not path.is_symlink():
+    if (not updated or updated == {"hooks": {}}) and _created_by_us(path, entry):
         path.unlink()
     else:
         _write_text(path, json.dumps(updated, indent=2, ensure_ascii=False) + "\n")
@@ -628,19 +634,27 @@ def _remove_recorded(backup_root: Path, strip_for, problems: list) -> bool:
         problems.append(str(exc))
         return False
     changed = False
-    for key, entry in sorted(record.items()):
-        path = Path(key)
-        strip = strip_for(path)
-        if strip is None:
-            continue
+    # One file recorded under several paths (a linked config home) is changed
+    # once, through the path that may delete it.
+    by_file: dict[str, list[str]] = {}
+    for key in sorted(record):
+        by_file.setdefault(os.path.realpath(key), []).append(key)
+    for keys in by_file.values():
+        key = keys[0]
         try:
-            changed = _strip_file(path, strip, entry) or changed
-            if path.exists() and _has_ours_in(path):
+            key = next((k for k in keys if _created_by_us(Path(k), record[k])), key)
+            path = Path(key)
+            strip = strip_for(path)
+            if strip is None:
+                continue
+            changed = _strip_file(path, strip, record[key]) or changed
+            if path.exists() and _has_ours_in(path, codex_launcher(backup_root)):
                 continue  # left in place on purpose; ``strip`` said why
         except (ConfigError, OSError) as exc:
-            problems.append(f"{path}: {exc}")
+            problems.append(f"{key}: {exc}")
             continue
-        del record[key]
+        for alias in keys:
+            del record[alias]
     try:
         _save_record(backup_root, record)
     except OSError as exc:
@@ -648,43 +662,61 @@ def _remove_recorded(backup_root: Path, strip_for, problems: list) -> bool:
     return changed
 
 
-def _has_ours_in(path: Path) -> bool:
-    document = _read_document(path) or {}
-    hooks = document.get("hooks")
-    return isinstance(hooks, dict) and any(
-        is_our_hook_command(h.get("command")) or _codex_launcher_word(h.get("command"))
-        for groups in hooks.values() if isinstance(groups, list)
-        for group in groups if isinstance(group, dict) and isinstance(group.get("hooks"), list)
-        for h in group["hooks"] if isinstance(h, dict))
+def _handlers(document: dict):
+    """Every hook entry (a dict) in a settings or ``hooks.json`` document."""
+    hooks = document.get("hooks") if isinstance(document.get("hooks"), dict) else {}
+    for groups in hooks.values():
+        for group in groups if isinstance(groups, list) else []:
+            handlers = group.get("hooks") if isinstance(group, dict) else None
+            yield from (h for h in (handlers if isinstance(handlers, list) else []) if isinstance(h, dict))
+
+
+def _ours(handler: dict, launcher: Path) -> bool:
+    return is_our_hook_command(handler.get("command")) or _is_ours_in(handler, launcher)
+
+
+def _has_ours_in(path: Path, launcher: Path) -> bool:
+    return any(_ours(h, launcher) for h in _handlers(_read_document(path) or {}))
+
+
+def _recorded_handlers(backup_root: Path):
+    """Every hook entry in the files OpenSwap recorded, as far as they read."""
+    try:
+        record = _record(backup_root)
+    except ConfigError:
+        return
+    for key in record:
+        try:
+            yield from _handlers(_read_document(Path(key)) or {})
+        except ConfigError:
+            continue
 
 
 def recorded_programs(backup_root: Path) -> list[str]:
     """The programs OpenSwap's recorded hooks run that no longer exist, for Settings."""
     import shutil
 
-    missing = []
-    try:
-        record = _record(backup_root)
-    except ConfigError:
-        return []
-    for key in record:
-        try:
-            document = _read_document(Path(key)) or {}
-        except ConfigError:
-            continue
-        hooks = document.get("hooks") if isinstance(document.get("hooks"), dict) else {}
-        for groups in hooks.values():
-            for group in groups if isinstance(groups, list) else []:
-                handlers = group.get("hooks") if isinstance(group, dict) else None
-                for handler in handlers if isinstance(handlers, list) else []:
-                    if not isinstance(handler, dict):
-                        continue
-                    words = _hook_words(handler.get("command"))
-                    ours = is_our_hook_command(handler.get("command")) or _codex_launcher_word(
-                        handler.get("command"))
-                    if ours and words and shutil.which(words[0]) is None and words[0] not in missing:
-                        missing.append(words[0])
+    missing, launcher = [], codex_launcher(backup_root)
+    for handler in _recorded_handlers(backup_root):
+        words = _hook_words(handler.get("command"))
+        if _ours(handler, launcher) and words and shutil.which(words[0]) is None and words[0] not in missing:
+            missing.append(words[0])
     return missing
+
+
+def other_launchers(backup_root: Path) -> list[str]:
+    """Codex launchers of another OpenSwap (another backup root) that the files
+    OpenSwap recorded run, for Settings. Only a launcher script that is there is
+    named: once it is gone its entry cannot be told from the owner's own
+    ``.../bin/codex-hook``, so it counts as the owner's hook (in the consent
+    list too) and stays."""
+    out, launcher = [], codex_launcher(backup_root)
+    for handler in _recorded_handlers(backup_root):
+        words = _hook_words(handler.get("command"))
+        if len(words) >= 2 and words[0] != str(launcher) and words[0].endswith("/" + str(CODEX_LAUNCHER)) \
+                and words[0] not in out and _is_launcher_script(Path(words[0])):
+            out.append(words[0])
+    return out
 
 
 # --- Claude Code settings.json ----------------------------------------------
@@ -898,6 +930,22 @@ def codex_hooks_on(config: dict) -> bool:
     return True
 
 
+# What ``_write_launcher`` writes, for any program.
+_LAUNCHER_SCRIPT = re.compile(r'#!/bin/sh\ncommand -v (.+) >/dev/null 2>&1 \|\| exit 0\n'
+                              rf'exec \1 attention {re.escape(CODEX)} "\$@"\n', re.DOTALL)
+
+
+def _is_launcher_script(path: Path) -> bool:
+    """Whether ``path`` is a launcher some OpenSwap wrote."""
+    try:
+        if not path.is_file():
+            return False
+        with open(path, encoding="utf-8") as handle:
+            return _LAUNCHER_SCRIPT.fullmatch(handle.read(16384)) is not None
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
 def _write_launcher(backup_root: Path, executable: str) -> None:
     path = codex_launcher(backup_root)
     quoted = shlex.quote(executable)
@@ -924,11 +972,6 @@ def _read_hooks_file(path: Path) -> dict:
     if not isinstance(hooks, dict) or any(not isinstance(groups, list) for groups in hooks.values()):
         raise ConfigError(f"{path} is not in the form Codex reads; refusing to rewrite it")
     return data
-
-
-def _codex_launcher_word(command: object) -> bool:
-    words = _hook_words(command)
-    return len(words) >= 2 and words[0].endswith("/" + str(CODEX_LAUNCHER))
 
 
 def _is_ours_in(handler: object, launcher: Path) -> bool:
@@ -996,7 +1039,10 @@ def _trust_source(home: Path) -> str:
 
 def _moves(groups: list, launcher: Path) -> list[tuple[tuple[int, int], tuple[int, int], object, object]]:
     """Each other hook whose (group, entry) position changes once OpenSwap's
-    entries are taken out of ``groups``: (old, new, entry, its group)."""
+    entries are taken out of ``groups``: (old, new, entry, its group). A group
+    is numbered by its place in the list, an empty one (``"hooks": []``)
+    counted too (measured: Codex 0.167.0-alpha.4.1 ``hooks/list`` loads such a
+    file and keys ``[{"hooks": []}, {a}, {b}]`` as ``stop:1:0`` and ``stop:2:0``)."""
     moves, new_group = [], 0
     for g, group in enumerate(groups):
         handlers = group.get("hooks") if isinstance(group, dict) else None
@@ -1006,8 +1052,8 @@ def _moves(groups: list, launcher: Path) -> list[tuple[tuple[int, int], tuple[in
             new_group += 1
             continue
         kept = [h for h in handlers if not _is_ours_in(h, launcher)]
-        if not kept:
-            continue
+        if handlers and not kept:
+            continue  # taken out with OpenSwap's entries
         index = 0
         for h, handler in enumerate(handlers):
             if _is_ours_in(handler, launcher):
@@ -1515,7 +1561,9 @@ def set_notices(backup_root: Path, enabled: bool) -> list[str]:
 
 def set_replies(backup_root: Path, enabled: bool) -> list[str]:
     """Settings › Remote › "Allow replies from my phone and watch" (this Mac
-    only): the switch, then the question hook in every managed config home."""
+    only): the switch, then the question hook in every managed config home.
+    Not an owner's action for Codex: it never turns Codex's hooks feature on
+    or moves the owner's Codex hooks."""
     from openswap import bundle
     from openswap.settings import load_attention_settings, write_attention_settings
 
@@ -1533,9 +1581,8 @@ def set_replies(backup_root: Path, enabled: bool) -> list[str]:
             return []
         switches = write_attention_settings(backup_root, replies=enabled)
         problems: list = []
-        notes: list = []
-        apply(backup_root, switches.notices, switches.replies, owner=True, problems=problems, notes=notes)
-        return problems + notes
+        apply(backup_root, switches.notices, switches.replies, problems=problems)
+        return problems
 
 
 def _refuse_temporary_copy() -> None:

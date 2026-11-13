@@ -1686,7 +1686,13 @@ turned off in Codex (`/hooks` or `features.hooks = false`), blocked by managed
 configuration (`allow_managed_hooks_only`, or hooks turned off in
 `/etc/codex` or a managed profile), or missing; it never advises trusting
 all while other hooks there also wait for review. It also names hook entries
-whose program is gone. Turning notices on says so when the review is still
+whose program is gone, and entries that run another OpenSwap's launcher (one
+under another backup root) while that launcher is there. Only the entries
+that run this OpenSwap's own launcher, at its exact path, are OpenSwap's: an
+entry whose program merely ends in `/bin/codex-hook` is the owner's, and so
+is another OpenSwap's once its launcher is gone (it is left in place, and
+counts among the hooks the owner is asked about before Codex's `hooks`
+feature is turned on). Turning notices on says so when the review is still
 to come.
 
 A hook hands its event to the worker's socket and exits within a second,
