@@ -10,6 +10,7 @@ import os
 import socket
 import sys
 import threading
+import time
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -652,6 +653,19 @@ def test_a_malformed_reply_with_an_id_is_refused_and_without_one_ignored(env):
     assert env.outcomes() == {"r1": "refused"}
 
 
+def test_only_the_registration_that_received_a_reply_applies_it(env):
+    first, second = object(), object()
+    env.accepted()
+    reply = {"id": "r1", "item_id": "x", "action": "message", "expires_at": stamp(START)}
+    env.store.queue_replies([reply], first)
+    env.store.apply_replies(env.clock.now, second)  # re-paired since: dropped, not applied
+    env.store.apply_replies(env.clock.now, first)
+    assert env.outcomes() == {}
+    env.store.queue_replies([reply], first)
+    env.store.apply_replies(env.clock.now, first)
+    assert env.outcomes() == {"r1": "refused"}
+
+
 def test_acks_go_until_the_service_takes_them_and_applied_replaces_sent(env):
     item = env.prompt()
     env.reply(item.id, "allow")
@@ -972,7 +986,7 @@ def test_a_reply_travels_from_the_service_to_the_session_and_its_outcome_back(en
     reply_id = service.attention_reply(worker, item.id, "allow")
     client.heartbeat_tick()  # the heartbeat only queues it
     assert env.link.sent == []
-    env.store.apply_replies(env.clock.now)
+    env.store.apply_replies(env.clock.now, client)
     assert env.link.sent == [{"verdict": {"request_id": "abcde", "behavior": "allow"}}]
     client.heartbeat_tick()
     assert transport.calls[-1][1]["attention_acks"] == [{"id": reply_id, "outcome": "sent"}]
@@ -984,6 +998,25 @@ def test_a_reply_travels_from_the_service_to_the_session_and_its_outcome_back(en
     assert report["replies"][0]["outcome"] == "applied" and report["closed"] == {item.id: "answered_from_watch"}
     client.heartbeat_tick()
     assert "attention_acks" not in transport.calls[-1][1]  # nothing left to tell
+
+
+def test_the_attention_thread_applies_a_reply_its_client_received(env, online):
+    client, service, worker, _ = online
+    item = env.prompt()
+    client.sync_attention()
+    service.attention_reply(worker, item.id, "allow")
+    client.stop_event = threading.Event()
+    thread = threading.Thread(target=client._attention_loop, daemon=True)
+    thread.start()
+    try:
+        client.heartbeat_tick()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not env.link.sent:
+            time.sleep(0.05)
+        assert env.link.sent == [{"verdict": {"request_id": "abcde", "behavior": "allow"}}]
+    finally:
+        client.stop_event.set()
+        thread.join(timeout=3)
 
 
 def test_the_reference_service_refuses_replies_it_should_not_queue(env, online):
@@ -1016,7 +1049,7 @@ def test_the_worker_sends_its_outcomes_before_capabilities_are_resent(env, onlin
     client.sync_attention()
     service.attention_reply(worker, item.id, "allow")
     client.heartbeat_tick()
-    env.store.apply_replies(env.clock.now)
+    env.store.apply_replies(env.clock.now, client)
     client._attention_epoch = client.worker_epoch - 1  # a new registration that has not advertised it yet
     client.heartbeat_tick()
     assert transport.calls[-1][1]["attention_acks"][0]["outcome"] == "sent"

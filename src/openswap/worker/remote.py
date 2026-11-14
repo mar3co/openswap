@@ -319,7 +319,6 @@ def run_attention(runtime, stop_event: threading.Event, current) -> None:
     store = runtime.attention
     next_pass = next_install = 0.0
     pending = False
-    source = None  # the last client seen: its heartbeats queued the replies waiting now
     while not stop_event.is_set():
         # Cleared only once seen set: a notice landing after a timed-out
         # wait wakes the next one at once.
@@ -327,15 +326,12 @@ def run_attention(runtime, stop_event: threading.Event, current) -> None:
             store.changed.clear()
             pending = True
         try:
-            client = current()
-            if client is not None and client is not source:
-                if source is not None:
-                    store.drop_replies()
-                source = client
             store.refresh()  # session files and Codex's log: answers and exits that fire no hook
             store.tick()
+            # Asked only now: an unpair or re-pair during the refresh changes it.
+            client = current()
             if client is not None:
-                store.apply_replies(client._server_now().timestamp())
+                store.apply_replies(client._server_now().timestamp(), client)
             now = time.monotonic()
             if now >= next_pass:
                 next_pass = now + HEARTBEAT_SECONDS
@@ -951,7 +947,7 @@ class RemoteClient:
                 store.acks_sent(acks)
                 if self._attention_epoch is not None and self._attention_epoch == self.worker_epoch:
                     # Only queued here too: the attention thread applies them.
-                    store.queue_replies(heartbeat.get("attention_replies"))
+                    store.queue_replies(heartbeat.get("attention_replies"), self)
             self._connectivity()
             return self.state == "online"
         except (ProtocolError, KeyError, TypeError, ValueError, OSError, sqlite3.Error) as exc:

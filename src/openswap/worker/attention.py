@@ -1704,21 +1704,15 @@ class AttentionStore:
             return ["answer"] if whole and sum(self._waits_for(w, item) for w in self._waiters) == 1 else []
         return ["message"] if item.kind == "idle" else []
 
-    def queue_replies(self, replies: object) -> None:
-        """From the heartbeat thread: keep the replies for the attention thread."""
+    def queue_replies(self, replies: object, source: object = None) -> None:
+        """From the heartbeat thread: keep the replies for the attention thread,
+        with the registration (``source``) that received them."""
         if not isinstance(replies, list) or not replies:
             return
         with self._ack_lock:
-            self._incoming.extend(replies[:MAX_INCOMING])
+            self._incoming.extend((source, raw) for raw in replies[:MAX_INCOMING])
             del self._incoming[:-MAX_INCOMING]
         self.changed.set()
-
-    def drop_replies(self) -> None:
-        """The worker reports through another registration now: the queued replies
-        came from the last one. A registration of the same worker gets its own
-        again, since the service resends a reply until it hears the outcome."""
-        with self._ack_lock:
-            self._incoming = []
 
     def _record(self, reply_id: str, outcome: str, until: float | None = None, *, queue: bool = True) -> None:
         """A reply's outcome, kept for answering it again and (unless ``queue`` is
@@ -1731,15 +1725,21 @@ class AttentionStore:
         for oldest in list(self._handled)[:-MAX_HANDLED]:
             del self._handled[oldest]
 
-    def apply_replies(self, now: float | None = None) -> None:
-        """Apply the queued replies, each at most once. ``now`` is the service's
-        clock (replies expire by it). Nothing is applied while the record of
-        handled replies cannot be read (the service sends them again)."""
+    def apply_replies(self, now: float | None = None, source: object = None) -> None:
+        """Apply the queued replies ``source`` received, each at most once; ``now``
+        is its service's clock (replies expire by it). Replies another
+        registration received are dropped: the worker no longer reports through
+        it, and a rebuilt registration of the same worker gets its own again,
+        since the service resends a reply until it hears the outcome. Nothing is
+        applied while the record of handled replies cannot be read (the service
+        sends them again)."""
         if not self._ensure_ready() or not self._reported:
             return  # kept: what this start offered is known only once a report was accepted
         with self._ack_lock:
             incoming, self._incoming = self._incoming, []
-        for raw in incoming:
+        for origin, raw in incoming:
+            if origin is not source:
+                continue
             try:
                 self._apply_reply(raw, self.clock() if now is None else now)
             except Exception:  # noqa: BLE001 - one bad reply must not stop the others
