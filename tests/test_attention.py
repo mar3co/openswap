@@ -1822,6 +1822,28 @@ def test_a_configured_worker_reports_notices(reporting):
         thread.join(timeout=10)
 
 
+def test_a_configured_worker_reports_only_to_the_service_settings_name(reporting):
+    from datetime import datetime, timedelta, timezone
+
+    from openswap.worker.pairing import Enrollment
+    from openswap.worker.remote_state import ConfiguredRemote
+
+    client, _, _, worker, transport, root = reporting
+    enrollment = Enrollment(worker, transport.key, datetime.now(timezone.utc) + timedelta(days=30))
+    configured = ConfiguredRemote(client.runtime, client_factory=lambda *_a, **_k: client,
+                                  enrollment_loader=lambda _url: enrollment)
+    assert configured._attention_client() is None  # no client yet
+    configured.tick()
+    assert configured._attention_client() is client
+    configure_worker_service(root, "http://127.0.0.1:9999")  # re-paired elsewhere, client not yet replaced
+    assert configured._attention_client() is None
+    configure_worker_service(root, None)  # unpaired, client not yet dropped
+    assert configured._attention_client() is None
+    configure_worker_service(root, client.url)
+    update_worker_settings(root, enabled=False)
+    assert configured._attention_client() is None
+
+
 # --- S1 review round (plan 025, 025-review-s1.md) ------------------------------------
 
 

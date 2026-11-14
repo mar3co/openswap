@@ -344,10 +344,13 @@ def run_attention(runtime, stop_event: threading.Event, current) -> None:
             if store.changed.is_set():
                 store.changed.clear()
                 pending = True
-            # Kept until a client could report it: none yet at start or during a
-            # re-pair, or one not yet registered or offline.
-            if pending and client is not None and client.sync_attention():
-                pending = False
+            if pending:
+                # Asked again: an unpair or re-pair during this pass changes it.
+                client = current()
+                # Kept until a client could report it: none yet at start or during a
+                # re-pair, or one not yet registered or offline.
+                if client is not None and client.sync_attention():
+                    pending = False
         except Exception as exc:  # noqa: BLE001 - the next pass tries again
             log_limited("attention_loop", "Session notices pass failed: %s", exc)
             continue

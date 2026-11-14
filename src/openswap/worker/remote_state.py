@@ -358,6 +358,18 @@ class ConfiguredRemote:
         if client is not None:
             client._connectivity(exc)
 
+    def _attention_client(self):
+        """The client to report sessions through, or None. An unpair clears the
+        configured URL before the next pass replaces the client, so a report
+        never goes to a service the owner just disconnected."""
+        client = self.client
+        if client is None:
+            return None
+        policy = load_worker_settings(self.runtime.backup_root)
+        if not policy.enabled or policy.control_service_url != client.url:
+            return None
+        return client
+
     def run(self, stop_event):
         self.stop_event = stop_event
         helpers = [threading.Thread(target=self._loop, args=(self._sync_pass,),
@@ -365,7 +377,7 @@ class ConfiguredRemote:
                    threading.Thread(target=self._loop, args=(self._renew_pass,),
                                     name="openswap-worker-remote-renew", daemon=True)]
         if getattr(self.runtime, "attention", None) is not None:
-            helpers.append(threading.Thread(target=run_attention, args=(self.runtime, stop_event, lambda: self.client),
+            helpers.append(threading.Thread(target=run_attention, args=(self.runtime, stop_event, self._attention_client),
                                             name="openswap-worker-remote-attention", daemon=True))
         for helper in helpers:
             helper.start()
