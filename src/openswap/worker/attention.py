@@ -1704,12 +1704,13 @@ class AttentionStore:
             return ["answer"] if whole and sum(self._waits_for(w, item) for w in self._waiters) == 1 else []
         return ["message"] if item.kind == "idle" else []
 
-    def queue_replies(self, replies: object) -> None:
-        """From the heartbeat thread: keep the replies for the attention thread."""
+    def queue_replies(self, replies: object, source: object = None) -> None:
+        """From the heartbeat thread: keep the replies for the attention thread,
+        with the registration (``source``) that received them."""
         if not isinstance(replies, list) or not replies:
             return
         with self._ack_lock:
-            self._incoming.extend(replies[:MAX_INCOMING])
+            self._incoming.extend((source, raw) for raw in replies[:MAX_INCOMING])
             del self._incoming[:-MAX_INCOMING]
         self.changed.set()
 
@@ -1724,14 +1725,18 @@ class AttentionStore:
         for oldest in list(self._handled)[:-MAX_HANDLED]:
             del self._handled[oldest]
 
-    def apply_replies(self, now: float | None = None) -> None:
-        """Apply the queued replies, each at most once. ``now`` is the service's
-        clock (replies expire by it). Nothing is applied while the record of
-        handled replies cannot be read (the service sends them again)."""
+    def apply_replies(self, now: float | None = None, source: object = None) -> None:
+        """Apply the queued replies ``source`` received, each at most once; ``now``
+        is its service's clock (replies expire by it). Replies another
+        registration received stay queued, for that registration only, until
+        newer ones push them out. Nothing is applied while the record of handled
+        replies cannot be read (the service sends them again)."""
         if not self._ensure_ready() or not self._reported:
             return  # kept: what this start offered is known only once a report was accepted
         with self._ack_lock:
-            incoming, self._incoming = self._incoming, []
+            incoming = [raw for origin, raw in self._incoming if origin is source]
+            others = [entry for entry in self._incoming if entry[0] is not source]
+            self._incoming = others
         for raw in incoming:
             try:
                 self._apply_reply(raw, self.clock() if now is None else now)

@@ -1778,6 +1778,104 @@ def test_the_attention_loop_reports_a_notice_within_a_second(reporting, monkeypa
         thread.join(timeout=3)
 
 
+def test_a_notice_waits_for_the_client_to_come_online_then_goes_at_once(reporting):
+    client, items, service, worker, _, _ = reporting
+    client.state = "offline"
+    client.stop_event = threading.Event()
+    thread = threading.Thread(target=client._attention_loop, daemon=True)
+    thread.start()
+    try:
+        items.notice(notification("idle_prompt"))
+        time.sleep(1)
+        assert not (service.attention(worker) or {}).get("items")
+        client.state = "online"
+        deadline = time.monotonic() + 1.5  # well before the next 5-second pass
+        while time.monotonic() < deadline and not (service.attention(worker) or {}).get("items"):
+            time.sleep(0.05)
+        assert len(service.attention(worker)["items"]) == 1
+    finally:
+        client.stop_event.set()
+        thread.join(timeout=3)
+
+
+def test_a_configured_worker_reports_notices(reporting):
+    from datetime import datetime, timedelta, timezone
+
+    from openswap.worker.pairing import Enrollment
+    from openswap.worker.remote_state import ConfiguredRemote
+
+    client, items, service, worker, transport, _ = reporting
+    enrollment = Enrollment(worker, transport.key, datetime.now(timezone.utc) + timedelta(days=30))
+    configured = ConfiguredRemote(client.runtime, client_factory=lambda *_a, **_k: client,
+                                  enrollment_loader=lambda _url: enrollment)
+    stop = threading.Event()
+    thread = threading.Thread(target=configured.run, args=(stop,), daemon=True)
+    items.notice(notification("idle_prompt"))  # waiting before the worker has a client
+    thread.start()
+    try:
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not (service.attention(worker) or {}).get("items"):
+            time.sleep(0.05)
+        assert len(service.attention(worker)["items"]) == 1
+    finally:
+        stop.set()
+        thread.join(timeout=10)
+
+
+def test_a_configured_worker_reports_only_to_the_service_settings_name(reporting):
+    from datetime import datetime, timedelta, timezone
+
+    from openswap.worker.pairing import Enrollment
+    from openswap.worker.remote_state import ConfiguredRemote
+
+    client, _, _, worker, transport, root = reporting
+    client.worker_id = worker  # as the configured factory builds it, from the enrollment
+    enrollment = Enrollment(worker, transport.key, datetime.now(timezone.utc) + timedelta(days=30))
+    configured = ConfiguredRemote(client.runtime, client_factory=lambda *_a, **_k: client,
+                                  enrollment_loader=lambda _url: enrollment)
+    assert configured._attention_client() is None  # no client yet
+    configured.tick()
+    assert configured._attention_client() is client
+    configure_worker_service(root, client.url, worker)
+    assert configured._attention_client() is client
+    configure_worker_service(root, client.url, "another-worker")  # re-paired to the same service
+    assert configured._attention_client() is None
+    configure_worker_service(root, "http://127.0.0.1:9999")  # re-paired elsewhere, client not yet replaced
+    assert configured._attention_client() is None
+    configure_worker_service(root, None)  # unpaired, client not yet dropped
+    assert configured._attention_client() is None
+    configure_worker_service(root, client.url)
+    update_worker_settings(root, enabled=False)
+    assert configured._attention_client() is None
+
+
+def test_a_configured_worker_stops_reporting_at_an_unpair(reporting):
+    from datetime import datetime, timedelta, timezone
+
+    from openswap.worker.pairing import Enrollment
+    from openswap.worker.remote_state import ConfiguredRemote
+
+    client, items, service, worker, transport, root = reporting
+    enrollment = Enrollment(worker, transport.key, datetime.now(timezone.utc) + timedelta(days=30))
+    configured = ConfiguredRemote(client.runtime, client_factory=lambda *_a, **_k: client,
+                                  enrollment_loader=lambda _url: enrollment)
+    stop = threading.Event()
+    thread = threading.Thread(target=configured.run, args=(stop,), daemon=True)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and configured.client is None:
+            time.sleep(0.05)
+        assert configured.client is client
+        configure_worker_service(root, None)  # the next heartbeat pass would drop the client
+        items.notice(notification("idle_prompt"))
+        time.sleep(1.5)
+        assert not (service.attention(worker) or {}).get("items")
+    finally:
+        stop.set()
+        thread.join(timeout=10)
+
+
 # --- S1 review round (plan 025, 025-review-s1.md) ------------------------------------
 
 
@@ -2884,3 +2982,4 @@ def test_f5_a_413_any_time_after_the_budget_came_back_shrinks_it_for_good(report
     for _ in range(remote.ATTENTION_BUDGET_RECOVERY * 3):
         report()
     assert shape.budget < REPORT_BUDGET
+

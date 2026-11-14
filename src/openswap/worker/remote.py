@@ -309,6 +309,54 @@ def offerable(backup_root, workspace, workspaces) -> bool:
         return False
 
 
+def run_attention(runtime, stop_event: threading.Event, current) -> None:
+    """The session attention thread: keep ``runtime.attention`` current and
+    report it through ``current()``, the client to report through now (None
+    while there is none; a configured worker replaces its client on a re-pair).
+    """
+    from openswap.settings import load_attention_settings
+
+    store = runtime.attention
+    next_pass = next_install = 0.0
+    pending = False
+    while not stop_event.is_set():
+        # Cleared only once seen set: a notice landing after a timed-out
+        # wait wakes the next one at once.
+        if store.changed.wait(ATTENTION_WAKE_SECONDS):
+            store.changed.clear()
+            pending = True
+        try:
+            store.refresh()  # session files and Codex's log: answers and exits that fire no hook
+            store.tick()
+            # Asked only now: an unpair or re-pair during the refresh changes it.
+            client = current()
+            if client is not None:
+                store.apply_replies(client._server_now().timestamp(), client)
+            now = time.monotonic()
+            if now >= next_pass:
+                next_pass = now + HEARTBEAT_SECONDS
+                switches = load_attention_settings(runtime.backup_root)
+                if switches.readable and not switches.notices:
+                    store.clear()  # even with no service to tell
+                pending = True
+            if now >= next_install:
+                next_install = now + ATTENTION_INSTALL_SECONDS
+                store.install()  # config homes and profiles added while the worker runs
+            if store.changed.is_set():
+                store.changed.clear()
+                pending = True
+            if pending:
+                # Asked again: an unpair or re-pair during this pass changes it.
+                client = current()
+                # Kept until a client could report it: none yet at start or during a
+                # re-pair, or one not yet registered or offline.
+                if client is not None and client.sync_attention():
+                    pending = False
+        except Exception as exc:  # noqa: BLE001 - the next pass tries again
+            log_limited("attention_loop", "Session notices pass failed: %s", exc)
+            continue
+
+
 class RemoteClient:
     """Heartbeats on one thread; admission and durable upload replay on another.
 
@@ -720,7 +768,7 @@ class RemoteClient:
         except Exception:
             return
 
-    def sync_attention(self) -> None:
+    def sync_attention(self) -> bool:
         """Send ``attention`` whenever the open items, the closes to report or the
         owner's switches changed, for a registration that advertised it.
 
@@ -730,6 +778,10 @@ class RemoteClient:
         report is reshaped (``_attention_refused``) so the closes always get
         through. An unreadable settings file is not "off": the open items stay
         and waiting closes still go, without details or replies.
+
+        Returns False when this registration cannot report yet (not online, not
+        registered or advertised, unsupported, or waiting out a refusal), so the
+        caller keeps the change; True once it had its turn, sent or not.
         """
         try:
             store = getattr(self.runtime, "attention", None)
@@ -737,7 +789,7 @@ class RemoteClient:
             if (store is None or not store.ready or epoch is None or self.state != "online"
                     or self._attention_epoch != epoch or self._attention_unsupported_epoch == epoch
                     or time.monotonic() < self._attention_shape.retry_at):
-                return
+                return False
             from openswap.settings import load_attention_settings
             from openswap.worker.attention import approved_folder_label
 
@@ -757,11 +809,11 @@ class RemoteClient:
                 budget=shape.budget, plain=frozenset(shape.plain - {shape.trying}), bare=frozenset(shape.bare),
                 closes_only=shape.closes_only)
             if not switches.readable and not body["items"] and not closed_ids:
-                return  # nothing to keep the service up to date with
+                return True  # nothing to keep the service up to date with
             fingerprint = hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
             if not closed_ids and self._attention_sent == (epoch, fingerprint):
                 shape.accepted()  # the very report the service took last: what it would say again
-                return
+                return True
             try:
                 response = self.transport.request("attention", {"worker_epoch": epoch, **body})
             except ProtocolError as exc:
@@ -771,12 +823,12 @@ class RemoteClient:
                     self._connectivity(exc)
                 else:
                     self._attention_refused(store, exc, body)
-                return
+                return True
             try:
                 if integer(fields(response, {"item_count"})["item_count"]) != len(body["items"]):
-                    return  # malformed acknowledgement: resend on the next pass
+                    return True  # malformed acknowledgement: resend on the next pass
             except ProtocolError:
-                return
+                return True
             store.acknowledge(closed_ids, body["items"])
             shape.took()
             store.note_problem("refused", None)
@@ -785,7 +837,8 @@ class RemoteClient:
             self._attention_sent = (epoch, hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest())
         except Exception as exc:  # noqa: BLE001 - retried on the next pass
             log_limited("attention_sync", "Session notices could not be reported: %s", exc)
-            return
+            return True
+        return True
 
     def _attention_refused(self, store, exc: ProtocolError, body: dict) -> None:
         """The service refused a report. 403: ask again only every
@@ -809,36 +862,7 @@ class RemoteClient:
             shape.refused(body)  # the service's own refusal of the report, never a proxy's error page
 
     def _attention_loop(self):
-        from openswap.settings import load_attention_settings
-
-        store = self.runtime.attention
-        next_pass = next_install = 0.0
-        while not self.stop_event.is_set():
-            # Cleared only once seen set: a notice landing after a timed-out
-            # wait wakes the next one at once.
-            changed = store.changed.wait(ATTENTION_WAKE_SECONDS)
-            if changed:
-                store.changed.clear()
-            try:
-                store.refresh()  # session files and Codex's log: answers and exits that fire no hook
-                store.tick()
-                store.apply_replies(self._server_now().timestamp())
-                now = time.monotonic()
-                if now >= next_pass:
-                    next_pass = now + HEARTBEAT_SECONDS
-                    switches = load_attention_settings(self.runtime.backup_root)
-                    if switches.readable and not switches.notices:
-                        store.clear()  # even with no service to tell
-                    changed = True
-                if now >= next_install:
-                    next_install = now + ATTENTION_INSTALL_SECONDS
-                    store.install()  # config homes and profiles added while the worker runs
-                if changed or store.changed.is_set():
-                    store.changed.clear()
-                    self.sync_attention()
-            except Exception as exc:  # noqa: BLE001 - the next pass tries again
-                log_limited("attention_loop", "Session notices pass failed: %s", exc)
-                continue
+        run_attention(self.runtime, self.stop_event, lambda: self)
 
     def accounts_offered(self) -> bool:
         """Whether the service acknowledged a non-empty account set for this registration."""
@@ -923,7 +947,7 @@ class RemoteClient:
                 store.acks_sent(acks)
                 if self._attention_epoch is not None and self._attention_epoch == self.worker_epoch:
                     # Only queued here too: the attention thread applies them.
-                    store.queue_replies(heartbeat.get("attention_replies"))
+                    store.queue_replies(heartbeat.get("attention_replies"), self)
             self._connectivity()
             return self.state == "online"
         except (ProtocolError, KeyError, TypeError, ValueError, OSError, sqlite3.Error) as exc:

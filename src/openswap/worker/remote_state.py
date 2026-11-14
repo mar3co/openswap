@@ -10,7 +10,7 @@ import time
 from openswap.settings import atomic_write_json, load_worker_settings
 from openswap.worker.models import RemoteConnectivity
 from openswap.worker.protocol import HEARTBEAT_SECONDS, MISSED_HEARTBEATS, ProtocolError, timestamp
-from openswap.worker.remote import RemoteClient
+from openswap.worker.remote import RemoteClient, run_attention
 from openswap.worker.pairing import Enrollment, load_enrollment, store_rotated_key
 
 
@@ -358,12 +358,30 @@ class ConfiguredRemote:
         if client is not None:
             client._connectivity(exc)
 
+    def _attention_client(self):
+        """The client to report sessions through, or None. Settings change at an
+        unpair or re-pair before the next pass replaces the client, so reports
+        stop once they do, short of one already being sent."""
+        client = self.client
+        if client is None:
+            return None
+        policy = load_worker_settings(self.runtime.backup_root)
+        if not policy.enabled or policy.control_service_url != client.url:
+            return None
+        # A re-pair to the same URL changes only the worker; older pairings saved no ID.
+        if policy.control_service_worker_id is not None and policy.control_service_worker_id != client.worker_id:
+            return None
+        return client
+
     def run(self, stop_event):
         self.stop_event = stop_event
         helpers = [threading.Thread(target=self._loop, args=(self._sync_pass,),
                                     name="openswap-worker-remote-sync", daemon=True),
                    threading.Thread(target=self._loop, args=(self._renew_pass,),
                                     name="openswap-worker-remote-renew", daemon=True)]
+        if getattr(self.runtime, "attention", None) is not None:
+            helpers.append(threading.Thread(target=run_attention, args=(self.runtime, stop_event, self._attention_client),
+                                            name="openswap-worker-remote-attention", daemon=True))
         for helper in helpers:
             helper.start()
         try:
