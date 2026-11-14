@@ -309,6 +309,46 @@ def offerable(backup_root, workspace, workspaces) -> bool:
         return False
 
 
+def run_attention(runtime, stop_event: threading.Event, current) -> None:
+    """The session attention thread: keep ``runtime.attention`` current and
+    report it through ``current()``, the client to report through now (None
+    while there is none; a configured worker replaces its client on a re-pair).
+    """
+    from openswap.settings import load_attention_settings
+
+    store = runtime.attention
+    next_pass = next_install = 0.0
+    while not stop_event.is_set():
+        # Cleared only once seen set: a notice landing after a timed-out
+        # wait wakes the next one at once.
+        changed = store.changed.wait(ATTENTION_WAKE_SECONDS)
+        if changed:
+            store.changed.clear()
+        try:
+            client = current()
+            store.refresh()  # session files and Codex's log: answers and exits that fire no hook
+            store.tick()
+            if client is not None:
+                store.apply_replies(client._server_now().timestamp())
+            now = time.monotonic()
+            if now >= next_pass:
+                next_pass = now + HEARTBEAT_SECONDS
+                switches = load_attention_settings(runtime.backup_root)
+                if switches.readable and not switches.notices:
+                    store.clear()  # even with no service to tell
+                changed = True
+            if now >= next_install:
+                next_install = now + ATTENTION_INSTALL_SECONDS
+                store.install()  # config homes and profiles added while the worker runs
+            if changed or store.changed.is_set():
+                store.changed.clear()
+                if client is not None:
+                    client.sync_attention()
+        except Exception as exc:  # noqa: BLE001 - the next pass tries again
+            log_limited("attention_loop", "Session notices pass failed: %s", exc)
+            continue
+
+
 class RemoteClient:
     """Heartbeats on one thread; admission and durable upload replay on another.
 
@@ -809,36 +849,7 @@ class RemoteClient:
             shape.refused(body)  # the service's own refusal of the report, never a proxy's error page
 
     def _attention_loop(self):
-        from openswap.settings import load_attention_settings
-
-        store = self.runtime.attention
-        next_pass = next_install = 0.0
-        while not self.stop_event.is_set():
-            # Cleared only once seen set: a notice landing after a timed-out
-            # wait wakes the next one at once.
-            changed = store.changed.wait(ATTENTION_WAKE_SECONDS)
-            if changed:
-                store.changed.clear()
-            try:
-                store.refresh()  # session files and Codex's log: answers and exits that fire no hook
-                store.tick()
-                store.apply_replies(self._server_now().timestamp())
-                now = time.monotonic()
-                if now >= next_pass:
-                    next_pass = now + HEARTBEAT_SECONDS
-                    switches = load_attention_settings(self.runtime.backup_root)
-                    if switches.readable and not switches.notices:
-                        store.clear()  # even with no service to tell
-                    changed = True
-                if now >= next_install:
-                    next_install = now + ATTENTION_INSTALL_SECONDS
-                    store.install()  # config homes and profiles added while the worker runs
-                if changed or store.changed.is_set():
-                    store.changed.clear()
-                    self.sync_attention()
-            except Exception as exc:  # noqa: BLE001 - the next pass tries again
-                log_limited("attention_loop", "Session notices pass failed: %s", exc)
-                continue
+        run_attention(self.runtime, self.stop_event, lambda: self)
 
     def accounts_offered(self) -> bool:
         """Whether the service acknowledged a non-empty account set for this registration."""

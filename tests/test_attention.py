@@ -1778,6 +1778,30 @@ def test_the_attention_loop_reports_a_notice_within_a_second(reporting, monkeypa
         thread.join(timeout=3)
 
 
+def test_a_configured_worker_reports_notices(reporting):
+    from datetime import datetime, timedelta, timezone
+
+    from openswap.worker.pairing import Enrollment
+    from openswap.worker.remote_state import ConfiguredRemote
+
+    client, items, service, worker, transport, _ = reporting
+    enrollment = Enrollment(worker, transport.key, datetime.now(timezone.utc) + timedelta(days=30))
+    configured = ConfiguredRemote(client.runtime, client_factory=lambda *_a, **_k: client,
+                                  enrollment_loader=lambda _url: enrollment)
+    stop = threading.Event()
+    thread = threading.Thread(target=configured.run, args=(stop,), daemon=True)
+    thread.start()
+    try:
+        items.notice(notification("idle_prompt"))
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not (service.attention(worker) or {}).get("items"):
+            time.sleep(0.05)
+        assert len(service.attention(worker)["items"]) == 1
+    finally:
+        stop.set()
+        thread.join(timeout=10)
+
+
 # --- S1 review round (plan 025, 025-review-s1.md) ------------------------------------
 
 

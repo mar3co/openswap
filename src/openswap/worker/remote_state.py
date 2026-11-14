@@ -10,7 +10,7 @@ import time
 from openswap.settings import atomic_write_json, load_worker_settings
 from openswap.worker.models import RemoteConnectivity
 from openswap.worker.protocol import HEARTBEAT_SECONDS, MISSED_HEARTBEATS, ProtocolError, timestamp
-from openswap.worker.remote import RemoteClient
+from openswap.worker.remote import RemoteClient, run_attention
 from openswap.worker.pairing import Enrollment, load_enrollment, store_rotated_key
 
 
@@ -364,6 +364,9 @@ class ConfiguredRemote:
                                     name="openswap-worker-remote-sync", daemon=True),
                    threading.Thread(target=self._loop, args=(self._renew_pass,),
                                     name="openswap-worker-remote-renew", daemon=True)]
+        if getattr(self.runtime, "attention", None) is not None:
+            helpers.append(threading.Thread(target=run_attention, args=(self.runtime, stop_event, lambda: self.client),
+                                            name="openswap-worker-remote-attention", daemon=True))
         for helper in helpers:
             helper.start()
         try:
