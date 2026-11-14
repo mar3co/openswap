@@ -11,19 +11,21 @@ release workflow copies that section into the GitHub release, and
 opensoft.me/swap/changelog shows this file.
 -->
 
-## 0.4.1 (2026-11-14)
+## Unreleased
 
 ### New
 
 - Settings › Remote shows where this Mac is linked, with Unpair… to link it to a different account. Macs connected from now on also show the workspace and account.
 
-### Improved
-
-- Settings › Remote › Sessions explains Codex trust and phone replies in fewer words, and names `openswap claude` instead of the app's full path when that command opens this copy.
+## 0.4.1 (2026-11-14)
 
 ### Fixed
 
 - Waiting Claude Code and Codex sessions now reach OpenTag on your iPhone and Apple Watch. The background worker never sent them before.
+
+### Improved
+
+- Settings › Remote › Sessions explains Codex trust and phone replies in fewer words, and names `openswap claude` instead of the app's full path when that command opens this copy.
 
 ## 0.4.0 (2026-11-13)
 
