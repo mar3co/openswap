@@ -1971,8 +1971,10 @@ def test_h3_a_file_the_owner_replaced_since_is_never_deleted(tmp_path, monkeypat
     home.mkdir()
     attention.set_hooks(home, EXE, backup_root=root)  # created by OpenSwap
     text = (home / "settings.json").read_text()
-    (home / "settings.json").unlink()
+    # Kept until the new file exists, so the new one cannot reuse its inode.
+    (home / "settings.json").rename(home / "old.json")
     (home / "settings.json").write_text(text)  # the owner's own file now, with the same content
+    (home / "old.json").unlink()
     attention.remove(root)
     assert (home / "settings.json").exists() and _settings(home) == {}
 

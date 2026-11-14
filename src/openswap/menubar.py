@@ -19,6 +19,7 @@ import time
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from openswap.claude_login import (
     ClaudeLoginRun,
@@ -976,6 +977,11 @@ def run(switcher, codex=None) -> int:
                                    "problems": read_problems(root)}
             if self._setup_changing_folders():
                 status["setup_changing_folders"] = True
+            policy = self._worker_policy
+            if policy.control_service_url is not None:
+                status["linked"] = {"workspace": policy.control_service_workspace_label,
+                                    "owner": policy.control_service_owner_label,
+                                    "server": urlsplit(policy.control_service_url).netloc}
             return status
 
         def _codex_hooks_status(self):
@@ -1099,6 +1105,20 @@ def run(switcher, codex=None) -> int:
                 return
             self._run_connect(url)
 
+        def _confirm_unpair(self):
+            """Unpair…: after one confirm, `openswap worker unpair` as a worker action."""
+            if self._setup_running() or self._worker_busy():
+                return
+            from openswap.worker.guided_setup import UNPAIR_TITLE, unpair_message
+
+            policy = self._worker_policy
+            url = policy.control_service_url
+            if url is None:
+                return
+            if self._alert(title=UNPAIR_TITLE, message=unpair_message(urlsplit(url).netloc),
+                           ok="Unpair", cancel="Cancel", destructive=True) == 1:
+                self._worker_action("remote_tasks_unpair", (url, policy.control_service_worker_id))
+
         def _wait_dialog(self, *, title, message, done):
             """The "Finish in your browser…" dialog: True when the owner cancelled."""
             from openswap.menubar_dialog import run_waiting_dialog
@@ -1130,6 +1150,7 @@ def run(switcher, codex=None) -> int:
                 "remote_tasks_web_choice": "worker_account_update",
                 "remote_tasks_folder_add": "worker_folder_update",
                 "remote_tasks_folder_remove": "worker_folder_update",
+                "remote_tasks_unpair": "worker_unpair",
             }.get(row_id)
             if self._worker_operation is None:
                 return
@@ -1216,6 +1237,11 @@ def run(switcher, codex=None) -> int:
                     from openswap.worker.guided_setup import remove_folder
 
                     notice = remove_folder(root, value)
+                elif row_id == "remote_tasks_unpair":
+                    from openswap.worker.guided_setup import unpair_this_mac
+
+                    action = "unpair"
+                    diagnostic = unpair_this_mac(root, *value)
                 acted = True
                 policy = load_worker_settings(root)
                 snapshot = read_status(root)
@@ -2436,6 +2462,8 @@ def run(switcher, codex=None) -> int:
                 self._run_connect()
             elif row_id == "remote_tasks_connect_other":
                 self._connect_other_server()
+            elif row_id == "remote_tasks_unpair":
+                self._confirm_unpair()
             elif row_id == "remote_tasks_folder_add":
                 folder = self._choose_task_folder()
                 if folder:

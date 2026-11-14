@@ -224,7 +224,8 @@ def _remote_tasks_status_copy(
     operation = snapshot.get("operation")
     if not isinstance(operation, str) or operation not in {
         "worker_enable_or_disable", "worker_admission_update", "worker_stop_requested",
-        "worker_account_update", "worker_folder_update", "worker_control_busy", "worker_status_checking",
+        "worker_account_update", "worker_folder_update", "worker_unpair", "worker_control_busy",
+        "worker_status_checking",
     }:
         operation = None
     notice = snapshot.get("diagnostic_notice")
@@ -345,7 +346,8 @@ def remote_control_state(snapshot: dict, policy) -> tuple:
     else:
         job = active.get("job_id") if isinstance(active, dict) else None
     return (getattr(policy, "enabled", None), getattr(policy, "paused", None),
-            getattr(policy, "pinned_account_ref", None), getattr(policy, "account_allowlist", None), job)
+            getattr(policy, "pinned_account_ref", None), getattr(policy, "account_allowlist", None),
+            getattr(policy, "control_service_url", None), job)
 
 
 def kept_control_state(notice_state, state: tuple) -> tuple | None:
@@ -613,10 +615,10 @@ class MenuBarSettings:
         atomic_write_json(path, asdict(self))
 
 
-def remote_connect_rows(paired: bool, worker_status: dict) -> list[dict]:
-    """Connect to OpenTag… on an unpaired Mac (with Use another server…), and
-    Reconnect on a paired Mac whose key has expired. No rows otherwise; the
-    pasted command stays under Setup."""
+def remote_pairing_rows(paired: bool, worker_status: dict) -> list[dict]:
+    """Connect to OpenTag… on an unpaired Mac (with Use another server…). On a
+    paired Mac, what it is linked to with Unpair…, and Reconnect when its key
+    has expired. The pasted command stays under Setup."""
     busy = worker_status.get("operation") is not None
     if not paired:
         return [
@@ -639,9 +641,26 @@ def remote_connect_rows(paired: bool, worker_status: dict) -> list[dict]:
                 "disabled": busy,
             },
         ]
+    from openswap.worker.guided_setup import task_blocks_unpair
+
+    linked = worker_status.get("linked")
+    linked = linked if isinstance(linked, dict) else {}
+    names = [linked.get(key) for key in ("workspace", "owner")]
+    where = " · ".join(name for name in names if isinstance(name, str) and name) or linked.get("server") or "OpenTag"
+    rows = [{
+        "kind": "button",
+        "section": SETTINGS_SECTION_REMOTE,
+        "id": "remote_tasks_unpair",
+        "label": "Linked to",
+        "detail": where,
+        "full_label": f"Linked to {where}",
+        "title": "Unpair…",
+        "value": None,
+        "disabled": busy or task_blocks_unpair(worker_status),
+    }]
     reconnect = remote_reconnect_label(worker_status)
     if reconnect is not None:
-        return [{
+        rows.append({
             "kind": "button",
             "section": SETTINGS_SECTION_REMOTE,
             "id": "remote_tasks_reconnect",
@@ -649,8 +668,8 @@ def remote_connect_rows(paired: bool, worker_status: dict) -> list[dict]:
             "title": "Reconnect",
             "value": None,
             "disabled": busy,
-        }]
-    return []
+        })
+    return rows
 
 
 REMOTE_NO_FOLDERS = "No folders yet. Tasks need at least one."
@@ -1027,7 +1046,7 @@ def settings_page_rows(
         *remote_status_rows(status, enabled=worker_enabled, paused=worker_paused, paired=worker_paired,
                             expanded="remote_tasks_details" in (expanded_sections or ())),
     ]
-    remote[1:1] = remote_connect_rows(worker_paired, status)
+    remote[1:1] = remote_pairing_rows(worker_paired, status)
     setup_note = _bounded_text(status.get("setup_note"), 120)
     if setup_note:
         # Why Set up or Connect did nothing just now.

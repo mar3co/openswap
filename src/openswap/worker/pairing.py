@@ -10,7 +10,7 @@ import sys
 import unicodedata
 
 from openswap import macos_keychain
-from openswap.exceptions import LockError
+from openswap.exceptions import ClaudeSwitchError, LockError
 from openswap.locking import FileLock
 from openswap.settings import configure_worker_service, load_worker_settings
 from openswap.worker.protocol import ProtocolError, fields, text, timestamp, validate_url
@@ -178,8 +178,9 @@ def _pair(root: Path, url: str, code: str, *, transport=None, code_verifier: str
     _check_cancelled(cancelled)
     _store(url, enrollment)
     try:
-        configure_worker_service(root, url, enrollment.worker_id)
-    except (OSError, RuntimeError, ValueError):
+        configure_worker_service(root, url, enrollment.worker_id, workspace_label=labels.get("workspace_label"),
+                                 owner_label=labels.get("owner_label"))
+    except (OSError, RuntimeError, ValueError, ClaudeSwitchError):
         # A key must not become an orphan when URL persistence fails.
         try:
             macos_keychain.delete_password(SERVICE, account_name(url))
@@ -220,6 +221,14 @@ def _reconnect(root: Path, url: str, code: str, *, code_verifier: str, transport
         raise ProtocolError("worker_mismatch")
     _check_cancelled(cancelled)
     _store(url, enrollment)
+    if labels:
+        # Replaces the saved labels as a whole (a renamed workspace), and adds them to a
+        # pairing made before they were saved. Display only: a failed write changes nothing.
+        try:
+            configure_worker_service(root, url, enrollment.worker_id, workspace_label=labels.get("workspace_label"),
+                                     owner_label=labels.get("owner_label"))
+        except (OSError, RuntimeError, ValueError, ClaudeSwitchError):
+            pass
     _drop_status(root)
     _record_key(root, url, enrollment)
     return PairedWorker(enrollment.worker_id, labels.get("workspace_label"), labels.get("owner_label"))

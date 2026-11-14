@@ -11,6 +11,12 @@ release workflow copies that section into the GitHub release, and
 opensoft.me/swap/changelog shows this file.
 -->
 
+## Unreleased
+
+### New
+
+- Settings › Remote shows where this Mac is linked, with Unpair… to link it to a different account. Macs connected from now on also show the workspace and account.
+
 ## 0.4.1 (2026-11-14)
 
 ### Fixed

@@ -304,7 +304,7 @@ def test_settings_page_sections_separate_display_from_provider_automation():
     assert not any(row_id.startswith("remote_tasks") for row_id in general_ids)
     assert "group_remote_tasks" not in general_ids
     assert remote_ids == {
-        "group_remote_tasks", "remote_tasks_setup", "remote_tasks_enabled",
+        "group_remote_tasks", "remote_tasks_unpair", "remote_tasks_setup", "remote_tasks_enabled",
         "remote_tasks_paired_off", "group_remote_account", "remote_tasks_account", "remote_tasks_web_choice",
         "group_remote_status", "remote_tasks_status", "remote_tasks_paused", "remote_tasks_stop",
         "remote_tasks_details",
