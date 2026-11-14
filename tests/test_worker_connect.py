@@ -7,6 +7,7 @@ verifier. A fake browser follows that redirect. Keychain access is mocked.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import base64
 import hashlib
@@ -25,6 +26,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 import pytest
 
 from openswap import macos_keychain, menubar
+from openswap.exceptions import ClaudeSwitchError, ConfigError
 from openswap.settings import configure_worker_service, load_worker_settings
 from openswap.worker import cli, connect, guided_setup, pairing
 from openswap.worker.protocol import ProtocolError
@@ -1004,12 +1006,33 @@ def _fails(error):
     ({(macos_keychain, "delete_password"): _fails(macos_keychain.KeychainError("locked"))}, "key_left", True),
     ({(pairing, "unpair"): _fails(ProtocolError("pairing_in_progress"))}, "pairing_in_progress", False),
     ({(pairing, "unpair"): _fails(OSError("disk"))}, "settings_unavailable", False),
+    ({(pairing, "unpair"): _fails(ConfigError("unreadable"))}, "settings_unavailable", False),
+    ({(cli, "lifecycle_lock"): _fails(ClaudeSwitchError("worker_lifecycle_busy"))}, "worker_lifecycle_busy", False),
+    ({(cli, "lifecycle_lock"): _fails(ClaudeSwitchError("worker_state_unavailable"))},
+     "worker_state_unavailable", False),
 ])
 def test_settings_unpair_outcomes(paired_for_unpair, monkeypatch, patch, code, unpaired):
     for (module, name), value in patch.items():
         monkeypatch.setattr(module, name, value)
     assert guided_setup.unpair_this_mac(paired_for_unpair) == code
     assert (load_worker_settings(paired_for_unpair).control_service_url is None) is unpaired
+
+
+def test_settings_unpair_checks_for_a_task_and_unpairs_under_the_lifecycle_lock(paired_for_unpair, monkeypatch):
+    events = []
+
+    @contextmanager
+    def lifecycle_lock(_root):
+        events.append("locked")
+        yield
+        events.append("released")
+
+    real_unpair = pairing.unpair
+    monkeypatch.setattr(cli, "lifecycle_lock", lifecycle_lock)
+    monkeypatch.setattr(cli, "read_status", lambda _root: events.append("status") or {"active_job": None})
+    monkeypatch.setattr(pairing, "unpair", lambda root: events.append("unpair") or real_unpair(root))
+    assert guided_setup.unpair_this_mac(paired_for_unpair) is None
+    assert events == ["locked", "status", "unpair", "released"]
 
 
 def test_pairing_saves_the_key_expiry_for_status(tmp_path, monkeypatch):

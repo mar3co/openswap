@@ -951,16 +951,23 @@ def unpair_this_mac(root: Path) -> str | None:
 
     cli = _cli()
     try:
-        status = cli.read_status(root)
-    except Exception:
-        return "worker_state_unavailable"
-    if status.get("process_state") == "unavailable":
-        return "worker_state_unavailable"
-    if task_blocks_unpair(status):
-        return "job_running"
-    try:
         cli._migrate_legacy_before_worker_state_change(root)
-        unpair(root)
+        # The runtime starts a task under the lifecycle lock: holding it across the
+        # check and the unpair, a task either shows here or sees the cleared pairing.
+        with cli.lifecycle_lock(root):
+            try:
+                status = cli.read_status(root)
+            except Exception:
+                return "worker_state_unavailable"
+            if status.get("process_state") == "unavailable":
+                return "worker_state_unavailable"
+            if task_blocks_unpair(status):
+                return "job_running"
+            unpair(root)
+    except ClaudeSwitchError as exc:
+        if str(exc) in {"worker_lifecycle_busy", "worker_state_unavailable"}:
+            return str(exc)
+        return "settings_unavailable"
     except ProtocolError as exc:
         # device_key_unavailable is raised only after the configured URL was cleared: the
         # Mac is unpaired, but the key stays until a pairing with the same server replaces it.
