@@ -1829,12 +1829,17 @@ def test_a_configured_worker_reports_only_to_the_service_settings_name(reporting
     from openswap.worker.remote_state import ConfiguredRemote
 
     client, _, _, worker, transport, root = reporting
+    client.worker_id = worker  # as the configured factory builds it, from the enrollment
     enrollment = Enrollment(worker, transport.key, datetime.now(timezone.utc) + timedelta(days=30))
     configured = ConfiguredRemote(client.runtime, client_factory=lambda *_a, **_k: client,
                                   enrollment_loader=lambda _url: enrollment)
     assert configured._attention_client() is None  # no client yet
     configured.tick()
     assert configured._attention_client() is client
+    configure_worker_service(root, client.url, worker)
+    assert configured._attention_client() is client
+    configure_worker_service(root, client.url, "another-worker")  # re-paired to the same service
+    assert configured._attention_client() is None
     configure_worker_service(root, "http://127.0.0.1:9999")  # re-paired elsewhere, client not yet replaced
     assert configured._attention_client() is None
     configure_worker_service(root, None)  # unpaired, client not yet dropped
@@ -1842,6 +1847,32 @@ def test_a_configured_worker_reports_only_to_the_service_settings_name(reporting
     configure_worker_service(root, client.url)
     update_worker_settings(root, enabled=False)
     assert configured._attention_client() is None
+
+
+def test_a_configured_worker_stops_reporting_at_an_unpair(reporting):
+    from datetime import datetime, timedelta, timezone
+
+    from openswap.worker.pairing import Enrollment
+    from openswap.worker.remote_state import ConfiguredRemote
+
+    client, items, service, worker, transport, root = reporting
+    enrollment = Enrollment(worker, transport.key, datetime.now(timezone.utc) + timedelta(days=30))
+    configured = ConfiguredRemote(client.runtime, client_factory=lambda *_a, **_k: client,
+                                  enrollment_loader=lambda _url: enrollment)
+    stop = threading.Event()
+    thread = threading.Thread(target=configured.run, args=(stop,), daemon=True)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and configured.client is None:
+            time.sleep(0.05)
+        configure_worker_service(root, None)  # the next heartbeat pass would drop the client
+        items.notice(notification("idle_prompt"))
+        time.sleep(1.5)
+        assert not (service.attention(worker) or {}).get("items")
+    finally:
+        stop.set()
+        thread.join(timeout=10)
 
 
 # --- S1 review round (plan 025, 025-review-s1.md) ------------------------------------

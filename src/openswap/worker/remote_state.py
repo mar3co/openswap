@@ -359,14 +359,17 @@ class ConfiguredRemote:
             client._connectivity(exc)
 
     def _attention_client(self):
-        """The client to report sessions through, or None. An unpair clears the
-        configured URL before the next pass replaces the client, so a report
-        never goes to a service the owner just disconnected."""
+        """The client to report sessions through, or None. Settings change at an
+        unpair or re-pair before the next pass replaces the client, so a report
+        never goes to a registration the owner just disconnected."""
         client = self.client
         if client is None:
             return None
         policy = load_worker_settings(self.runtime.backup_root)
         if not policy.enabled or policy.control_service_url != client.url:
+            return None
+        # A re-pair to the same URL changes only the worker; older pairings saved no ID.
+        if policy.control_service_worker_id is not None and policy.control_service_worker_id != client.worker_id:
             return None
         return client
 
