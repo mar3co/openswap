@@ -360,8 +360,8 @@ class ConfiguredRemote:
 
     def _attention_client(self):
         """The client to report sessions through, or None. Settings change at an
-        unpair or re-pair before the next pass replaces the client, so a report
-        never goes to a registration the owner just disconnected."""
+        unpair or re-pair before the next pass replaces the client, so reports
+        stop once they do, short of one already being sent."""
         client = self.client
         if client is None:
             return None

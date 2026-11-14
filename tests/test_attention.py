@@ -1866,6 +1866,7 @@ def test_a_configured_worker_stops_reporting_at_an_unpair(reporting):
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline and configured.client is None:
             time.sleep(0.05)
+        assert configured.client is client
         configure_worker_service(root, None)  # the next heartbeat pass would drop the client
         items.notice(notification("idle_prompt"))
         time.sleep(1.5)
