@@ -1415,3 +1415,14 @@ def test_settings_unpair_cancelled_or_refused_keeps_the_pairing(root, keychain, 
     unpaired = menubar_display.remote_control_state({"process_state": "running", "active_job": {"job_id": "job-1"}},
                                                     WorkerSettings())
     assert menubar_display.kept_control_state(status["notice_state"], unpaired) is None
+    # Paired again from a terminal while the dialog was open: that new pairing stays.
+    monkeypatch.setattr(cli, "read_status", lambda _root: {"process_state": "stopped", "active_job": None})
+
+    def repaired(**_):
+        configure_worker_service(root, "https://opentag.me", "worker-2")
+        return 1
+
+    unpair_app._alert = repaired
+    status = _settings(unpair_app, "remote_tasks_unpair")
+    assert status["diagnostic_notice"] == "pairing_changed" and keychain
+    assert load_worker_settings(root).control_service_worker_id == "worker-2"

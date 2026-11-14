@@ -340,6 +340,7 @@ _CONTROL_REASONS = {
     ("unpair", "worker_state_unavailable"): "the worker's state could not be read",
     ("unpair", "pairing_in_progress"): "OpenSwap is busy with another change; try again in a moment",
     ("unpair", "settings_unavailable"): "the settings could not be saved",
+    ("unpair", "pairing_changed"): "it was paired again meanwhile; check where it is linked and try again",
 }
 
 
@@ -941,9 +942,10 @@ def task_blocks_unpair(status: dict) -> bool:
     return status.get("process_state") == "running" and status.get("active_job") is not None
 
 
-def unpair_this_mac(root: Path) -> str | None:
-    """Settings → Remote's Unpair…: `openswap worker unpair`'s ``pairing.unpair``,
-    refused while a task runs (``task_blocks_unpair``). Returns a control code
+def unpair_this_mac(root: Path, url: str, worker_id: str | None) -> str | None:
+    """Settings → Remote's Unpair…: `openswap worker unpair`'s ``pairing.unpair`` of the
+    pairing the owner confirmed (``url``, ``worker_id``), refused once another replaced it
+    and while a task runs (``task_blocks_unpair``). Returns a control code
     (see ``control_message``), or None once this Mac is unpaired; ``key_left``
     when it is unpaired but its old key stays in the Keychain."""
     from openswap.worker.pairing import unpair
@@ -955,6 +957,11 @@ def unpair_this_mac(root: Path) -> str | None:
         # The runtime starts a task under the lifecycle lock: holding it across the
         # check and the unpair, a task either shows here or sees the cleared pairing.
         with cli.lifecycle_lock(root):
+            current = load_worker_settings(root)
+            if current.control_service_url is None:
+                return None
+            if (current.control_service_url, current.control_service_worker_id) != (url, worker_id):
+                return "pairing_changed"
             try:
                 status = cli.read_status(root)
             except Exception:

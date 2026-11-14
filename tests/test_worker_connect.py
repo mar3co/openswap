@@ -1014,8 +1014,19 @@ def _fails(error):
 def test_settings_unpair_outcomes(paired_for_unpair, monkeypatch, patch, code, unpaired):
     for (module, name), value in patch.items():
         monkeypatch.setattr(module, name, value)
-    assert guided_setup.unpair_this_mac(paired_for_unpair) == code
+    assert guided_setup.unpair_this_mac(paired_for_unpair, URL, "worker-1") == code
     assert (load_worker_settings(paired_for_unpair).control_service_url is None) is unpaired
+
+
+@pytest.mark.parametrize("url, worker_id", [(URL, "worker-0"), ("https://other.example", "worker-1")])
+def test_settings_unpair_refuses_a_pairing_other_than_the_one_confirmed(paired_for_unpair, keychain, url, worker_id):
+    assert guided_setup.unpair_this_mac(paired_for_unpair, url, worker_id) == "pairing_changed"
+    assert load_worker_settings(paired_for_unpair).control_service_url == URL and keychain
+
+
+def test_settings_unpair_of_a_mac_unpaired_meanwhile_reports_it_unpaired(paired_for_unpair):
+    pairing.unpair(paired_for_unpair)
+    assert guided_setup.unpair_this_mac(paired_for_unpair, URL, "worker-1") is None
 
 
 def test_settings_unpair_checks_for_a_task_and_unpairs_under_the_lifecycle_lock(paired_for_unpair, monkeypatch):
@@ -1031,7 +1042,7 @@ def test_settings_unpair_checks_for_a_task_and_unpairs_under_the_lifecycle_lock(
     monkeypatch.setattr(cli, "lifecycle_lock", lifecycle_lock)
     monkeypatch.setattr(cli, "read_status", lambda _root: events.append("status") or {"active_job": None})
     monkeypatch.setattr(pairing, "unpair", lambda root: events.append("unpair") or real_unpair(root))
-    assert guided_setup.unpair_this_mac(paired_for_unpair) is None
+    assert guided_setup.unpair_this_mac(paired_for_unpair, URL, "worker-1") is None
     assert events == ["locked", "status", "unpair", "released"]
 
 

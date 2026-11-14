@@ -1111,12 +1111,13 @@ def run(switcher, codex=None) -> int:
                 return
             from openswap.worker.guided_setup import UNPAIR_TITLE, unpair_message
 
-            url = self._worker_policy.control_service_url
+            policy = self._worker_policy
+            url = policy.control_service_url
             if url is None:
                 return
             if self._alert(title=UNPAIR_TITLE, message=unpair_message(urlsplit(url).netloc),
                            ok="Unpair", cancel="Cancel", destructive=True) == 1:
-                self._worker_action("remote_tasks_unpair", None)
+                self._worker_action("remote_tasks_unpair", (url, policy.control_service_worker_id))
 
         def _wait_dialog(self, *, title, message, done):
             """The "Finish in your browser…" dialog: True when the owner cancelled."""
@@ -1240,7 +1241,7 @@ def run(switcher, codex=None) -> int:
                     from openswap.worker.guided_setup import unpair_this_mac
 
                     action = "unpair"
-                    diagnostic = unpair_this_mac(root)
+                    diagnostic = unpair_this_mac(root, *value)
                 acted = True
                 policy = load_worker_settings(root)
                 snapshot = read_status(root)
