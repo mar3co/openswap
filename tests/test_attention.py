@@ -1778,6 +1778,26 @@ def test_the_attention_loop_reports_a_notice_within_a_second(reporting, monkeypa
         thread.join(timeout=3)
 
 
+def test_a_notice_waits_for_the_client_to_come_online_then_goes_at_once(reporting):
+    client, items, service, worker, _, _ = reporting
+    client.state = "offline"
+    client.stop_event = threading.Event()
+    thread = threading.Thread(target=client._attention_loop, daemon=True)
+    thread.start()
+    try:
+        items.notice(notification("idle_prompt"))
+        time.sleep(1)
+        assert not (service.attention(worker) or {}).get("items")
+        client.state = "online"
+        deadline = time.monotonic() + 1.5  # well before the next 5-second pass
+        while time.monotonic() < deadline and not (service.attention(worker) or {}).get("items"):
+            time.sleep(0.05)
+        assert len(service.attention(worker)["items"]) == 1
+    finally:
+        client.stop_event.set()
+        thread.join(timeout=3)
+
+
 def test_a_configured_worker_reports_notices(reporting):
     from datetime import datetime, timedelta, timezone
 
