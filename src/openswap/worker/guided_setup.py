@@ -323,6 +323,7 @@ _CONTROL_FAILED = {
     "pause": "Couldn't pause new tasks",
     "resume": "Couldn't resume new tasks",
     "stop": "Couldn't stop the task",
+    "unpair": "Couldn't unpair this Mac",
 }
 # Reasons the CLI's tables don't have, or word for the terminal.
 _CONTROL_REASONS = {
@@ -335,16 +336,22 @@ _CONTROL_REASONS = {
     ("stop", "active_job_mismatch"): "a different task is running now",
     ("pause", "settings_unavailable"): "the worker couldn't apply it",
     ("resume", "settings_unavailable"): "the worker couldn't apply it",
+    ("unpair", "job_running"): "a task is running; stop it or let it finish first",
+    ("unpair", "worker_state_unavailable"): "the worker's state could not be read",
+    ("unpair", "pairing_in_progress"): "OpenSwap is busy with another change; try again in a moment",
+    ("unpair", "settings_unavailable"): "the settings could not be saved",
 }
 
 
 def control_message(code: str, action: str | None = None) -> str:
     """Why a Settings → Remote control did not do what was asked.
 
-    ``action`` is the control used: enable, disable, pause, resume, stop or
-    account; the same code can mean different things for different controls.
+    ``action`` is the control used: enable, disable, pause, resume, stop,
+    account or unpair; the same code can mean different things for different controls.
     """
     cli = _cli()
+    if (action, code) == ("unpair", "key_left"):
+        return UNPAIR_KEY_LEFT
     if code == "status_read_failed":
         return STATUS_READ_FAILED
     if code == "worker_lifecycle_busy":
@@ -918,6 +925,51 @@ def add_folder(root: Path, folder) -> str | None:
     return f"Already allowed through {_display_path(parent.work_root)}." if parent else "Already allowed."
 
 
+UNPAIR_TITLE = "Unpair this Mac?"
+UNPAIR_KEY_LEFT = ("Unpaired, but the old key couldn't be removed from the Keychain. "
+                   "Connecting to the same server again replaces it.")
+
+
+def unpair_message(server: str) -> str:
+    return (f"Remote tasks turn off. This Mac stays listed, offline, under the old account until you remove "
+            f"it on {server}.\n\nTo link it again, choose Connect to OpenTag….")
+
+
+def task_blocks_unpair(status: dict) -> bool:
+    """A task the running worker still has could not report its result once the Mac
+    is unpaired. A stopped worker's leftover task is closed by its next start."""
+    return status.get("process_state") == "running" and status.get("active_job") is not None
+
+
+def unpair_this_mac(root: Path) -> str | None:
+    """Settings → Remote's Unpair…: `openswap worker unpair`'s ``pairing.unpair``,
+    refused while a task runs (``task_blocks_unpair``). Returns a control code
+    (see ``control_message``), or None once this Mac is unpaired; ``key_left``
+    when it is unpaired but its old key stays in the Keychain."""
+    from openswap.worker.pairing import unpair
+    from openswap.worker.protocol import ProtocolError
+
+    cli = _cli()
+    try:
+        status = cli.read_status(root)
+    except Exception:
+        return "worker_state_unavailable"
+    if status.get("process_state") == "unavailable":
+        return "worker_state_unavailable"
+    if task_blocks_unpair(status):
+        return "job_running"
+    try:
+        cli._migrate_legacy_before_worker_state_change(root)
+        unpair(root)
+    except ProtocolError as exc:
+        # device_key_unavailable is raised only after the configured URL was cleared: the
+        # Mac is unpaired, but the key stays until a pairing with the same server replaces it.
+        return "key_left" if exc.code == "device_key_unavailable" else exc.code
+    except Exception:
+        return "settings_unavailable"
+    return None
+
+
 def add_repo_groups(root: Path, folder) -> tuple[str, bool, bool] | None:
     """Add each subfolder of ``folder`` that holds repos as a folder of repos, each on its own.
 
@@ -1129,7 +1181,7 @@ class Readiness:
             # Only an online worker can receive tasks from the service.
             if gui:
                 out.append({
-                    "revoked": "this Mac was removed in OpenTag, so it must be paired again",
+                    "revoked": "this Mac was removed in OpenTag: Unpair… in Settings → Remote, then Connect again",
                     "expired": "Reconnect this Mac in Settings → Remote (the pairing expired)",
                 }.get(self.connection, wait))
             else:

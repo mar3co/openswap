@@ -1395,10 +1395,11 @@ def _remote_rows(**kwargs):
 
 
 def test_menu_has_a_set_up_button_after_the_worker_switches():
-    # Remote tasks reads Local worker, Pause new tasks, Setup; an unpaired Mac leads with Connect.
+    # Remote tasks reads Linked to, Local worker, Pause new tasks, Setup; an unpaired Mac leads with Connect.
     rows = _remote_rows(worker_paired=True, worker_enabled=True)
     ids = [row["id"] for row in rows]
-    assert ids[:4] == ["group_remote_tasks", "remote_tasks_enabled", "remote_tasks_paused", "remote_tasks_setup"]
+    assert ids[:5] == ["group_remote_tasks", "remote_tasks_unpair", "remote_tasks_enabled", "remote_tasks_paused",
+                       "remote_tasks_setup"]
     unpaired = [row["id"] for row in _remote_rows()]
     assert unpaired[:6] == ["group_remote_tasks", "remote_tasks_connect", "remote_tasks_connect_other",
                             "remote_tasks_enabled", "remote_tasks_paused", "remote_tasks_setup"]

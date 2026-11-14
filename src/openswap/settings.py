@@ -133,6 +133,10 @@ class WorkerSettings:
     control_service_url: str | None = None
     # The worker ID the configured URL was paired as; a re-pair changes it.
     control_service_worker_id: str | None = None
+    # Display only: the workspace name and the owner's sign-in email that a
+    # Connect pairing returned (None for a pasted code or an older pairing).
+    control_service_workspace_label: str | None = None
+    control_service_owner_label: str | None = None
     workspaces: tuple[WorkerWorkspace, ...] = ()
     # Accounts a control service may choose per job (the pin is the default
     # and is always one of them). Empty for settings written before the
@@ -450,6 +454,15 @@ def _migrate_account_allowlist(section: dict, backup_root: Path) -> None:
     )
 
 
+def _pairing_label(section: dict, key: str, control_url: str | None) -> str | None:
+    """A saved pairing label, or None: being display only, a bad one never disables the worker."""
+    value = section.get(key)
+    if (control_url is None or not isinstance(value, str) or not value or len(value) > 200
+            or any(unicodedata.category(c).startswith("C") for c in value)):
+        return None
+    return value
+
+
 def _default_worker_workspace(backup_root: Path) -> WorkerWorkspace:
     return WorkerWorkspace(
         workspace_id="research",
@@ -544,6 +557,8 @@ def _worker_from_raw(raw: dict, backup_root: Path) -> WorkerSettings:
         pinned_account_ref=pinned,
         control_service_url=control_url,
         control_service_worker_id=control_worker,
+        control_service_workspace_label=_pairing_label(section, "controlServiceWorkspaceLabel", control_url),
+        control_service_owner_label=_pairing_label(section, "controlServiceOwnerLabel", control_url),
         workspaces=tuple(workspaces),
         account_allowlist=allowlist,
     )
@@ -1359,9 +1374,10 @@ def atomic_write_json(path: Path, data: dict) -> None:
         raise
 
 
-def configure_worker_service(backup_root: Path, url: str | None, worker_id: str | None = None) -> WorkerSettings:
-    """Persist the owner-selected URL (and the worker ID it was paired as); configuring
-    it alone never enables remote work. Clearing the URL clears the worker ID too."""
+def configure_worker_service(backup_root: Path, url: str | None, worker_id: str | None = None, *,
+                             workspace_label: str | None = None, owner_label: str | None = None) -> WorkerSettings:
+    """Persist the owner-selected URL (and the worker ID and labels it was paired with);
+    configuring it alone never enables remote work. Clearing the URL clears the rest too."""
     if url is not None:
         from openswap.worker.protocol import validate_url
         url = validate_url(url)
@@ -1375,10 +1391,12 @@ def configure_worker_service(backup_root: Path, url: str | None, worker_id: str 
             section = {}
             raw["worker"] = section
         section["controlServiceUrl"] = url
-        if url is not None and worker_id is not None:
-            section["controlServiceWorkerId"] = worker_id
-        else:
-            section.pop("controlServiceWorkerId", None)
+        for key, value in (("controlServiceWorkerId", worker_id), ("controlServiceWorkspaceLabel", workspace_label),
+                           ("controlServiceOwnerLabel", owner_label)):
+            if url is not None and value is not None:
+                section[key] = value
+            else:
+                section.pop(key, None)
         _migrate_account_allowlist(section, Path(backup_root))
         atomic_write_json(settings_path(backup_root), raw)
     return load_worker_settings(backup_root)

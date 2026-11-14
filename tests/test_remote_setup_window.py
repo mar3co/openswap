@@ -24,6 +24,7 @@ from openswap.worker.guided_setup import Readiness, SetupClosed
 from openswap.worker.setup_window import WindowPrompts, done_page, window_page
 from tests.menubar_harness import SetupWindow, extract_class, settle_setup, setup_app
 from tests.test_worker_accounts import ALICE, root  # noqa: F401 (fixture)
+from tests.test_worker_pairing_status import keychain  # noqa: F401 (fixture)
 from tests.test_worker_guided_setup import URL, _builtin, _code, _repo, enable_calls, research_home  # noqa: F401 (fixtures)
 
 
@@ -820,12 +821,12 @@ def test_active_job_reads_none_with_stop_disabled_until_a_job_runs():
     assert (busy["detail"], busy["value"], busy["disabled"]) == ("waiting for approval", "job-1", False)
 
 
-def _settings_app(root):
+def _settings_app(root, *methods):
     app = extract_class(menubar.__file__, "MenuBarApp",
                         {"_worker_action", "_worker_action_worker", "_with_account_picker", "_with_folders",
                          "_drain_worker_result", "_on_setting", "_choose_task_folder", "_reload_remote_settings",
-                         "_setup_changing_folders", "_remote_status"},
-                        {"threading": threading})()
+                         "_setup_changing_folders", "_remote_status", *methods},
+                        {"threading": threading, "urlsplit": menubar.urlsplit})()
     app.switcher = SimpleNamespace(backup_dir=root)
     app._worker_generation = 0
     app._worker_result_lock = threading.Lock()
@@ -1369,3 +1370,48 @@ def test_unchecking_the_only_org_while_adding_its_parent_only_removes_it(root, r
                     chosen=[str(github)])
     assert _notes(window.shown[3]) == ["✓ Removed ~/GitHub/opensoft (its files are kept)."]
     assert [entry[0] for entry in _saved(root)] == ["notes"]
+
+
+@pytest.fixture
+def unpair_app(root, keychain, monkeypatch):
+    from openswap.worker import pairing
+
+    configure_worker_service(root, "https://opentag.me", "worker-1", workspace_label="Acme", owner_label="Owner")
+    keychain[("openswap", pairing.account_name("https://opentag.me"))] = "{}"
+    monkeypatch.setattr(cli, "read_status", lambda _root: {"process_state": "stopped", "active_job": None})
+    app = _settings_app(root, "_confirm_unpair", "_setup_running", "_worker_busy")
+    app._worker_policy = load_worker_settings(root)
+    app.alerts = []
+    app.answer = 1
+    app._alert = lambda **kwargs: app.alerts.append(kwargs) or app.answer
+    return app
+
+
+def test_settings_shows_the_linked_account_and_unpair_ends_the_pairing(root, keychain, unpair_app):
+    rows = menubar_display.remote_pairing_rows(True, unpair_app._remote_status())
+    assert rows[0]["detail"] == "Acme · Owner"
+    status = _settings(unpair_app, "remote_tasks_unpair")
+    ((alert),) = unpair_app.alerts
+    assert alert["title"] == "Unpair this Mac?" and "opentag.me" in alert["message"] and alert["destructive"]
+    assert status.get("diagnostic_notice") is None and not keychain
+    assert unpair_app._worker_policy.control_service_url is None
+    connect = menubar_display.remote_pairing_rows(False, unpair_app._remote_status())
+    assert connect[0]["id"] == "remote_tasks_connect"
+
+
+def test_settings_unpair_cancelled_or_refused_keeps_the_pairing(root, keychain, unpair_app, monkeypatch):
+    unpair_app.answer = 0
+    _settings(unpair_app, "remote_tasks_unpair")
+    assert unpair_app._worker_operation is None and keychain
+    unpair_app.answer = 1
+    monkeypatch.setattr(cli, "read_status", lambda _root: {"process_state": "running", "active_job": {"job_id": "job-1"}})
+    status = _settings(unpair_app, "remote_tasks_unpair")
+    assert (status["diagnostic_notice"], status["notice_action"]) == ("job_running", "unpair")
+    assert keychain and load_worker_settings(root).control_service_url == "https://opentag.me"
+    assert guided_setup.control_message("job_running", "unpair") == (
+        "Couldn't unpair this Mac: a task is running; stop it or let it finish first.")
+    assert guided_setup.control_message("key_left", "unpair") == guided_setup.UNPAIR_KEY_LEFT
+    # Unpaired some other way: a refresh that reads it clears the refusal.
+    unpaired = menubar_display.remote_control_state({"process_state": "running", "active_job": {"job_id": "job-1"}},
+                                                    WorkerSettings())
+    assert menubar_display.kept_control_state(status["notice_state"], unpaired) is None

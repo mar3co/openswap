@@ -13,6 +13,10 @@ opensoft.me/swap/changelog shows this file.
 
 ## Unreleased
 
+### New
+
+- Settings › Remote shows where this Mac is linked, with Unpair… to link it to a different account. Macs connected from now on also show the workspace and account.
+
 ### Improved
 
 - Settings › Remote › Sessions explains Codex trust and phone replies in fewer words, and names `openswap claude` instead of the app's full path when that command opens this copy.

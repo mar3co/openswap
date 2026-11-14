@@ -447,14 +447,30 @@ def test_pair_with_a_verifier_accepts_the_labels(tmp_path, keychain):
     worker = pairing.pair(tmp_path, "http://localhost", "pair_1", transport=transport, code_verifier=RFC_VERIFIER)
     assert worker == "worker-1" and (worker.workspace_label, worker.owner_label) == ("Acme", "Owner")
     assert transport.requests == [("pair", {"code": "pair_1", "code_verifier": RFC_VERIFIER})]
-    assert load_worker_settings(tmp_path).control_service_worker_id == "worker-1"
+    policy = load_worker_settings(tmp_path)
+    assert policy.control_service_worker_id == "worker-1"
+    assert (policy.control_service_workspace_label, policy.control_service_owner_label) == ("Acme", "Owner")
     assert RFC_VERIFIER not in (tmp_path / "settings.json").read_text()
+    assert pairing.unpair(tmp_path)
+    policy = load_worker_settings(tmp_path)
+    assert (policy.control_service_workspace_label, policy.control_service_owner_label) == (None, None)
 
 
 def test_pair_with_a_verifier_accepts_a_response_without_labels(tmp_path, keychain):
     worker = pairing.pair(tmp_path, "http://localhost", "pair_1", transport=LabelTransport(_pair_response()),
                           code_verifier=RFC_VERIFIER)
     assert worker == "worker-1" and worker.workspace_label is None
+    assert load_worker_settings(tmp_path).control_service_workspace_label is None
+
+
+def test_saved_pairing_labels_are_display_only(tmp_path):
+    configure_worker_service(tmp_path, URL, "worker-1", workspace_label="Acme", owner_label="Owner")
+    raw = json.loads((tmp_path / "settings.json").read_text())
+    raw["worker"].update(controlServiceWorkspaceLabel="Bad\u202ename", controlServiceOwnerLabel=7)
+    (tmp_path / "settings.json").write_text(json.dumps(raw))
+    policy = load_worker_settings(tmp_path)
+    assert (policy.control_service_url, policy.control_service_worker_id) == (URL, "worker-1")
+    assert (policy.control_service_workspace_label, policy.control_service_owner_label) == (None, None)
 
 
 def test_pair_without_a_verifier_keeps_the_closed_shape(tmp_path, keychain):
@@ -492,15 +508,15 @@ def test_odd_labels_never_fail_a_pairing(tmp_path, keychain, extra, shown):
 URL = "http://localhost"
 
 
-def _paired(root, keychain, *, days=-1, worker_id="worker-1"):
-    configure_worker_service(root, URL, worker_id)
+def _paired(root, keychain, *, days=-1, worker_id="worker-1", **labels):
+    configure_worker_service(root, URL, worker_id, **labels)
     old = json.dumps({"worker_id": worker_id, "device_key": "old-device-key", "expires_at": _later(days)})
     keychain[("openswap", pairing.account_name(URL))] = old
     return old
 
 
 def test_reconnect_replaces_the_key_in_place(tmp_path, keychain):
-    _paired(tmp_path, keychain)
+    _paired(tmp_path, keychain, workspace_label="Old", owner_label="old@example.com")
     (tmp_path / "worker").mkdir()
     (tmp_path / "worker" / "remote-status.json").write_text("{}")
     worker = pairing.reconnect(tmp_path, URL, "pair_1", code_verifier=RFC_VERIFIER,
@@ -511,11 +527,29 @@ def test_reconnect_replaces_the_key_in_place(tmp_path, keychain):
     assert pairing.load_enrollment(URL).device_key == "new-device-key"
     policy = load_worker_settings(tmp_path)
     assert (policy.control_service_url, policy.control_service_worker_id) == (URL, "worker-1")
+    assert (policy.control_service_workspace_label, policy.control_service_owner_label) == ("Acme", None)
     # The old status is gone; the new one holds only the new key's expiry.
     status = json.loads((tmp_path / "worker" / "remote-status.json").read_text())
     assert status["state"] == "offline" and status["last_seen_at"] is None
     assert status["key_expires_at"] == pairing.load_enrollment(URL).expires_at.isoformat()
     assert "new-device-key" not in json.dumps(status)
+
+
+def test_reconnect_without_labels_keeps_the_saved_ones(tmp_path, keychain):
+    _paired(tmp_path, keychain, workspace_label="Old", owner_label="old@example.com")
+    pairing.reconnect(tmp_path, URL, "pair_1", code_verifier=RFC_VERIFIER, transport=LabelTransport(_pair_response()))
+    policy = load_worker_settings(tmp_path)
+    assert (policy.control_service_workspace_label, policy.control_service_owner_label) == ("Old", "old@example.com")
+
+
+def test_reconnect_succeeds_when_only_the_label_write_fails(tmp_path, keychain, monkeypatch):
+    from openswap.exceptions import ConfigError
+
+    _paired(tmp_path, keychain)
+    monkeypatch.setattr(pairing, "configure_worker_service", _fails(ConfigError("unreadable")))
+    worker = pairing.reconnect(tmp_path, URL, "pair_1", code_verifier=RFC_VERIFIER,
+                               transport=LabelTransport(_pair_response(workspace_label="Acme")))
+    assert worker == "worker-1" and pairing.load_enrollment(URL).device_key == "new-device-key"
 
 
 @pytest.mark.parametrize("transport, code", [
@@ -928,6 +962,54 @@ def test_menu_offers_reconnect_from_the_saved_expiry_while_the_worker_is_off():
     plenty = rows(remote_key_expires_at=(now + timedelta(days=20)).isoformat())
     assert "remote_tasks_reconnect" not in plenty
     assert "remote_tasks_reconnect" not in rows()  # nothing saved yet
+
+
+def test_menu_shows_what_a_paired_mac_is_linked_to_with_unpair():
+    def row(**status):
+        return {r["id"]: r for r in _remote_rows(worker_paired=True, worker_status=status)}["remote_tasks_unpair"]
+
+    linked = row(linked={"workspace": "Acme", "owner": "owner@example.com", "server": "opentag.me"})
+    assert (linked["label"], linked["detail"], linked["title"], linked["disabled"]) == (
+        "Linked to", "Acme · owner@example.com", "Unpair…", False)
+    assert row(linked={"workspace": None, "owner": None, "server": "opentag.me"})["detail"] == "opentag.me"
+    assert row(operation="worker_account_update")["disabled"]
+    assert row(process_state="running", active_job={"job_id": "job-1"})["disabled"]
+    assert not row(process_state="stopped", active_job={"job_id": "job-1"})["disabled"]  # closed by its next start
+    assert "remote_tasks_unpair" not in {r["id"] for r in _remote_rows()}
+
+
+@pytest.fixture
+def paired_for_unpair(tmp_path, keychain, monkeypatch):
+    configure_worker_service(tmp_path, URL, "worker-1")
+    keychain[("openswap", pairing.account_name(URL))] = "{}"
+    monkeypatch.setattr(cli, "read_status", lambda _root: {"active_job": None})
+    return tmp_path
+
+
+def _fails(error):
+    def raising(*_args, **_kwargs):
+        raise error
+    return raising
+
+
+@pytest.mark.parametrize("patch, code, unpaired", [
+    ({}, None, True),
+    ({(cli, "read_status"): lambda _root: {"process_state": "running", "active_job": {"job_id": "job-1"}}},
+     "job_running", False),
+    ({(cli, "read_status"): lambda _root: {"process_state": "stopped", "active_job": {"job_id": "job-1"}}},
+     None, True),
+    ({(cli, "read_status"): lambda _root: {"process_state": "unavailable"}}, "worker_state_unavailable", False),
+    ({(cli, "read_status"): _fails(OSError("socket"))}, "worker_state_unavailable", False),
+    # The Keychain refused after the URL was cleared: unpaired, but the old key stays.
+    ({(macos_keychain, "delete_password"): _fails(macos_keychain.KeychainError("locked"))}, "key_left", True),
+    ({(pairing, "unpair"): _fails(ProtocolError("pairing_in_progress"))}, "pairing_in_progress", False),
+    ({(pairing, "unpair"): _fails(OSError("disk"))}, "settings_unavailable", False),
+])
+def test_settings_unpair_outcomes(paired_for_unpair, monkeypatch, patch, code, unpaired):
+    for (module, name), value in patch.items():
+        monkeypatch.setattr(module, name, value)
+    assert guided_setup.unpair_this_mac(paired_for_unpair) == code
+    assert (load_worker_settings(paired_for_unpair).control_service_url is None) is unpaired
 
 
 def test_pairing_saves_the_key_expiry_for_status(tmp_path, monkeypatch):

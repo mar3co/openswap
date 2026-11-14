@@ -8,6 +8,7 @@ import pytest
 from tests.test_worker_remote import remote_setup
 
 from openswap import macos_keychain
+from openswap.exceptions import ConfigError, LockError
 from openswap.settings import configure_worker_service, load_worker_settings, update_worker_settings
 from openswap.worker import cli, pairing
 from openswap.worker.models import RemoteConnectivity
@@ -45,8 +46,9 @@ def test_pair_and_unpair_keychain_only(tmp_path, keychain):
     assert not keychain and load_worker_settings(tmp_path).control_service_url is None
 
 
-def test_pair_settings_failure_cleans_key(tmp_path, keychain, monkeypatch):
-    monkeypatch.setattr(pairing, "configure_worker_service", lambda *_: (_ for _ in ()).throw(OSError("secret path")))
+@pytest.mark.parametrize("error", [OSError("secret path"), ConfigError("unreadable"), LockError("busy")])
+def test_pair_settings_failure_cleans_key(tmp_path, keychain, monkeypatch, error):
+    monkeypatch.setattr(pairing, "configure_worker_service", lambda *_, **__: (_ for _ in ()).throw(error))
     with pytest.raises(ProtocolError, match="pairing_settings_unavailable"):
         pairing.pair(tmp_path, "http://localhost", "one-use", transport=PairTransport())
     assert not keychain

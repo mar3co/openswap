@@ -330,7 +330,9 @@ after 10 minutes (a pair code's lifetime) or when the owner cancels on the Mac.
   flow) refuses a verifier.
 - Only when the request carried a verifier may the response add
   `workspace_label` and `owner_label` (each 1–200 characters with no control
-  characters, or null), so the Mac can say where it was paired. Without a
+  characters, or null), so the Mac can say where it was paired; it saves them
+  in `settings.json` (`controlServiceWorkspaceLabel`, `controlServiceOwnerLabel`,
+  display only, replaced by a reconnect that returns either, cleared by `unpair`). Without a
   verifier the response keeps the exact closed shape, and a worker refuses
   either field as `invalid_request`.
 - A renewal code issued for a reconnect (`worker_id` set) keeps the worker ID.
@@ -882,7 +884,9 @@ was stored) is an orphan and `pair` replaces it. New enrollment at the same
 URL receives separate claim/upload journal bindings, scoped by the worker ID;
 nothing key-derived is written to disk.
 
-`openswap worker unpair [url]` clears the URL, then removes the key. With an
+`openswap worker unpair [url]` clears the URL, then removes the key; the
+menu's **Unpair…** (Settings › Remote) calls the same function, refused while
+a task runs. With an
 explicit URL it removes that enrollment's item even when settings no longer
 reference it, clearing the configured URL only when it is the same origin.
 New launches also recheck Keychain availability, and the guard's authorization
