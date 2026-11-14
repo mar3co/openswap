@@ -960,12 +960,8 @@ def run(switcher, codex=None) -> int:
         def _remote_status(self):
             """The worker snapshot Settings › Remote draws, with the setup window's folder
             lock and the session attention switches as saved now."""
-            import shlex
-
-            from openswap.attention import program
+            from openswap.attention import claude_launcher, other_launchers, recorded_programs
             from openswap.settings import load_attention_settings
-
-            from openswap.attention import other_launchers, recorded_programs
             from openswap.worker.attention import read_problems
 
             root = self.switcher.backup_dir
@@ -973,7 +969,7 @@ def run(switcher, codex=None) -> int:
             switches = load_attention_settings(root)
             status["attention"] = {"notices": switches.notices, "details": switches.details,
                                    "codex": self._codex_hooks_status() if switches.notices else None,
-                                   "replies": switches.replies, "launcher": f"{shlex.quote(program())} claude",
+                                   "replies": switches.replies, "launcher": claude_launcher(),
                                    "readable": switches.readable,
                                    "missing": recorded_programs(root) if switches.notices else [],
                                    "others": other_launchers(root) if switches.notices else [],

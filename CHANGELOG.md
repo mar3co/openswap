@@ -11,6 +11,12 @@ release workflow copies that section into the GitHub release, and
 opensoft.me/swap/changelog shows this file.
 -->
 
+## Unreleased
+
+### Improved
+
+- Settings › Remote › Sessions explains Codex trust and phone replies in fewer words, and names `openswap claude` instead of the app's full path when that command opens this copy.
+
 ## 0.4.0 (2026-11-13)
 
 ### New

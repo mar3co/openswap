@@ -1559,7 +1559,38 @@ def test_settings_rows_show_the_switches_on_a_paired_mac():
                                                 "launcher": "/Apps/O S.app/Contents/MacOS/OpenSwap claude"}},
                                  enabled=True)
     assert rows[-1]["id"] == "remote_attention_replies_note"
-    assert "alias claude='/Apps/O S.app/Contents/MacOS/OpenSwap claude'" in rows[-1]["label"]
+    assert "start Claude with /Apps/O S.app/Contents/MacOS/OpenSwap claude instead" in rows[-1]["label"]
+
+
+@pytest.mark.parametrize(("on_path", "launcher"), [
+    (["bin"], "openswap claude"),
+    ([], "full"),
+    (["bin", "old"], "full"),
+    (["old", "bin"], "full"),
+])
+def test_settings_name_the_short_command_only_when_every_openswap_runs_this_copy(
+        tmp_path, monkeypatch, on_path, launcher):
+    exe = tmp_path / "O S.app" / "Contents" / "MacOS" / "OpenSwap"
+    exe.parent.mkdir(parents=True)
+    exe.write_text("#!/bin/sh\n")
+    exe.chmod(0o755)
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "openswap").symlink_to(exe)
+    (tmp_path / "old").mkdir()
+    (tmp_path / "old" / "openswap").write_text("#!/bin/sh\n")
+    (tmp_path / "old" / "openswap").chmod(0o755)
+    for name in ("UV_TOOL_BIN_DIR", "XDG_BIN_HOME", "UV_INSTALL_DIR", "XDG_DATA_HOME"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("PATH", os.pathsep.join([str(exe.parent), *(str(tmp_path / d) for d in on_path)]))
+    monkeypatch.setattr(attention.Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(attention, "program", lambda: str(exe))
+    expected = "openswap claude" if launcher != "full" else f"'{exe}' claude"
+    assert attention.claude_launcher() == expected
+
+
+def test_settings_name_the_short_command_for_an_install_on_path(monkeypatch):
+    monkeypatch.setattr(attention, "program", lambda: "openswap")
+    assert attention.claude_launcher() == "openswap claude"
 
 
 @pytest.mark.parametrize(("paired", "notices", "shown"), [(True, False, True), (False, False, False),

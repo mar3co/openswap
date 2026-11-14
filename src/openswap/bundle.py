@@ -776,12 +776,12 @@ def _retire_widget_host(home: Path, uid: int | None) -> str | None:
     return None if widget_install.retire_legacy_host(home=home, uid=uid) is None else "widget host"
 
 
-def _uv_bin_dirs(home: Path) -> list[Path]:
+def uv_bin_dirs(home: Path) -> list[Path]:
     """Where a uv install's ``openswap`` shim can be, most specific first.
 
     uv's tool bin directory (``UV_TOOL_BIN_DIR``, ``XDG_BIN_HOME``,
     ``XDG_DATA_HOME/../bin``, ``~/.local/bin``), the ``UV_INSTALL_DIR`` the
-    installer honours, then every PATH entry, since a shim anywhere on PATH
+    installer honors, then every PATH entry, since a shim anywhere on PATH
     can shadow the cask's command.
     """
     env = os.environ
@@ -795,7 +795,7 @@ def _uv_bin_dirs(home: Path) -> list[Path]:
 
 def _report_uv_install(exe: Path, home: Path, say: Callable[[str], object]) -> None:
     seen: set[Path] = set()
-    for directory in _uv_bin_dirs(home):
+    for directory in uv_bin_dirs(home):
         shim = directory / "openswap"
         if shim in seen or not (shim.exists() or shim.is_symlink()):
             continue
