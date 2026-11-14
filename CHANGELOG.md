@@ -21,6 +21,10 @@ opensoft.me/swap/changelog shows this file.
 
 - Settings › Remote › Sessions explains Codex trust and phone replies in fewer words, and names `openswap claude` instead of the app's full path when that command opens this copy.
 
+### Fixed
+
+- Waiting Claude Code and Codex sessions now reach OpenTag on your iPhone and Apple Watch. The background worker never sent them before.
+
 ## 0.4.0 (2026-11-13)
 
 ### New
