@@ -319,6 +319,7 @@ def run_attention(runtime, stop_event: threading.Event, current) -> None:
     store = runtime.attention
     next_pass = next_install = 0.0
     pending = False
+    source = None  # the last client seen: its heartbeats queued the replies waiting now
     while not stop_event.is_set():
         # Cleared only once seen set: a notice landing after a timed-out
         # wait wakes the next one at once.
@@ -327,6 +328,10 @@ def run_attention(runtime, stop_event: threading.Event, current) -> None:
             pending = True
         try:
             client = current()
+            if client is not None and client is not source:
+                if source is not None:
+                    store.drop_replies()
+                source = client
             store.refresh()  # session files and Codex's log: answers and exits that fire no hook
             store.tick()
             if client is not None:

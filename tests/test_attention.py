@@ -2982,3 +2982,57 @@ def test_f5_a_413_any_time_after_the_budget_came_back_shrinks_it_for_good(report
     for _ in range(remote.ATTENTION_BUDGET_RECOVERY * 3):
         report()
     assert shape.budget < REPORT_BUDGET
+
+
+def test_the_attention_thread_drops_replies_queued_for_an_earlier_client(tmp_path):
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+
+    from openswap.worker.remote import run_attention
+
+    applied, passes = [], []
+
+    class Store:
+        changed = threading.Event()
+
+        def refresh(self):
+            passes.append(1)
+
+        def tick(self): pass
+
+        def clear(self): pass
+
+        def install(self): pass
+
+        def drop_replies(self):
+            applied.append("drop")
+
+        def apply_replies(self, now):
+            applied.append(now)
+
+    def client(at):
+        return SimpleNamespace(_server_now=lambda: datetime.fromtimestamp(at, timezone.utc),
+                               sync_attention=lambda: True)
+
+    first, second = client(1), client(2)
+    current = [None]
+    store, stop = Store(), threading.Event()
+    thread = threading.Thread(target=run_attention, daemon=True,
+                              args=(SimpleNamespace(attention=store, backup_root=tmp_path), stop, lambda: current[0]))
+    thread.start()
+    try:
+        for now in (None, first, None, first, second):  # a gap with no client keeps the same one's replies
+            current[0] = now
+            seen = len(passes)
+            store.changed.set()
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and len(passes) < seen + 2:  # the second pass saw it
+                time.sleep(0.01)
+            assert len(passes) >= seen + 2
+    finally:
+        stop.set()
+        thread.join(timeout=3)
+    drop = applied.index("drop")
+    assert applied.count("drop") == 1
+    assert applied[:drop] and set(applied[:drop]) == {1.0}
+    assert applied[drop + 1:] and set(applied[drop + 1:]) == {2.0}

@@ -1713,6 +1713,13 @@ class AttentionStore:
             del self._incoming[:-MAX_INCOMING]
         self.changed.set()
 
+    def drop_replies(self) -> None:
+        """The worker reports through another registration now: the queued replies
+        came from the last one. A registration of the same worker gets its own
+        again, since the service resends a reply until it hears the outcome."""
+        with self._ack_lock:
+            self._incoming = []
+
     def _record(self, reply_id: str, outcome: str, until: float | None = None, *, queue: bool = True) -> None:
         """A reply's outcome, kept for answering it again and (unless ``queue`` is
         False) queued for the service."""
