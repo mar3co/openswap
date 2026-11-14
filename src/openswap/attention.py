@@ -477,6 +477,29 @@ def program() -> str:
     return words[0] if len(words) == 2 else "openswap"
 
 
+def claude_launcher() -> str:
+    """The command that starts Claude Code through OpenSwap: ``openswap claude``
+    when every ``openswap`` on this process's PATH and in uv's tool folders runs
+    this copy, else the full path. A folder only the owner's shell has is not
+    seen (#197). The app's own ``Contents/MacOS``, first on the menu bar's PATH,
+    is on no shell's PATH, so it doesn't count."""
+    from openswap.bundle import uv_bin_dirs
+
+    exe = program()
+    if exe == "openswap":
+        return "openswap claude"
+    own = Path(exe).parent
+    same = []
+    for directory in uv_bin_dirs(Path.home()):
+        command = directory / "openswap"
+        try:
+            if command.is_file() and os.access(command, os.X_OK) and not os.path.samefile(directory, own):
+                same.append(os.path.samefile(command, exe))
+        except OSError:
+            same.append(False)
+    return "openswap claude" if same and all(same) else f"{shlex.quote(exe)} claude"
+
+
 # Every hook entry runs through this: a program that is missing, or present but
 # unable to run the hook (an older build, an import failure), exits 0 and prints
 # nothing, so no Claude Code or Codex event ever fails or is blocked over it.

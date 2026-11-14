@@ -11,7 +11,6 @@ import logging
 import os
 import plistlib
 import re
-import shlex
 import shutil
 import sys
 import threading
@@ -741,26 +740,21 @@ REMOTE_ATTENTION_MISSING = ("Some session hooks run {program}, which is gone{mor
                             "Turn notices off and on to point them at this copy of OpenSwap.")
 REMOTE_ATTENTION_OTHERS = ("A file holding OpenSwap's session hooks also runs {program}, the session hooks of "
                            "another copy of OpenSwap{more}. Turn notices off in that copy to take them out.")
-CODEX_REVIEW = ("Codex shows “Hooks need review” the next time it starts. Choose “Trust all and "
-                "continue” so Codex sessions can tell you when they need you.")
+CODEX_REVIEW = "When Codex next shows “Hooks need review”, choose “Trust all and continue” so it can alert you."
 # Codex's state for OpenSwap's hooks (``attention.codex_hooks_status``), in words.
 CODEX_HOOKS_STATUS = {
-    "trusted": "Codex: OpenSwap's hooks are trusted.",
+    "trusted": "Codex is set up.",
     "review": "Codex: " + CODEX_REVIEW,
-    "review_others": ("Codex: Codex shows “Hooks need review” the next time it starts, for other hooks too. "
-                      "Trust OpenSwap's (codex-hook) and only the hooks you recognize; don't choose “Trust all and "
-                      "continue” unless you know them all."),
-    "disabled": "Codex: OpenSwap's hooks are turned off in Codex (/hooks), so Codex sessions can't tell you "
-                "when they need you.",
-    "off": "Codex: hooks are turned off in Codex's settings, so Codex sessions can't tell you when they need you.",
-    "blocked": "Codex: your organization's Codex settings don't allow OpenSwap's hooks.",
-    "missing": "Codex: OpenSwap's hooks are missing from Codex's hooks.json; the worker puts them back.",
-    "unknown": "Codex: OpenSwap can't read Codex's settings to tell whether its hooks are trusted.",
+    "review_others": ("Codex: When Codex next shows “Hooks need review”, trust OpenSwap's codex-hook and only "
+                      "hooks you recognize; don't choose “Trust all and continue” unless you know them all."),
+    "disabled": "Codex: OpenSwap's hooks are off in Codex's /hooks, so Codex can't alert you.",
+    "off": "Codex: hooks are off in Codex's settings, so Codex can't alert you.",
+    "blocked": "Codex: your organization doesn't allow OpenSwap's hooks.",
+    "missing": "Codex: OpenSwap's hooks are missing; the worker adds them back.",
+    "unknown": "Codex: OpenSwap can't tell whether Codex trusts its hooks.",
 }
-REMOTE_REPLIES_HOW = ("Only sessions started with {launcher} can be answered from your phone and watch; "
-                      "to make it your claude command, add alias claude={launcher_quoted} to your shell's "
-                      "startup file. Claude Code asks you to confirm the OpenSwap channel each time it starts, "
-                      "and Team and Enterprise organizations must turn channels on first.")
+REMOTE_REPLIES_HOW = ("Replies: start Claude with {launcher} instead of claude, and allow OpenSwap when Claude "
+                      "asks. Team and Enterprise plans need an admin to turn on channels first.")
 
 
 def remote_attention_rows(worker_status: dict, *, enabled: bool) -> list[dict]:
@@ -805,8 +799,7 @@ def remote_attention_rows(worker_status: dict, *, enabled: bool) -> list[dict]:
         rows.append(_remote_hint("remote_attention_codex", codex))
     launcher = switches.get("launcher")
     if notices and switches.get("replies") is True and isinstance(launcher, str):
-        rows.append(_remote_hint("remote_attention_replies_note", REMOTE_REPLIES_HOW.format(
-            launcher=launcher, launcher_quoted=shlex.quote(launcher))))
+        rows.append(_remote_hint("remote_attention_replies_note", REMOTE_REPLIES_HOW.format(launcher=launcher)))
     return rows
 
 
