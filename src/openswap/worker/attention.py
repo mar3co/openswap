@@ -1728,18 +1728,16 @@ class AttentionStore:
     def apply_replies(self, now: float | None = None, source: object = None) -> None:
         """Apply the queued replies ``source`` received, each at most once; ``now``
         is its service's clock (replies expire by it). Replies another
-        registration received are dropped: the worker no longer reports through
-        it, and a rebuilt registration of the same worker gets its own again,
-        since the service resends a reply until it hears the outcome. Nothing is
-        applied while the record of handled replies cannot be read (the service
-        sends them again)."""
+        registration received stay queued, for that registration only, until
+        newer ones push them out. Nothing is applied while the record of handled
+        replies cannot be read (the service sends them again)."""
         if not self._ensure_ready() or not self._reported:
             return  # kept: what this start offered is known only once a report was accepted
         with self._ack_lock:
-            incoming, self._incoming = self._incoming, []
-        for origin, raw in incoming:
-            if origin is not source:
-                continue
+            incoming = [raw for origin, raw in self._incoming if origin is source]
+            others = [entry for entry in self._incoming if entry[0] is not source]
+            self._incoming = others
+        for raw in incoming:
             try:
                 self._apply_reply(raw, self.clock() if now is None else now)
             except Exception:  # noqa: BLE001 - one bad reply must not stop the others

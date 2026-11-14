@@ -656,13 +656,12 @@ def test_a_malformed_reply_with_an_id_is_refused_and_without_one_ignored(env):
 def test_only_the_registration_that_received_a_reply_applies_it(env):
     first, second = object(), object()
     env.accepted()
-    reply = {"id": "r1", "item_id": "x", "action": "message", "expires_at": stamp(START)}
-    env.store.queue_replies([reply], first)
-    env.store.apply_replies(env.clock.now, second)  # re-paired since: dropped, not applied
-    env.store.apply_replies(env.clock.now, first)
-    assert env.outcomes() == {}
-    env.store.queue_replies([reply], first)
-    env.store.apply_replies(env.clock.now, first)
+    reply = {"item_id": "x", "action": "message", "expires_at": stamp(START)}
+    env.store.queue_replies([{"id": "r1", **reply}], first)
+    env.store.queue_replies([{"id": "r2", **reply}], second)
+    env.store.apply_replies(env.clock.now, second)
+    assert env.outcomes() == {"r2": "refused"}  # the first registration's reply is not applied through it
+    env.store.apply_replies(env.clock.now, first)  # kept for the first, should it report again
     assert env.outcomes() == {"r1": "refused"}
 
 
