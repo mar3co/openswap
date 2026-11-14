@@ -1790,10 +1790,10 @@ def test_a_configured_worker_reports_notices(reporting):
                                   enrollment_loader=lambda _url: enrollment)
     stop = threading.Event()
     thread = threading.Thread(target=configured.run, args=(stop,), daemon=True)
+    items.notice(notification("idle_prompt"))  # waiting before the worker has a client
     thread.start()
     try:
-        items.notice(notification("idle_prompt"))
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 2
         while time.monotonic() < deadline and not (service.attention(worker) or {}).get("items"):
             time.sleep(0.05)
         assert len(service.attention(worker)["items"]) == 1

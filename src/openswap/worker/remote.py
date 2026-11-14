@@ -318,6 +318,7 @@ def run_attention(runtime, stop_event: threading.Event, current) -> None:
 
     store = runtime.attention
     next_pass = next_install = 0.0
+    pending = False
     while not stop_event.is_set():
         # Cleared only once seen set: a notice landing after a timed-out
         # wait wakes the next one at once.
@@ -342,8 +343,11 @@ def run_attention(runtime, stop_event: threading.Event, current) -> None:
                 store.install()  # config homes and profiles added while the worker runs
             if changed or store.changed.is_set():
                 store.changed.clear()
-                if client is not None:
-                    client.sync_attention()
+                pending = True
+            # Kept until there is a client to report through (none yet at start or during a re-pair).
+            if pending and client is not None:
+                pending = False
+                client.sync_attention()
         except Exception as exc:  # noqa: BLE001 - the next pass tries again
             log_limited("attention_loop", "Session notices pass failed: %s", exc)
             continue
