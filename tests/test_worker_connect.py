@@ -977,6 +977,7 @@ def test_menu_shows_what_a_paired_mac_is_linked_to_with_unpair():
     assert row(operation="worker_account_update")["disabled"]
     assert row(process_state="running", active_job={"job_id": "job-1"})["disabled"]
     assert not row(process_state="stopped", active_job={"job_id": "job-1"})["disabled"]  # closed by its next start
+    assert not row(process_state="stale", active_job={"job_id": "job-1"})["disabled"]  # owner's call
     assert "remote_tasks_unpair" not in {r["id"] for r in _remote_rows()}
 
 

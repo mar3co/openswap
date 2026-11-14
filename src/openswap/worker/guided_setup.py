@@ -938,14 +938,16 @@ def unpair_message(server: str) -> str:
 
 def task_blocks_unpair(status: dict) -> bool:
     """A task the running worker still has could not report its result once the Mac
-    is unpaired. A stopped worker's leftover task is closed by its next start."""
+    is unpaired. A stopped worker's leftover task, or a stale one's (dead, or hung), does
+    not block: its next start closes it, nothing in the app could unblock a hung one, and
+    the owner confirmed the unpair, so a task a hung worker resumes runs but loses its result."""
     return status.get("process_state") == "running" and status.get("active_job") is not None
 
 
 def unpair_this_mac(root: Path, url: str, worker_id: str | None) -> str | None:
     """Settings → Remote's Unpair…: `openswap worker unpair`'s ``pairing.unpair`` of the
     pairing the owner confirmed (``url``, ``worker_id``), refused once another replaced it
-    and while a task runs (``task_blocks_unpair``). Returns a control code
+    and while the running worker has a task (``task_blocks_unpair``). Returns a control code
     (see ``control_message``), or None once this Mac is unpaired; ``key_left``
     when it is unpaired but its old key stays in the Keychain."""
     from openswap.worker.pairing import unpair
