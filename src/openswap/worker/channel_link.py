@@ -29,8 +29,9 @@ POLL_SECONDS = 0.5
 # goes in, and the fields carrying its own prompt as shown and its word that
 # this is the prompt exactly or whole.
 WAITERS = {
-    "question": ({"version", "command", "session_id", "tool_key"}, {"agent_id", "questions", "answerable"},
-                 "answers", "questions", "answerable"),
+    # An older question hook's "answerable" is taken and ignored: it says "whole" by older rules.
+    "question": ({"version", "command", "session_id", "tool_key"}, {"agent_id", "questions", "whole", "answerable"},
+                 "answers", "questions", "whole"),
     "permission": ({"version", "command", "session_id", "tool_key", "tool_name"}, {"agent_id", "preview", "exact"},
                    "behavior", "preview", "exact"),
 }

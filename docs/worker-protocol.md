@@ -715,15 +715,18 @@ exactly these fields, and optionally `session_id` and `detail`:
   with at least one of `tool_name` (1–100 characters), `description` (1–1,000),
   `input_preview` (1–4,000; the call as Claude Code itself previews it to
   OpenSwap's channel or, in a session without the channel, as the prompt's own
-  permission hook previews it in the same form with credentials masked; sent
-  only for a permission that takes replies), `last_message`
-  (1–1,000, the start of the session's last message; `description` and
-  `last_message` have API keys and tokens recognizable by their shape masked) and
+  permission hook previews it in the same form; never for a call that may hold
+  a credential, whose `description` is then "Preview withheld: it may contain a
+  credential."; sent only for a permission that takes replies), `last_message`
+  (1–1,000, the start of the session's last message; `description`,
+  `last_message` and `questions` have API keys and tokens recognizable by their
+  shape, private-key blocks, a URL's password and the values of `Authorization`
+  and `Cookie` headers masked as `[REDACTED]`) and
   `questions` (1–4 closed objects, each with
   `question` (1–1,000), an optional `header` (1–100) and `options`, 0–4
-  option labels of 1–100 characters; format, bidi and zero-width characters,
-  line and paragraph separators, DEL, C1 controls and lone surrogates in them
-  are written as their JSON escapes, such as `\u202e`). `tool_name`, `header` and option labels
+  option labels of 1–100 characters; every character outside ASCII but
+  letters, numbers, punctuation and symbols, and the ones that look blank, is
+  written as its JSON escape, such as `\u00a0`). `tool_name`, `header` and option labels
   contain no Unicode control characters; the other text may contain newline,
   carriage return and tab, and no other control character. A tool's raw input
   is never sent: for `Bash` the worker sends the model's own description of
@@ -1838,22 +1841,33 @@ questions (details off, or the detail cut for size):
   timeout, which leaves `AskUserQuestion` to the question hook) is installed
   with the question hook. It sends the worker its own call as Claude Code's
   channel form previews it, `{ "key": value, … }` with each value as JSON, and
-  that preview is the item's `input_preview`. Everything in it that differs
-  from the call shows and makes it inexact, and then the item takes `deny`
-  only: credentials masked (API keys and tokens by their shape, private-key
-  blocks, `Bearer` tokens, `Authorization:` and `Cookie:` headers, a URL's user
-  and password, `-u user:password`, mysql's `-pPASSWORD`, a registry's
-  `login -p PASSWORD`, and the value of anything whose name has a password,
-  secret, token, key, credential, auth or cookie segment, quoted values whole
-  and unquoted ones up to the shell's next `; & | < > )`, while a value that is
-  only `$(…)`, a backtick command, `<(…)` or a variable stays readable); a field
-  cut in its middle or left out, with a marker (also a field too large to mask
-  quickly); format, bidi and zero-width characters, line and paragraph
-  separators, DEL, C1 controls and lone surrogates written as their JSON
-  escapes; and a run of more than 16 spaces, which could push the rest of a
-  command out of sight, shown as a marker (indentation stays exact). JSON's own escapes (`\n`, `\"`) keep
-  it exact. The worker cleans the preview once more and keeps the hook's word
-  that it is exact only if that changes nothing. A second hook for the same
+  that preview is the item's `input_preview`. A call that may hold a
+  credential sends no preview at all: one with a recognizable token shape
+  anywhere in its input, keys included (API keys and tokens, a private key's
+  BEGIN or END line, a URL's password), a secret-sounding word or name segment
+  (`password`, `passwd`, `pass`, `pwd` but not the bare `PWD`, `OLDPWD` or
+  `$(pwd)`, `secret`, `credential(s)`, `token`, `apikey`, `api_key`,
+  `access_key`, `private_key`, `authorization`, `bearer`, `cookie`, split on
+  `_ - . /`, spaces, `=`, `:` and camelCase), or more than 256 KiB of text;
+  its item shows "Preview withheld: it may contain a credential." and takes
+  `deny` only. A false positive costs only Allow and the preview for that
+  call. Known limit: a password with no recognizable shape and no
+  secret-sounding name next to it (`sshpass -p x`, `mysql -px`, a name like
+  `PGPASSWORD` whose secret word is not its own segment) is not caught.
+  Everything else in the preview that differs from the call shows and makes it
+  inexact, and then the item takes `deny` only: a field cut in its middle or
+  left out, with a marker; every character outside ASCII but letters, numbers,
+  punctuation and symbols (blanks other than the ASCII space, combining marks,
+  format, private-use and unassigned characters, lone surrogates, DEL, C1
+  controls, line and paragraph separators), and the letters and symbols that
+  look blank (Hangul fillers, the braille blank, variation selectors), written
+  as their JSON escapes; and a run of more than 16 spaces, which could push
+  the rest of a command out of sight, shown as a marker (indentation stays
+  exact). Text that reads right to left (Hebrew, Arabic, Arabic-Indic digits)
+  is shown as it is but makes the preview inexact. JSON's own escapes (`\n`,
+  `\"`, `\u0001`) keep it exact. The worker cleans the preview once more and
+  keeps the hook's word that it is exact only if that changes nothing and
+  nothing in it reads right to left. A second hook for the same
   prompt takes every reply away while it waits, and one with another preview
   takes them away for good, so a command the session runs can block replies
   but never approve a call. It gives Claude Code `allow`, or `deny` with the
@@ -1870,13 +1884,19 @@ questions (details off, or the detail cut for size):
   process) is gone with that process. An allow counts as `applied` when the
   session leaves `waiting` for `busy` within 2 seconds of the hook taking it.
   Claude goes on after a hook's deny as after a Yes or a No at the Mac, so a
-  deny counts only once the turn's next signal shows the call did not run: the
-  main thread's `Stop` (for a subagent's prompt, that subagent's `SubagentStop`
-  or next `PermissionRequest`) with no `PostToolUse` or `PostToolUseFailure`
-  for that call within 1.5 seconds after it. The call's own `PostToolUse`
-  means the Mac's Yes won (`answered_on_mac`); another call's signal decides
-  nothing. A No at the Mac within 2 seconds of the watch's Deny looks the same
-  and is credited to the watch; the call is denied either way.
+  deny settles 1.5 seconds after it was handed over, or after the session was
+  first seen leaving `waiting` if that is later: `applied` and
+  `answered_from_watch` when the session left `waiting` (for `busy` or `idle`)
+  within 2 seconds of the hand-over and no `PostToolUse` or
+  `PostToolUseFailure` of that call came meanwhile; `answered_on_mac` when that
+  call's signal came (the Mac's Yes won), the session never left `waiting` (the
+  next queued dialog showed at once) or left it later; `session_ended` when the
+  session ended first. Another call's signal, the turn's `Stop` and the
+  subagent's next call decide nothing. Until it settles, the denied prompt
+  counts as queued beside prompts recorded before its session left `waiting`,
+  never beside later ones. Known imprecision: a No at the Mac within 2 seconds
+  of the watch's Deny, or a Yes at the Mac whose call runs longer than the
+  grace, is credited to the watch.
 - A permission prompt in a session with the channel takes `deny`, and `allow`
   while details are on (the phone then shows the call as Claude Code previews
   it to the channel). It takes either only when the channel's request is
@@ -1889,8 +1909,15 @@ questions (details off, or the detail cut for size):
 - A question takes `answer` while exactly one synchronous hook waits for that
   very question (the one Claude Code ran with it), details are on, the item
   shows the questions that hook sent, and the hook says they are whole (none
-  past the caps, cut, cleaned to nothing, or with a character written as its
-  escape); a notice's own word never makes a question answerable. A notice
+  past the caps, cut, changed by cleaning or masking, or with a character
+  written as its escape or reading right to left, a run of more than 16
+  spaces, or more than two line breaks in a row in a question's text, with
+  `\r\n` one break, and breaks with only spaces or tabs between them in a row); a
+  notice's own word never makes a question answerable, and neither does an
+  older hook's `answerable` (the hook's word is now `whole`). A notice from an
+  older hook still running across an update is taken with its questions
+  cleaned again and its `answerable` dropped, and the worker masks the
+  `description` and `last_message` of every notice again. A notice
   whose questions differ from its hook's, or two hooks with different
   questions, leave the question without an answer for good, so a forged
   notice can never relabel the options the hook answers by position. Any
@@ -1935,7 +1962,9 @@ call's `PostToolUse` or `PostToolUseFailure` after an allow (also when the
 turn's `Stop` or the subagent's `SubagentStop` comes first; without it the
 item closes 1.5 seconds later as `answered_on_mac`), the `Stop` that
 follows a channel deny (a "No" at the Mac fires none), a subagent's next call
-after a deny of its prompt, a `PostToolUse` carrying the chosen options, or
+after a channel deny of its prompt, the end of a waiting hook's deny's grace
+without that call's own signal (above), a `PostToolUse` carrying the chosen
+options, or
 the channel turn carrying the message's own token. Otherwise the item closes
 with its usual reason and the reply stays `sent`.
 
@@ -1943,8 +1972,8 @@ Always sent: the kind, the provider, a session label, the time and an opaque
 folder ID. With details on, also the folder's name (an approved Remote tasks
 folder's label is always sent), the tool name and, for `Bash`, the model's own
 description of the command (never the command itself; for a prompt that takes
-replies, the preview of the call, which shows the command with credentials
-masked), a question with its
+replies, the preview of the call, withheld for a call that may hold a
+credential), a question with its
 header and option labels, and the first 1,000 characters of the session's
 last message. Never sent: prompts the owner typed, transcripts, account data
 or a tool's raw input.

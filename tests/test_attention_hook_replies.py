@@ -19,7 +19,7 @@ from openswap import attention
 from openswap.settings import AttentionSettings
 from openswap.worker import attention as store_module
 from openswap.worker import channel_link, ipc, peers
-from openswap.worker.attention import AttentionStore, SessionRecord, shown_questions
+from openswap.worker.attention import AttentionStore, SessionRecord, shown_questions, validate_notice
 from openswap.worker.peers import Process
 from tests.test_attention_replies import (  # noqa: F401 (fixtures)
     CHANNEL, CLAUDE, PID, QUESTIONS, SESSION, Env, FakeLink, _hooks_run_under_the_test, _running, bash, env, hook,
@@ -149,8 +149,8 @@ def test_a_permission_hook_needs_a_tool_name_and_a_tool_key(desktop, tool_name, 
     ("npm test", ["allow", "deny"]), ("cat <<EOF\nline\nEOF", ["allow", "deny"]),
     ("deploy --token sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWx", ["deny"]), ("deploy --password hunter2", ["deny"]),
     ("x" * 5000, ["deny"]), ("echo \u202eevil", ["deny"]), ("echo a\u200bb", ["deny"]),
-    ("echo ok" + " " * 40 + "&& rm -rf ~", ["deny"]),
-], ids=["plain", "multi-line", "masked token", "masked name", "cut", "bidi", "zero-width", "spaces"])
+    ("echo ok" + " " * 40 + "&& rm -rf ~", ["deny"]), ("echo \u05e9\u05dc\u05d5\u05dd", ["deny"]),
+], ids=["plain", "multi-line", "token shape", "secret name", "cut", "bidi", "zero-width", "spaces", "right to left"])
 def test_f1_allow_only_for_a_preview_that_shows_the_call_exactly(desktop, command, actions):
     item = desktop.prompt(command, relay=False)
     waiter = desktop.permission(item, command)
@@ -267,17 +267,18 @@ def test_row4_an_allow_wins_only_when_the_dialog_closed_its_way(desktop, status,
     assert desktop.outcomes() == ({"r1": "applied"} if won else {})
 
 
-# --- F8: a hook's Deny is credited only when the call didn't run ------------------------------
+# --- G1: a hook's Deny settles at the end of its grace -----------------------------------------
 
 
-def _denied(desktop, agent=""):
-    """A prompt whose own hook took the watch's Deny; the dialog then closed within CONFIRM_SECONDS."""
+def _denied(desktop, agent="", closed=0.5):
+    """A prompt whose own hook took the watch's Deny; the dialog then closed ``closed`` seconds later."""
     item = desktop.prompt(relay=False, agent=agent or None)
     waiter = desktop.permission(item, agent=agent)
     desktop.reply(item.id, "deny")
     desktop.store.handed_over(waiter.reply_id)
     assert desktop.outcomes() == {"r1": "sent"}
-    desktop.status("busy", desktop.clock.now + 0.5)  # a hook's deny lets Claude go on
+    if closed is not None:
+        desktop.status("busy", desktop.clock.now + closed)  # a hook's deny lets Claude go on
     return item
 
 
@@ -286,59 +287,89 @@ def _after_grace(desktop):
     desktop.store.tick()
 
 
+@pytest.mark.parametrize("stop", [False, True], ids=["no Stop", "Stop"])
 @pytest.mark.parametrize("status", ["busy", "idle"])
-def test_f8_a_hook_deny_is_credited_once_the_turn_ends_without_the_call(desktop, status):
-    item = _denied(desktop)
-    desktop.status(status, desktop.clock.now + 0.6)
-    desktop.clock.now += 60
+def test_g1_a_hook_deny_is_applied_once_its_grace_passes_without_the_call(desktop, status, stop):
+    item = _denied(desktop, closed=None)
+    desktop.status(status, desktop.clock.now + 0.5)
+    if stop:
+        desktop.store.notice(hook("Stop") | desktop.at(0.8))  # the turn ended: still not before the grace
     desktop.store.tick()
-    assert desktop.closes() == {} and desktop.outcomes() == {}  # the turn runs on: not decided yet
-    desktop.store.notice(hook("Stop") | desktop.at(0))
-    assert desktop.closes() == {}
+    assert desktop.closes() == {} and desktop.outcomes() == {}  # the call's own signal may still come
     _after_grace(desktop)
     assert desktop.closes() == {item.id: "answered_from_watch"} and desktop.outcomes() == {"r1": "applied"}
 
 
-@pytest.mark.parametrize("post_first", [True, False])
-def test_f8_the_calls_own_post_tool_use_means_the_mac_said_yes(desktop, post_first):
+@pytest.mark.parametrize("event", ["PostToolUse", "PostToolUseFailure"])
+@pytest.mark.parametrize("stop_first", [False, True])
+def test_g1_the_calls_own_signal_within_the_grace_means_the_mac_said_yes(desktop, event, stop_first):
     item = _denied(desktop)
-    signals = [hook("PostToolUse", tool_name="Bash", tool_input=bash("npm test")) | desktop.at(1),
-               hook("Stop") | desktop.at(2)]
-    for notice in signals if post_first else signals[::-1]:
+    signals = [hook(event, tool_name="Bash", tool_input=bash("npm test")) | desktop.at(0.6),
+               hook("Stop") | desktop.at(0.9)]
+    for notice in signals[::-1] if stop_first else signals:
         desktop.store.notice(notice)
     _after_grace(desktop)
     assert desktop.closes() == {item.id: "answered_on_mac"} and desktop.outcomes() == {}
 
 
-def test_f8_the_session_ending_first_credits_nothing(desktop):
+def test_g1_the_session_ending_first_credits_nothing(desktop):
     item = _denied(desktop)
     desktop.store.notice(hook("SessionEnd") | desktop.at(1))
     _after_grace(desktop)
     assert desktop.closes() == {item.id: "session_ended"} and desktop.outcomes() == {}
 
 
-def test_f8_a_sibling_calls_signal_never_decides(desktop):
-    item = _denied(desktop)
-    desktop.store.notice(hook("PostToolUse", tool_name="Bash", tool_input=bash("ls")) | desktop.at(1))
-    desktop.store.notice(hook("SubagentStop", agent_id="a9") | desktop.at(1))
+def test_g1_a_session_still_waiting_when_the_grace_from_the_hand_over_ends_closes_on_the_mac(desktop):
+    item = _denied(desktop, closed=None)
+    desktop.status("waiting", desktop.clock.now + 0.3)  # the next queued dialog showed at once
     _after_grace(desktop)
-    assert desktop.closes() == {} and desktop.outcomes() == {}
+    assert desktop.closes() == {item.id: "answered_on_mac"} and desktop.outcomes() == {}
+
+
+def test_g1_a_sibling_calls_signal_never_decides(desktop):
+    item = _denied(desktop)
+    desktop.store.notice(hook("PostToolUse", tool_name="Bash", tool_input=bash("ls")) | desktop.at(0.6))
+    desktop.store.notice(hook("SubagentStop", agent_id="a9") | desktop.at(0.7))
+    _after_grace(desktop)
+    assert desktop.closes() == {item.id: "answered_from_watch"} and desktop.outcomes() == {"r1": "applied"}
 
 
 @pytest.mark.parametrize("signal", ["SubagentStop", "PermissionRequest"])
-def test_f8_a_subagents_denied_prompt_is_credited_at_its_own_agents_next_signal(desktop, signal):
+def test_g1_a_subagents_denied_prompt_settles_at_its_grace_whatever_its_agent_does_next(desktop, signal):
     item = _denied(desktop, agent="a1")
-    desktop.store.notice(hook("Stop") | desktop.at(1))  # the main thread's turn: not this agent's
-    _after_grace(desktop)
-    assert desktop.closes() == {}
     if signal == "SubagentStop":
-        desktop.store.notice(hook("SubagentStop", agent_id="a1") | desktop.at(1))
+        desktop.store.notice(hook("SubagentStop", agent_id="a1") | desktop.at(0.8))
     else:
         desktop.store.notice(hook("PermissionRequest", tool_name="Bash", tool_input=bash("ls"), agent_id="a1")
-                             | desktop.at(1))
+                             | desktop.at(0.8))
     assert desktop.closes() == {}
     _after_grace(desktop)
     assert desktop.closes() == {item.id: "answered_from_watch"} and desktop.outcomes() == {"r1": "applied"}
+
+
+def test_g1_a_denied_prompt_is_not_queued_beside_a_prompt_recorded_after_its_exit(desktop):
+    _denied(desktop)
+    t = desktop.clock.now
+    desktop.store.notice(hook("PermissionRequest", tool_name="Bash", tool_input=bash("npm run lint")) | {"at": t + 1})
+    desktop.status("waiting", t + 0.9)
+    retry = next(i for i in desktop.store._items if i.created_at == t + 1)
+    waiter = desktop.permission(retry, "npm run lint")
+    desktop.status("busy", t + 1.2)  # answered at the Mac while the denied one is in its grace
+    assert desktop.store.waiter_over(waiter)
+
+
+def test_g1_a_prompt_queued_beside_the_denied_one_keeps_its_hook_and_takes_a_reply_after(desktop):
+    first = desktop.prompt(relay=False)
+    second = desktop.prompt("npm run lint", relay=False, agent="a1")
+    hooks = [desktop.permission(first), desktop.permission(second, "npm run lint", agent="a1")]
+    desktop.reply(first.id, "deny")
+    desktop.store.handed_over(hooks[0].reply_id)
+    desktop.status("busy", desktop.clock.now + 0.5)
+    assert not desktop.store.waiter_over(hooks[1])
+    desktop.status("waiting", desktop.clock.now + 0.8)  # the queued dialog shows
+    _after_grace(desktop)
+    assert desktop.closes() == {first.id: "answered_on_mac"}  # sent while another prompt waited: never credited
+    assert not desktop.store.waiter_over(hooks[1]) and desktop.actions(second) == ["allow", "deny"]
 
 
 def test_a_hook_that_sent_no_preview_takes_deny_only(desktop):
@@ -470,9 +501,10 @@ def test_f6_unreadable_settings_keep_waiting_hooks_and_refuse_replies(desktop):
     desktop.switches = AttentionSettings(notices=False, details=False, replies=False, readable=False)
     desktop.store.tick()
     assert not desktop.store.waiter_over(waiter)
-    assert desktop.permission(item) is not None  # a hook starting now registers and waits too
     desktop.reply(item.id, "deny", offered=False)
     assert desktop.outcomes() == {"r1": "refused"} and not waiter.done.is_set()
+    desktop.store.end_waiter(waiter)
+    assert desktop.permission(item) is not None  # a hook starting now registers and waits too
 
 
 @pytest.mark.parametrize(("notices", "replies"), [(False, True), (False, False), (True, False)])
@@ -646,9 +678,7 @@ def test_row13_the_permission_hook_prints_only_the_watchs_verdict(tmp_path, monk
     stdin = json.dumps({"session_id": SESSION, "tool_name": "Bash", "tool_input": tool_input}).encode()
     out = _run_hook(monkeypatch, stdin, root)
     assert seen[0] == {"version": 1, "command": "permission", "session_id": SESSION,
-                       "tool_key": attention.tool_key(tool_input), "tool_name": "Bash",
-                       "preview": attention.input_preview(tool_input)[0]}  # masked: no "exact"
-    assert "abc123" not in seen[0]["preview"]
+                       "tool_key": attention.tool_key(tool_input), "tool_name": "Bash"}  # withheld: no preview
     if decision is None:
         assert out == ""
     else:
@@ -672,8 +702,9 @@ def test_the_permission_hook_says_when_its_preview_shows_the_call_exactly(tmp_pa
     assert seen[0]["preview"] == attention.input_preview(bash("npm test"))[0] and seen[0]["exact"] is True
 
 
-@pytest.mark.parametrize("kind", ["permission", "question"])
+@pytest.mark.parametrize("kind", ["permission", "question", "older question"])
 def test_what_a_hook_sends_of_its_prompt_reaches_its_waiter(desktop, monkeypatch, kind):
+    older, kind = kind == "older question", kind.split()[-1]
     process = Process(PID + 9, PID, "Fri Nov  6 14:00:03 2026", ("openswap", "attention", kind))
     monkeypatch.setattr(peers, "peer_pid", lambda _c: process.pid)
     monkeypatch.setattr(peers, "hook_claude", lambda pid: CLAUDE)
@@ -684,8 +715,9 @@ def test_what_a_hook_sends_of_its_prompt_reaches_its_waiter(desktop, monkeypatch
                    "exact": True}
     else:
         shown = shown_questions(QUESTIONS)
+        # An older question hook said "answerable", by older rules: only the new hook's "whole" counts.
         request = {"tool_key": attention.question_key({"questions": QUESTIONS}), "questions": shown,
-                   "answerable": True}
+                   "answerable" if older else "whole": True}
     stop = threading.Event()
     a, b = socket.socketpair()
     with a, b:
@@ -696,13 +728,13 @@ def test_what_a_hook_sends_of_its_prompt_reaches_its_waiter(desktop, monkeypatch
         while not desktop.store._waiters and time.monotonic() < deadline:
             time.sleep(0.01)
         [waiter] = desktop.store._waiters
-        assert waiter.shown == shown and waiter.whole is True
+        assert waiter.shown == shown and waiter.whole is not older
         stop.set()
         serving.join(5)
 
 
 # The largest questions the report shows, in characters JSON escapes as two surrogates each.
-WORST = [{"question": "😀" * 1000, "header": "😀" * 100, "options": [{"label": "😀" * 100}] * 4}] * 4
+WORST = [{"question": "\u00e9" * 1000, "header": "\u00e9" * 100, "options": [{"label": "\u00e9" * 100}] * 4}] * 4
 
 
 def _ask_hook(monkeypatch, root, questions) -> str:
@@ -719,7 +751,7 @@ def test_f4_a_question_hooks_request_with_the_largest_questions_fits_what_the_wo
     sizes = []
     root, seen = _worker(tmp_path, {"answers": None}, sizes)
     assert _ask_hook(monkeypatch, root, WORST) == ""
-    assert seen[0]["questions"] == shown_questions(WORST) and seen[0]["answerable"] is True
+    assert seen[0]["questions"] == shown_questions(WORST) and seen[0]["whole"] is True
     assert sizes[0] <= ipc.MAX_REQUEST_BYTES
 
 
@@ -730,10 +762,9 @@ def test_f4_a_request_past_what_the_worker_reads_is_never_sent(tmp_path, monkeyp
     assert _ask_hook(monkeypatch, tmp_path, QUESTIONS) == "" and connected == []
 
 
-def test_f2_token_shapes_in_claudes_own_words_are_masked(monkeypatch):
-    notice = hook("PermissionRequest", tool_name="Bash", tool_input={
-        "command": "git push", "description": f"Push with ghp_{SECRET} (PASSWORD=hunter2)"})
-    assert notice["description"] == "Push with [REDACTED] (PASSWORD=hunter2)"
+def test_token_shapes_and_header_values_in_claudes_own_words_are_masked(monkeypatch):
+    stop = hook("Stop", last_assistant_message="Use Bearer authentication with Authorization: Basic Zq9 here.")
+    assert stop["last_message"] == "Use Bearer authentication with Authorization: [REDACTED]"
     stop = hook("Stop", last_assistant_message="Set " + "x" * 975 + f" ghp_{SECRET} as the token.")
     assert len(stop["last_message"]) == 1000 and not _leaks(stop["last_message"], SECRET)
     for event, data in (("PermissionRequest", {"tool_name": "Bash", "tool_input": {
@@ -763,7 +794,7 @@ def test_only_openswaps_permission_command_is_served(desktop, monkeypatch):
     assert desktop.store._waiters == []
 
 
-# --- what the watch shows before Allow (R1a; F1, F2, F3) --------------------------------------
+# --- what the watch shows before Allow (R1a; F1, F3; G2, G3) -----------------------------------
 
 
 def test_the_preview_shows_the_call_in_claude_codes_channel_form():
@@ -777,6 +808,7 @@ def test_the_preview_shows_the_call_in_claude_codes_channel_form():
     bash("npm test"), bash("cat <<EOF\nline one\n\tline two\nEOF"), {"command": 'echo "quoted \\ back"'},
     {"file_path": "/repo/app.py", "content": "def f():\n\treturn 1\n"}, {"command": "echo café ✓ 漢字"},
     {"content": "def f():\n    if x:\n        return 1\n"}, {"command": "echo a" + " " * 16 + "b"},
+    {"command": "printf 'a\x01b'"},
 ])
 def test_a_preview_with_only_jsons_own_escapes_is_exact(tool_input):
     preview, exact = attention.input_preview(tool_input)
@@ -784,23 +816,15 @@ def test_a_preview_with_only_jsons_own_escapes_is_exact(tool_input):
 
 
 @pytest.mark.parametrize(("tool_input", "shown"), [
-    (bash("deploy --token sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWx"), "[REDACTED]"),
-    ({"command": "x", "password": "hunter2"}, '"password": "[REDACTED]"'),
     ({"command": "a" * 5000}, "the middle left out"),
     ({f"f{i}": i for i in range(200)}, "fields left out"),
-    ({"command": "echo \u202eevil"}, "\\u202e"), ({"command": "echo a\u200bb"}, "\\u200b"),
-    ({"command": "echo a\u2028b"}, "\\u2028"), ({"command": "echo a\x7fb"}, "\\u007f"),
-    ({"command": "echo a\x85b"}, "\\u0085"), ({"command": "echo a\ud800b"}, "\\ud800"),
-    ({"command": "echo \U000e0041"}, "\\udb40\\udc41"),
     ({"command": "echo ok" + " " * 40 + "&& rm -rf ~"}, "40 spaces"),
     ({"content": "def f():\n" + " " * 17 + "return 1\n"}, "17 spaces"),
     ({"value": float("nan")}, "unserializable"),
 ])
 def test_a_preview_that_changes_anything_is_not_exact_and_shows_the_change(tool_input, shown):
     preview, exact = attention.input_preview(tool_input)
-    assert not exact and shown in preview
-    assert not any(c in preview for c in "\u202e\u200b\u2028\x7f\x85\ud800\U000e0041")
-    assert " " * 17 not in preview
+    assert not exact and shown in preview and " " * 17 not in preview
 
 
 def test_a_field_cut_to_the_smallest_share_still_shows_its_marker():
@@ -819,6 +843,17 @@ def test_a_long_call_is_cut_in_the_middle_of_each_field_within_the_cap():
     assert "the middle left out" in preview
 
 
+@pytest.mark.parametrize("tool_input", [
+    {"command": "x" * 300_000}, {f"{i}": "a" * 30 for i in range(500_000)}, {"a": "x" * 300_000, "b": "y" * 300_000},
+    {"command": "echo " + "é" * 200_000}, {"command": "echo " + "\u00a0" * 200_000}, {"command": "\x01" * 200_000},
+    {"command": "token=$( " * 29_000},
+], ids=["past the budget", "many fields", "two big fields", "letters", "blanks", "controls", "token words"])
+def test_the_preview_of_a_hostile_input_is_bounded(tool_input):
+    started = time.perf_counter()
+    preview, exact = attention.input_preview(tool_input)
+    assert time.perf_counter() - started < 1.0 and len(preview) <= 4000
+
+
 SECRET = "Zq9Xw7Vu5Ts3Rq1Po8Nm6Lk4Jh2Gf0Ed"
 
 
@@ -826,35 +861,132 @@ def _leaks(preview: str, secret: str) -> bool:
     return any(secret[i:i + 6] in preview for i in range(len(secret) - 5))
 
 
-@pytest.mark.parametrize("secret", [
-    f"ghp_{SECRET}", f"TOKEN={SECRET}",
-    f"-----BEGIN RSA PRIVATE KEY-----\n{SECRET * 40}\n-----END RSA PRIVATE KEY-----",
-], ids=["token", "assignment", "key block"])
-def test_no_part_of_a_credential_straddling_a_cut_is_shown(secret):
-    for offset in range(1900, 2050, 7):
-        field = "a" * offset + f" {secret} " + "b" * (4200 - offset)
-        for tool_input in ({"command": field}, {f"f{i}": field[:300] for i in range(3)} | {"z": field}):
-            preview, _ = attention.input_preview(tool_input)
-            assert not _leaks(preview, SECRET)
-
-
-def test_a_key_block_whose_begin_falls_in_the_dropped_middle_is_masked_whole():
-    block = f"-----BEGIN OPENSSH PRIVATE KEY-----\n{SECRET * 200}\n-----END OPENSSH PRIVATE KEY-----"
-    preview, exact = attention.input_preview({"content": "x" * 3000 + block + "\nafter"})
-    assert not exact and not _leaks(preview, SECRET) and "after" in preview
+# --- G3: a call that may hold a credential is withheld -----------------------------------------
 
 
 @pytest.mark.parametrize("tool_input", [
-    {"command": "token" * 8000}, {"command": "--token " * 5000}, {"content": "x" * (32 * 1024 * 1024 - 64)},
-    {f"{i}": "token=" + "a" * 30 for i in range(500_000)}, {"a": "x" * 300_000, "b": "y" * 300_000},
-], ids=["token word", "token flags", "stdin cap", "many fields", "two big fields"])
-def test_the_preview_of_a_hostile_input_is_bounded(tool_input):
-    started = time.perf_counter()
-    preview, exact = attention.input_preview(tool_input)
-    assert time.perf_counter() - started < 1.0 and len(preview) <= 4000
+    bash(f"deploy --token ghp_{SECRET}"), bash(f"PGPASSWORD=x DB_PASSWORD={SECRET} psql"),
+    {"command": "deploy", "env": [{"apiKey": SECRET}]}, {"content": f"{SECRET}\n-----END RSA PRIVATE KEY-----"},
+    {"command": f"git clone https://ann:{SECRET}@x.test/r.git"}, {"content": SECRET + "x" * 300_000},
+], ids=["token shape", "secret name", "nested key", "key block's end", "URL password", "past the budget"])
+def test_g3_a_call_that_may_hold_a_credential_is_withheld_and_takes_deny_only(desktop, tool_input):
+    assert attention.input_preview(tool_input) == ("", False)
+    notice = hook("PermissionRequest", tool_name="Bash", tool_input=tool_input)
+    assert notice["description"] == attention.PREVIEW_WITHHELD and not _leaks(json.dumps(notice), SECRET)
+    t = desktop.clock.now
+    desktop.store.notice(notice | {"at": t + 0.1})
+    desktop.status("waiting", t + 0.05)
+    desktop.store.notice(hook("Notification", notification_type="permission_prompt") | {"at": t + 6.1})
+    desktop.clock.now = t + 7
+    [item] = desktop.store._items
+    now, desktop.clock.now = desktop.clock.now, item.created_at
+    desktop.store.waiter("permission", CLAUDE, SESSION, attention.tool_key(tool_input), tool_name="Bash",
+                         shown=attention.input_preview(tool_input)[0])
+    desktop.clock.now = now
+    [entry] = desktop.report()["items"]
+    assert entry["detail"] == {"tool_name": "Bash", "description": attention.PREVIEW_WITHHELD}
+    assert entry["actions"] == ["deny"]
 
 
-def test_a_field_too_big_to_mask_is_left_out_with_a_marker():
-    preview, exact = attention.input_preview({"file_path": "/repo/big.txt", "content": f"TOKEN={SECRET} " * 40_000})
-    assert not exact and '"file_path": "/repo/big.txt"' in preview and "characters left out" in preview
-    assert not _leaks(preview, SECRET)
+def test_g3_an_ordinary_call_keeps_its_preview_and_allow(desktop):
+    item = desktop.prompt("pytest tests/test_auth.py::test_max_tokens && cd $PWD", relay=False)
+    desktop.permission(item, "pytest tests/test_auth.py::test_max_tokens && cd $PWD")
+    assert "cd $PWD" in item.detail["input_preview"] and desktop.actions(item) == ["allow", "deny"]
+
+
+# --- G2: only what shows as it reads counts as exact -------------------------------------------
+
+
+SHOWN_AS_IS = "café naïve ß ñ 漢字 ✓ → € ½ ™"
+HIDDEN = ["\u00a0", "\u2007", "\u3000", "\u0301", "\u20dd", "\ue000", "\u0378", "\ufeff", "\u200b", "\u202e",
+          "\u2028", "\u2029", "\x7f", "\x85", "\ud800", "\u115f", "\u1160", "\u3164", "\uffa0", "\u2800",
+          "\u034f", "\u17b4", "\u17b5", "\u180b", "\u180f", "\ufe00", "\ufe0f", "\U000e0100", "\U000e01ef",
+          "\U000e0041"]
+RIGHT_TO_LEFT = ["\u05e9\u05dc\u05d5\u05dd", "\u0645\u0631\u062d\u0628\u0627", "\u0661\u0662\u0663"]
+
+
+def _whole(**entry):
+    return store_module.questions_whole([{"question": "Pick one?", "header": "DB", "options": [{"label": "A"}],
+                                          **entry}])
+
+
+def test_g2_letters_numbers_punctuation_and_symbols_show_as_they_are():
+    preview, exact = attention.input_preview({"command": f"echo {SHOWN_AS_IS}"})
+    assert exact and SHOWN_AS_IS in preview
+    assert _whole(question=f"Pick {SHOWN_AS_IS}?", header="Ü", options=[{"label": SHOWN_AS_IS}])
+
+
+@pytest.mark.parametrize("char", HIDDEN, ids=lambda c: f"U+{ord(c):04X}")
+def test_g2_a_hidden_or_blank_looking_character_is_shown_escaped_and_never_exact(char):
+    escaped = json.dumps(char)[1:-1]
+    preview, exact = attention.input_preview({"command": f"echo a{char}b"})
+    assert not exact and f"a{escaped}b" in preview and char not in preview
+    assert store_module.escape_hidden(f"a{char}b") == f"a{escaped}b"
+    for entry in ({"question": f"Pick{char}?"}, {"header": f"D{char}B"}, {"options": [{"label": f"A{char}"}]}):
+        assert not _whole(**entry)
+    [shown] = shown_questions([{"question": f"Pick{char}?", "header": f"D{char}B", "options": [f"A{char}"]}])
+    assert shown == {"question": f"Pick{escaped}?", "header": f"D{escaped}B", "options": [f"A{escaped}"]}
+
+
+@pytest.mark.parametrize("text", RIGHT_TO_LEFT)
+def test_g2_right_to_left_text_is_shown_as_it_is_but_never_exact(text):
+    preview, exact = attention.input_preview({"command": f"echo {text}"})
+    assert not exact and text in preview
+    for entry in ({"question": f"Pick {text}?"}, {"header": text}, {"options": [{"label": text}]}):
+        assert not _whole(**entry)
+
+
+@pytest.mark.parametrize(("question", "whole"), [
+    ("One\n\nTwo", True), ("One\r\n\r\nTwo", True), ("One\n\r\nTwo\n\nThree", True),
+    ("One\n\n\nTwo", False), ("One\n \n\t\nTwo", False), ("One\r\n\r\n\r\nTwo", False), ("One\r\r\rTwo", False),
+    ("A" + " " * 16 + "B", True), ("A" + " " * 17 + "B", False), (" Leading", False), ("Bell\x07", False),
+    ("Q" * 1000, True), ("Q" * 1001, False), ("Uses Bearer authentication?", True),
+    (f"Use ghp_{SECRET}?", False), ("Send Authorization: Basic Zq9?", False),
+])
+def test_g2_question_text_is_whole_only_while_nothing_could_hide_or_change_part_of_it(question, whole):
+    assert _whole(question=question) is whole
+
+
+@pytest.mark.parametrize("entry", [
+    {"header": "H" * 101}, {"header": " DB"}, {"header": "Line\nbreak"}, {"header": "A" + " " * 17 + "B"},
+    {"header": None}, {"options": [{"label": "A" + " " * 17 + "B"}]}, {"options": [{"label": f"ghp_{SECRET}"}]},
+])
+def test_g2_a_header_or_option_that_could_hide_or_change_part_of_itself_takes_no_answer(entry):
+    assert _whole(header="DB") and not _whole(**entry)
+
+
+def test_g2_a_question_shows_its_token_shapes_masked():
+    [shown] = shown_questions([{"question": f"Use ghp_{SECRET}?", "options": [f"ghp_{SECRET}"]}])
+    assert shown == {"question": "Use [REDACTED]?", "options": ["[REDACTED]"]}
+
+
+def test_g2_the_worker_takes_no_exact_or_whole_claim_for_text_that_reads_right_to_left(desktop):
+    text = RIGHT_TO_LEFT[0]
+    item = desktop.prompt(relay=False)
+    desktop.permission(item, preview=f'{{ "command": "echo {text}" }}', exact=True)
+    assert desktop.actions(item) == ["deny"]
+    questions = [{"question": f"Pick {text}?", "options": [{"label": "A"}, {"label": "B"}]}]
+    waiter = desktop.store.waiter("question", CLAUDE, SESSION, attention.question_key({"questions": questions}),
+                                  shown=shown_questions(questions), whole=True)
+    assert waiter is not None and not waiter.whole
+
+
+# --- G4: notices from older hooks ---------------------------------------------------------------
+
+
+def test_g4_an_older_hooks_notice_is_accepted_with_its_text_cleaned_and_its_claim_ignored():
+    notice = validate_notice({
+        "provider": "claude", "event": "PermissionRequest", "session_id": SESSION, "cwd": "/x",
+        "tool_name": "AskUserQuestion", "tool_key": "a" * 32, "answerable": True,
+        "questions": [{"question": "Pick\u00a0one?", "header": "D\u200bB", "options": ["A", "B\u202e"]}]})
+    assert "answerable" not in notice
+    assert notice["questions"] == [{"question": "Pick\\u00a0one?", "header": "D\\u200bB",
+                                    "options": ["A", "B\\u202e"]}]
+
+
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+def test_g4_the_worker_masks_the_prose_of_every_notice(provider):
+    for event, field in (("PermissionRequest", "description"), ("Stop", "last_message")):
+        notice = validate_notice({"provider": provider, "event": event, "session_id": SESSION, "cwd": "/x",
+                                  field: f"Push ghp_{SECRET} with Cookie: sid=Zq9"})
+        assert notice[field] == "Push [REDACTED] with Cookie: [REDACTED]"

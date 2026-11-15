@@ -584,7 +584,7 @@ def test_the_question_hook_prints_a_decision_only_for_a_fitting_answer(tmp_path,
     assert attention.question_main(backup_root=root) == 0
     assert seen[0] == {"version": 1, "command": "question", "session_id": SESSION,
                        "tool_key": attention.question_key(tool_input), "questions": shown_questions(QUESTIONS),
-                       "answerable": True}
+                       "whole": True}
     if printed:
         decision = json.loads(out.getvalue())["hookSpecificOutput"]["decision"]
         assert decision == {"behavior": "allow", "updatedInput": {**tool_input,

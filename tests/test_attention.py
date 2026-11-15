@@ -103,12 +103,12 @@ def closes(store):
 
 
 def test_hook_input_maps_to_its_notice_and_never_carries_raw_tool_input():
-    notice = permission(command="curl https://x?token=secret")
+    notice = permission(command="curl https://x?q=raw-input")
     assert notice["event"] == "PermissionRequest" and notice["tool_name"] == "Bash"
     assert notice["description"] == "Run the tests"
-    assert "secret" not in json.dumps(notice)
+    assert "raw-input" not in json.dumps(notice)
     assert len(notice["tool_key"]) == 32
-    assert post(command="curl https://x?token=secret")["tool_key"] == notice["tool_key"]
+    assert post(command="curl https://x?q=raw-input")["tool_key"] == notice["tool_key"]
     assert hook("Notification", notification_type="idle_prompt")["notification_type"] == "idle_prompt"
     stop = hook("Stop", last_assistant_message="Done.\x1b[31m\nAll green " + "x" * 2000)
     assert stop["last_message"].startswith("Done. [31m\nAll green") and len(stop["last_message"]) == 1000
