@@ -198,3 +198,23 @@ line.
     costs only Allow; a miss sends a password off the Mac. Made inline
     (1834993); suite 7536 passed.
 - Review round 3 dispatched on 5828809..1834993: the same four Opus seats.
+
+### Task 1 review round 3 (5828809..1834993; four Opus seats)
+
+| Finding | Seat(s) | Severity | Disposition |
+|---|---|---|---|
+| Channel sessions: a credential call pairs with Claude Code's preview, which overwrites the withheld line, and Allow is offered | API, silent, hook | Critical | H1 |
+| Missing names: `passphrase`, `*_KEY`, `pw`, `auth`, `-u user:pass`, colon-less URL userinfo, `accesstoken` | silent, hook | Critical (data) | H2 |
+| U+1D159 and the musical format characters aren't escaped | hook | Critical (rendering-dependent; same class as G2) | H3 |
+| A token right after an escaped character in question text isn't masked | worker | Critical (data) | H4 |
+| Tab runs in question text pass "whole" | API, hook, worker | Important | H5 |
+| Prose headers in quoted or prefixed form aren't masked | hook | Important | H6 |
+| Codex's description isn't withheld for credential calls | silent | Important | H1 |
+| A hook Deny's grace (1.5 s) is shorter than the confirm window (2 s) | worker | Important | H7 |
+| Three G1 lines are untested or tests can't fail for their reason | worker | Minor (tests) | H8 |
+| A Mac Yes in the hook-read window, with a call longer than the grace, is credited to the watch | silent | Important; inside the accepted G1 imprecision | No change; known imprecision |
+| A hostile child as sole waiter: a Deny closes the item early while the dialog waits | API | Important; denial of service only, needs a hostile process | Filed mar3co/openswap#212 |
+| `CHECK_BUDGET` wording, `validate_notice` docstring, a partial `[RED` at the prose cap | API, hook | Minor | ride along |
+
+Round 3 fix notes: planning session scratchpad `028-task1-fix3-notes.md`
+(H1–H8). Ruling check: one Opus pass.
