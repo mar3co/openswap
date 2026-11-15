@@ -599,6 +599,78 @@ def test_a_gone_claude_process_closes_its_items(store):
     assert [c["reason"] for c in closes(items)] == ["session_ended"]
 
 
+def desktop(notice):
+    """As a Claude Desktop session's hook sends it: Claude Code without its terminal screen."""
+    return notice | {"entrypoint": "claude-desktop", "pid": os.getpid()}
+
+
+def test_a_desktop_session_that_finished_its_turn_publishes_after_sixty_seconds(store):
+    items, clock = store
+    items.notice(desktop(hook("Stop", last_assistant_message="All tests pass.")))
+    wait(items, clock, 59)
+    assert published(items) == []
+    wait(items, clock, 1)
+    [item] = published(items)
+    assert (item["kind"], item["detail"]) == ("idle", {"last_message": "All tests pass."})
+    items.notice(desktop(hook("UserPromptSubmit", prompt="next")) | at(clock, 0))
+    assert closes(items) == [{"id": item["id"], "reason": "answered_on_mac"}]
+
+
+def test_a_desktop_prompt_inside_the_wait_closes_it_without_a_report(store):
+    items, clock = store
+    items.notice(desktop(hook("Stop", last_assistant_message="Done.")))
+    items.notice(desktop(hook("UserPromptSubmit", prompt="more")) | at(clock, 30))
+    wait(items, clock, 120)
+    assert published(items) == [] and closes(items) == []
+
+
+@pytest.mark.parametrize("status", ["busy", "waiting"])  # a background task's turn, or its dialog
+def test_a_desktop_session_that_is_not_idle_at_sixty_seconds_waits(store, status):
+    items, clock = store
+    items.notice(desktop(hook("Stop", last_assistant_message="Done.")))
+    items.observe(record(status, clock.now + 10), True)
+    wait(items, clock, 61)
+    assert published(items) == []
+    items.observe(record("idle", clock.now - 1), True)
+    wait(items, clock, 1)
+    assert [i["kind"] for i in published(items)] == ["idle"]
+
+
+def test_a_desktop_session_file_without_a_status_does_not_hold_the_notice(store):
+    items, clock = store
+    items.notice(desktop(hook("Stop", last_assistant_message="Done.")))
+    items.observe(record("", clock.now + 10), True)
+    wait(items, clock, 61)
+    assert [i["kind"] for i in published(items)] == ["idle"]
+
+
+def test_a_desktop_session_cleared_while_the_worker_was_down_is_never_published(store):
+    items, clock = store
+    items.notice(desktop(hook("Stop", last_assistant_message="Done.")))
+    items.observe(record("idle", clock.now + 10, session=OTHER), True)  # the same process, after /clear
+    wait(items, clock, 61)
+    assert published(items) == []
+
+
+def test_a_later_desktop_turn_restarts_the_wait_and_reports_nothing_for_the_first(store):
+    items, clock = store
+    items.notice(desktop(hook("Stop", last_assistant_message="Launched it.")))
+    items.notice(desktop(hook("UserPromptSubmit", prompt="<task-notification>\n<task-id>x</task-id>")) | at(clock, 30))
+    items.notice(desktop(hook("Stop", last_assistant_message="Result is 42.")) | at(clock, 50))
+    wait(items, clock, 61)
+    assert published(items) == []
+    wait(items, clock, 50)
+    [item] = published(items)
+    assert item["detail"] == {"last_message": "Result is 42."} and closes(items) == []
+
+
+def test_a_terminal_session_still_waits_for_claude_codes_own_idle_notice(store):
+    items, clock = store
+    items.notice(hook("Stop", last_assistant_message="Done.") | {"entrypoint": "cli", "pid": os.getpid()})
+    wait(items, clock, 120)
+    assert published(items) == []
+
+
 def test_the_hook_reports_its_claude_code_process_and_surface(monkeypatch):
     monkeypatch.setattr(attention, "claude_pid", lambda: 4242)
     monkeypatch.setenv("CLAUDE_CODE_ENTRYPOINT", "cli")
