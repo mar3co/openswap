@@ -144,3 +144,24 @@ report as inputs.
 - 5828809: both rulings, made inline by the controller (24 lines changed, TDD);
   suite 7482 passed.
 - Review round 2 dispatched on 983c44b..5828809: the same four Opus seats.
+
+### Task 1 review round 2 (983c44b..5828809; four Opus seats)
+
+| Finding | Seat(s) | Severity | Disposition |
+|---|---|---|---|
+| Non-ASCII blanks (U+3000, NBSP, Hangul fillers), variation selectors and combining marks count as exact, so a tail can be pushed out of sight while Allow is offered | API, hook, silent | Critical (approves something not visibly shown) | G2: a safe character set; everything else is escaped and deny-only |
+| A credential used as a nested dict key goes out unmasked with `exact` | hook, silent | Critical (data) | G3 |
+| Masker quadratic on `token=$(`-style input (192 s at 262K) | hook, silent | Important | G3: linear, under 0.5 s |
+| Masker false positives (`git add src/auth.py …`, `fix-auth`, pytest `::`, `grep SECRET_KEY .env`) | hook | Important | G3: scope narrowed |
+| Substitution or variable values masked in quoted, header and `-u` branches | hook | Important | G3 |
+| A value inside an outer quoted string masked to the end of the text | hook | Important | G3 |
+| "Bearer" masked in prose | hook | Important | G3 |
+| F8 holds a hook-denied item open until `Stop`: blocks a retried call, keeps later prompts' hooks alive, sticks after Esc | worker, silent | Important (regression from round 1) | G1: settle at the grace (re-rules F8) |
+| Notices from v0.4.2 hooks rejected after an update | worker | Important | G4 |
+| The watch shows option labels without their descriptions | API | Important, predates plan 028 | Filed as mar3co/openswap#211 (owner decision) |
+| Docstring says 4 spaces; F6 test can't fail for its reason | API, worker, hook | Minor | ride along |
+| A subagent's hook Deny credited when a Mac Yes lands in the hook-read window | silent | Not reachable (millisecond race) | No change |
+
+Controller notes:
+- **The masker is narrowed (G3).** Round 1's F2 asked for more heuristics than the data boundary needs. Plan 025 D1 accepted masking that catches recognizable credentials only, and the heuristics produced most of round 2's findings. `mysql -pX` and `login -p X` drop out of scope as a documented limit.
+- **Convergence.** Most round 2 findings are in code round 1 added. Two Criticals reopen the loop, as the review rules require. Round 3 rewrites the masker to a narrower scope rather than patching it, to converge.
