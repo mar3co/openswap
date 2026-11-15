@@ -11,6 +11,12 @@ release workflow copies that section into the GitHub release, and
 opensoft.me/swap/changelog shows this file.
 -->
 
+## Unreleased
+
+### Fixed
+
+- A Claude Desktop or VS Code session that has finished its turn and waited a minute for you now shows in OpenTag on your iPhone and Apple Watch, as a terminal session already did.
+
 ## 0.4.2 (2026-11-14)
 
 ### New

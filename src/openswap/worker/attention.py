@@ -77,9 +77,14 @@ PROMPT_MATCH_SECONDS = 2.0
 # status is never read as an answer.
 NOT_WAITING = frozenset({"busy", "idle"})
 CODEX_ITEM_SECONDS = 24 * 3600
+# Claude Code's idle wait before its ``idle_prompt``.
+IDLE_NOTICE_SECONDS = 60.0
+# Surfaces that run Claude Code without its terminal screen, which alone sends
+# ``idle_prompt``: their finished turn waits IDLE_NOTICE_SECONDS here instead.
+NO_IDLE_NOTICE = frozenset({"claude-desktop", "claude-vscode"})
 # Claude Code's waits before its own notifications, applied to Codex's items.
 CODEX_PROMPT_SECONDS = PROMPT_NOTICE_SECONDS
-CODEX_FINISHED_SECONDS = 60.0
+CODEX_FINISHED_SECONDS = IDLE_NOTICE_SECONDS
 # The operations Codex logs when a person answers a prompt (any decision).
 CODEX_ANSWER_OPERATIONS = ("exec_approval", "patch_approval", "resolve_elicitation", "user_input_answer",
                            "request_permissions_response")
@@ -1006,6 +1011,11 @@ class AttentionStore:
                 idle = next((i for i in mine if i.kind == "idle" and i.created_at < at), None)
                 if idle is not None:
                     changed = self._idle_again(idle, {**notice, "at": at}, notice.get("last_message", ""))
+                elif notice.get("entrypoint") in NO_IDLE_NOTICE and not any(i.kind == "idle" for i in mine):
+                    # Published by ``tick`` once the session has stayed idle.
+                    self._open("idle", "claude", session, notice, published=False,
+                               detail={"last_message": notice.get("last_message", "")})
+                    changed = True
             # The main thread's turn ended: its own prompts were answered. A
             # background subagent's prompt may still wait, and a late Stop of an
             # earlier turn says nothing about this turn's prompts.
@@ -1319,6 +1329,8 @@ class AttentionStore:
             changed = self._close(expired, "expired") or changed
             waited = [i for i in self._items if i.provider == "codex" and not i.published and now - i.created_at >= (
                 CODEX_FINISHED_SECONDS if i.kind == "finished" else CODEX_PROMPT_SECONDS)]
+            waited += [i for i in self._items if i.provider == "claude" and i.kind == "idle" and not self._shown(i)
+                       and now - i.created_at >= IDLE_NOTICE_SECONDS and self._still_idle(i)]
             # A held prompt already answered at the Mac (awaiting its close) never goes.
             held = [i for i in self._items if i.id in self._held and i.id not in self._due]
             # Nothing new goes while the settings cannot be read.
@@ -1352,6 +1364,12 @@ class AttentionStore:
         return any(i.id != item.id and i.provider == "claude" and i.session == item.session
                    and i.kind in ("permission", "question") and self._same_process(i.session, i.pid, item.pid)
                    and i.created_at < before for i in self._items)
+
+    def _still_idle(self, item: Item) -> bool:
+        """Whether the session file, if one is read and says, still says ``idle``:
+        not a dialog on screen or a turn the owner did not start."""
+        record = self._record_for(item.session, item.pid)
+        return record is None or record.status in ("", "idle")
 
     def _waiting_again(self, item: Item) -> bool:
         """Whether the item's session, having left ``waiting`` (its answer is
