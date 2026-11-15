@@ -368,3 +368,19 @@ silent-failure, API surface; all Opus.
 | Desktop: a woken turn whose prompt notice arrives after its `Stop` leaves no idle item | hook, silent, worker | Important | K4 |
 | A lone-surrogate text makes the hook fail after taking it | silent | Important | K5 |
 | Forged notices block typed replies | API | Important; denial of service only | K6: accepted and documented |
+
+Task 2 fix round 1, pre-dispatch ruling check (Opus, one pass). Amendments:
+- **K1:** pairing at either order of the hook and its notice; exactly one
+  eligible hook pairs (two or more pair none); a hook whose process started more
+  than 2 s before the `Stop` is never eligible; a typed prompt releases only
+  unpaired hooks and hooks paired to an older `Stop`; per-process caps of one
+  paired and two unpaired.
+- **K2:** staleness only by events (a newer prompt, a busy or waiting status, a
+  newer `Stop`), never a time window, which would break Desktop's slow `Stop`
+  hooks.
+- **K3:** a mismatch is a note-carrying prompt with a wrong digest.
+- **K5:** refuse text containing the closing tag; trim U+FEFF.
+- **K6:** "any local process".
+
+Implementer: a fresh Opus agent. The Task 2 implementer is not reused, to stay
+under the context line.
