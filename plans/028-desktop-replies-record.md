@@ -401,3 +401,32 @@ time (`peers.hook_launch`). All six of its judgment calls are accepted:
 - two qualifying hooks are kept waiting, unpaired.
 
 Review: cold, silent-failure, API surface (701 lines), all Opus.
+
+### Task 2 review of d50057e (cold, silent-failure, API surface): per-task loop stops
+
+- **API seat's Critical:** a session command started mid-turn forges a `Stop`
+  and suppresses the real `Stop` notice, so it pairs and receives the typed
+  text. **Adjudicated Important** by effect, consistent with Task 2 round 1:
+  the text was bound for that same session, nothing is approved, and it is the
+  mar3co/openswap#181 class. The docs must stop saying such a shell "never
+  pairs" or that forged notices "never send text elsewhere".
+- **API Important:** a forged note-carrying prompt (unlimited back-dated
+  guesses, or the impostor that holds the text) makes a reply read `applied`.
+  Fix: a woken prompt counts only if dated at or after the hand-over, so a wrong
+  guess after it is a K3 mismatch (one guess); document that an impostor can
+  report `applied`.
+- **Silent and cold:** the launch check compares the notice's late `time.time()`
+  with the wrapper's `ps` start, which can drop the real hook on a slow start.
+  Fix: date the `Stop` by the notice hook's own launch (peer `hook_launch`), so
+  both sides use the same clock.
+- **Silent:** a background subagent's `waiting` dialog counts as a newer turn
+  (K2). Fix: count only `busy`.
+- **Silent:** a lost notice plus a fast background turn (about 100 ms race,
+  predates this round). Filed mar3co/openswap#214.
+- **Minors:** doc wording for an older `Stop` ("pairs nothing") and the 2 s
+  shell case; the `_actions`, `channel_link` and `wake_main` docstrings; the
+  `_gate` order.
+
+All of these are in code the last round added, or are narrow, so by the
+convergence rule they go to the whole-branch final review's single fix
+dispatch, with Task 1's items I-a to I-f.
