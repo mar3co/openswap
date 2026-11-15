@@ -1985,9 +1985,10 @@ questions (details off, or the detail cut for size):
   it, and the process of the hook's line that Claude Code started itself began
   no earlier than the second before the one the `Stop` notice's own hook's line
   began in (both read from `ps`, in whole seconds). When that launch can't be
-  read, or that hook runs under another Claude Code process than the notice
-  names, it must have begun no more than 2 seconds before the `Stop`'s time
-  instead. So a session command started 2 s or more before the `Stop` (a
+  read, that hook runs under another Claude Code process than the notice
+  names, or its line began more than 5 seconds before the `Stop`'s time (so it
+  is not that turn's own `Stop` hook), the hook must have begun no more than 2
+  seconds before the `Stop`'s time instead. So a session command started 2 s or more before the `Stop` (a
   background task's shell, started during the turn) never pairs, unless a
   forged `Stop` notice is used and the real one is suppressed (both need a
   hostile local process). When two hooks qualify, neither pairs and the item

@@ -696,6 +696,18 @@ def test_b2_a_hook_started_two_seconds_or_more_before_the_stop_hooks_own_launch_
     assert (wake(desktop, launched=t + started) is None) is not pairs
 
 
+def test_a_stop_notice_whose_hook_launched_long_before_it_never_vouches_for_a_hook(desktop):
+    t = desktop.clock.now
+    desktop.status("idle", t)
+    desktop.clock.now = t + 60  # a background shell, started at t, sends its own Stop now
+    stop(desktop, launched=t)
+    hostile = wake(desktop, launched=t)  # the same shell runs the wake command
+    desktop.clock.now = t + 125
+    desktop.store.tick()
+    [item] = desktop.store._items
+    assert desktop.actions(item) == [] and (hostile is None or hostile.done.is_set())
+
+
 def test_b2_a_slow_starting_stop_hook_keeps_its_turns_own_wake_hook(desktop):
     t = desktop.clock.now
     desktop.status("idle", t)

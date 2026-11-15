@@ -7,7 +7,7 @@ import time
 
 import pytest
 
-from openswap.redact import CHECK_BUDGET, holds_credential, mask_shapes
+from openswap.redact import REDACTED, CHECK_BUDGET, holds_credential, mask_shapes
 
 SHAPES = [
     "sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWx", "sk-proj-AbCdEfGhIjKlMnOpQrStUvWxYz012345",
@@ -133,6 +133,16 @@ def test_checking_and_masking_a_hostile_input_within_the_budget_is_quick(text):
 @pytest.mark.parametrize("shape", SHAPES)
 def test_prose_has_token_shapes_masked(shape):
     assert mask_shapes(f"Deploy with {shape} now.") == "Deploy with [REDACTED] now."
+
+
+@pytest.mark.parametrize(("text", "hidden"), [
+    ("Run curl -u admin:'p\\'q'r st'uv then", ("st", "uv")),
+    ('Run -u a:\\"\\"SE" CR ok', ("SE", "CR")),
+    ("Run curl -u admin:'it'\\''s secret' x", ("secret",)),
+])
+def test_prose_shows_no_part_of_a_login_password_quoted_as_the_shell_reads_it(text, hidden):
+    shown = mask_shapes(text)
+    assert REDACTED in shown and not any(part in shown for part in hidden)
 
 
 @pytest.mark.parametrize(("text", "masked"), [

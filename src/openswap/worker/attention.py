@@ -147,6 +147,9 @@ MAX_UNPAIRED_WAKERS = 2
 # ``ps`` gives whole seconds, and the hook's wrapper starts before the Stop
 # notice reads its clock.
 LAUNCH_SECONDS = 2.0
+# A Stop hook takes at most this long from its start to reading its clock; beyond it, its own
+# launch says nothing about the turn's end.
+STOP_START_SECONDS = 5.0
 # What ends a wake hook's text in the woken turn's prompt (measured on 2.1.325):
 # a text holding it could not be told apart there.
 WOKEN_TAG = "</system-reminder>"
@@ -2039,7 +2042,9 @@ class AttentionStore:
         did (both read from ``ps``, in whole seconds), or, when that is not
         known, no earlier than ``LAUNCH_SECONDS`` before the ``Stop``'s time."""
         stop_launch = self._stop_launch.get(key)
-        if stop_launch is not None:
+        # A Stop hook started long before the Stop it reports is not the turn's own (a session's
+        # command sending one): its launch vouches for nothing.
+        if stop_launch is not None and self._stopped[key] - stop_launch <= STOP_START_SECONDS:
             return stop_launch - launched <= 1
         return launched >= self._stopped[key] - LAUNCH_SECONDS
 

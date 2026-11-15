@@ -61,9 +61,11 @@ _SHAPES = re.compile("|".join([rf"-----BEGIN{_KEY_LABEL}.*?(?:-----END{_KEY_LABE
 # A literal U+3000 inside a URL's password in prose then shows: accepted, for readable CJK prose.
 _URL_PASSWORD = re.compile(_userinfo(_PROSE_SPACE))
 # The password after a login flag in prose: to the quote that opened before the user and on to the
-# end of the word, or to the end of the word, quoted parts included. An escaped quote ends nothing.
-_DQ_BODY, _SQ_BODY = r"(?:[^\r\n\"\\]|\\[^\r\n]?)*+", r"(?:[^\r\n'\\]|\\[^\r\n]?)*+"
-_PROSE_WORD = rf"(?:[^{_PROSE_SPACE}\"']|\"{_DQ_BODY}\"?|'{_SQ_BODY}'?)++"
+# end of the word, or to the end of the word, quoted parts included, read as the shell reads them:
+# a backslash escapes the next character outside quotes and inside double quotes, never inside
+# single quotes.
+_DQ_BODY, _SQ_BODY = r"(?:[^\r\n\"\\]|\\[^\r\n]?)*+", r"[^\r\n']*+"
+_PROSE_WORD = rf"(?:[^{_PROSE_SPACE}\"'\\]|\\[^\r\n]?|\"{_DQ_BODY}\"?|'{_SQ_BODY}'?)++"
 _FLAG_PASSWORD = re.compile(rf"({_FLAG}\"{_LOGIN_USER}){_DQ_BODY}(?:\"{_PROSE_WORD})?"
                             rf"|({_FLAG}'{_LOGIN_USER}){_SQ_BODY}(?:'{_PROSE_WORD})?"
                             rf"|({_FLAG}{_LOGIN_USER}){_PROSE_WORD}")
