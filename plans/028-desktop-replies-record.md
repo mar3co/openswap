@@ -34,9 +34,12 @@ results, review dispositions, hand-overs. Newest last within each section.
   Claude Desktop and terminal sessions started after you turn this on; VS Code
   sessions show notices only for now. …") and the CHANGELOG New line ("Claude
   Desktop sessions, and terminal sessions started without `openswap claude`, …")
-  are approved as proposed. The later CHANGELOG additions from the final review
-  (the Improved line on withholding and masking, and the restart sentence) are
-  still pending the owner's answer.
+  are approved as proposed.
+- **2026-11-15, final-review CHANGELOG additions (owner, relayed, quoting their
+  pick "Use both (Recommended)").** The Improved line on "Preview withheld" and
+  `[REDACTED]`, and the restart sentence on the New line, are kept as written.
+  The managing session also told the owner about the second R1 revisit
+  (withhold plus Deny only) and the reopened fix rounds; no objection.
 - **2026-11-15, merge and release.** Not this session's: the managing session
   gets the owner's approval for both.
 
