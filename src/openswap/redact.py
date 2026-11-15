@@ -50,6 +50,9 @@ _SECRET_SEGMENTS = frozenset({"password", "passwd", "pass", "pwd", "secret", "cr
 _SECRET_PAIRS = frozenset({("api", "key"), ("access", "key"), ("private", "key")})
 # The shell's working directories, ``$PWD`` and ``$(pwd)``.
 _PLAIN_NAMES = frozenset({"pwd", "oldpwd"})
+# Words that make a name secret wherever they sit in it (``PGPASSWORD``,
+# ``clientsecret``): a false alarm only costs a preview its Allow.
+_SECRET_WORDS = ("password", "passwd", "secret", "credential")
 
 
 def holds_credential(value: object) -> bool:
@@ -95,10 +98,14 @@ def _strings(value: object) -> list[str] | None:
 
 
 def _secret_name(name: str) -> bool:
-    """Whether ``name`` says it holds a credential, by its segments
-    (``DB_PASSWORD``, ``apiKey``, ``--api-key``), never by a word inside one
-    (``bypass``, ``max_tokens``, ``monkey``)."""
-    if name.lower() in _PLAIN_NAMES:
+    """Whether ``name`` says it holds a credential: one of ``_SECRET_WORDS``
+    anywhere in it, or a secret segment (``DB_TOKEN``, ``apiKey``,
+    ``--api-key``), never a shorter word inside one (``bypass``,
+    ``max_tokens``, ``monkey``)."""
+    lowered = name.lower()
+    if lowered in _PLAIN_NAMES:
         return False
+    if any(word in lowered for word in _SECRET_WORDS):
+        return True
     segments = [s.lower() for part in re.split("[_-]", name) for s in _CAMEL.findall(part)]
     return any(s in _SECRET_SEGMENTS for s in segments) or any(p in _SECRET_PAIRS for p in zip(segments, segments[1:]))

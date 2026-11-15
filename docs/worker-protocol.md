@@ -1848,12 +1848,14 @@ questions (details off, or the detail cut for size):
   (`password`, `passwd`, `pass`, `pwd` but not the bare `PWD`, `OLDPWD` or
   `$(pwd)`, `secret`, `credential(s)`, `token`, `apikey`, `api_key`,
   `access_key`, `private_key`, `authorization`, `bearer`, `cookie`, split on
-  `_ - . /`, spaces, `=`, `:` and camelCase), or more than 256 KiB of text;
+  `_ - . /`, spaces, `=`, `:` and camelCase; `password`, `passwd`, `secret`
+  and `credential` count anywhere in a name, as in `PGPASSWORD`), or more
+  than 256 KiB of text;
   its item shows "Preview withheld: it may contain a credential." and takes
   `deny` only. A false positive costs only Allow and the preview for that
   call. Known limit: a password with no recognizable shape and no
-  secret-sounding name next to it (`sshpass -p x`, `mysql -px`, a name like
-  `PGPASSWORD` whose secret word is not its own segment) is not caught.
+  secret-sounding name next to it (`sshpass -p x`, `mysql -px`) is not
+  caught.
   Everything else in the preview that differs from the call shows and makes it
   inexact, and then the item takes `deny` only: a field cut in its middle or
   left out, with a marker; every character outside ASCII but letters, numbers,

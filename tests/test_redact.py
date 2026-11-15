@@ -39,7 +39,7 @@ def test_a_key_block_line_or_a_url_password_holds_a_credential(text):
     "client_secret=x", "AWS_SECRET_ACCESS_KEY=x", "credentials.json", "aws_credential x", "export GITHUB_TOKEN=x",
     "OPENAI_API_KEY=x", "tool --api-key x", "apiKey=x", "APIKEY=x", "access_key x", "privateKey: x",
     "curl -H 'Authorization: Basic x'", "curl -H 'Bearer x'", "curl --cookie sid=x", "XAuthToken=x",
-    "make tests pass",
+    "make tests pass", "PGPASSWORD=hunter2 psql", "clientsecret=x", "MYSQLPASSWD=x", "cat secrets.yaml",
 ])
 def test_a_secret_sounding_name_holds_a_credential(text):
     assert holds_credential({"command": text})
@@ -53,7 +53,7 @@ def test_a_secret_sounding_key_at_any_depth_holds_a_credential(value):
 @pytest.mark.parametrize("text", [
     "npm test", "git push -u origin main", "cd $PWD && pwd", "PWD=/tmp ./run", "OLDPWD=/x ./run", 'echo "$(pwd)"',
     "src/auth.py", "fix-auth", "git log --author alice", "primary_key=id", "max_tokens=4000",
-    "claude --max-tokens 4000", "bypass=yes", "cat secrets.yaml", "monkey keyboard", "https://example.com/a@b",
+    "claude --max-tokens 4000", "bypass=yes", "monkey keyboard", "https://example.com/a@b",
     "git clone https://ann@x.test/repo.git", "Bearertoken", "sshpass -p x ssh host", "mysql -u root -px app",
 ])
 def test_ordinary_calls_hold_no_credential(text):
