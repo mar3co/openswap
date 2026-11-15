@@ -137,6 +137,21 @@ def test_prose_has_token_shapes_masked(shape):
 
 
 @pytest.mark.parametrize(("text", "hidden"), [
+    ("Cloned https://user:p'ass@example.com/x", ("p'ass", "ass")),
+    ('{"Authorization": "Bearer abc\\"supersecret"}', ("supersecret",)),
+    ("{'Cookie': 'sid=a\\'supersecret'}", ("supersecret",)),
+    ('Send Cookie: sid=\\"supersecret\\" now', ("supersecret",)),
+])
+def test_prose_shows_no_part_of_a_credential_holding_a_quote(text, hidden):
+    shown = mask_shapes(text)
+    assert REDACTED in shown and not any(part in shown for part in hidden)
+
+
+def test_a_url_password_holding_an_apostrophe_holds_a_credential():
+    assert holds_credential({"command": "curl https://user:p'ass@example.com/x"})
+
+
+@pytest.mark.parametrize(("text", "hidden"), [
     ("Run curl -u admin:'p\\'q'r st'uv then", ("st", "uv")),
     ('Run -u a:\\"\\"SE" CR ok', ("SE", "CR")),
     ("Run curl -u admin:'it'\\''s secret' x", ("secret",)),

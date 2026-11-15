@@ -47,7 +47,7 @@ def _userinfo(space: str) -> str:
     """A URL's ``user:password@``, or a user alone as long as a token
     (``https://<token>@github.com``), ending at a character of ``space``."""
     return (rf"(?i:(?<![a-z0-9+.-])([a-z][a-z0-9+.-]*+://)"
-            rf"(?:[^/{space}@:\"'<>]*+:[^/{space}@\"'<>]++|[A-Za-z0-9_-]{{20,}}+)@)")
+            rf"(?:[^/{space}@:\"'<>]*+:[^/{space}@\"<>]++|[A-Za-z0-9_-]{{20,}}+)@)")
 
 
 # In a call only ASCII whitespace ends one: a password may hold any other space.
@@ -85,10 +85,13 @@ _FLAG_PASSWORDS = (
 )
 # An ``Authorization`` or ``Cookie`` header (``HTTP_AUTHORIZATION`` too, and a quoted name, as in
 # JSON): a quoted value up to its closing quote, or an unquoted one up to the line's end or a
-# quote, quoted parts after ``=`` included (``sessionid="…"``, ``Digest response="…"``).
+# quote, quoted parts after ``=`` included (``sessionid="…"``, ``Digest response="…"``). A
+# backslash escapes the next character, so an escaped quote ends nothing (``"Bearer a\\"b"``).
 _HEADER = re.compile(r"(?i)(?<![A-Za-z0-9_])((?:[A-Za-z0-9]++_)*+(?:(?:proxy-)?authorization|(?:set-)?cookie)"
-                     r"[\"']?[ \t]*+:[ \t]*+[\"']?)(?:(?<=\")[^\r\n\"]*+|(?<=')[^\r\n']*+"
-                     r"|(?:[^\r\n\"']|(?<==)\"[^\r\n\"]*+\"?|(?<==)'[^\r\n']*+'?)++)")
+                     r"[\"']?[ \t]*+:[ \t]*+[\"']?)(?:(?<=\")(?:[^\r\n\"\\]|\\[^\r\n]?)*+"
+                     r"|(?<=')(?:[^\r\n'\\]|\\[^\r\n]?)*+"
+                     r"|(?:\\[^\r\n]?|[^\r\n\"'\\]|(?<==)\"(?:[^\r\n\"\\]|\\[^\r\n]?)*+\"?"
+                     r"|(?<==)'(?:[^\r\n'\\]|\\[^\r\n]?)*+'?)++)")
 # A scheme's word before a token-long word, as a header value is written.
 _SCHEME_TOKEN = re.compile(rf"(?i){_START}((?:bearer|basic)[ \t]++)[A-Za-z0-9_.~+/=-]{{20,}}+")
 # A header's name before its colon and value (``X-Auth-Key: …``, ``X-Auth-Key:…``, or a quoted
