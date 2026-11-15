@@ -169,7 +169,7 @@ designs the mechanism, and its review seats check these.
 
 | # | State | Required outcome |
 |---|---|---|
-| 1 | A prompt in a session with a live channel | Answered through the channel exactly as today; the new hooks exit at once and take no reply |
+| 1 | A prompt in a session with a live channel | Answered through the channel exactly as today; the new hooks exit at once and take no reply (amended 2026-11-15: a call that may hold a credential shows no preview there either, and takes Deny only when its channel request pairs) |
 | 2 | A prompt in a session without a channel, one waiter | Takes the actions above; a watch verdict that arrives first decides it, and the Mac's dialog closes |
 | 3 | The owner answers at the Mac first | The item closes as `answered_on_mac`; the waiter is released within 2 s of the worker seeing the session leave `waiting` (amended 2026-11-15: when another prompt of the same process is queued behind it, or its item isn't recorded yet, within 2 s of its own item closing); a verdict already handed to the hook has no effect and is never reported `applied` |
 | 4 | The watch's verdict reaches the hook just as the Mac answers | `applied` and `answered_from_watch` only when plan 025 row 12's rule shows the watch won; otherwise `answered_on_mac`, and the reply settles as not applied |
