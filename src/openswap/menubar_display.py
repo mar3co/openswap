@@ -772,8 +772,9 @@ CODEX_HOOKS_STATUS = {
     "missing": "Codex: OpenSwap's hooks are missing; the worker adds them back.",
     "unknown": "Codex: OpenSwap can't tell whether Codex trusts its hooks.",
 }
-REMOTE_REPLIES_HOW = ("Replies: start Claude with {launcher} instead of claude, and allow OpenSwap when Claude "
-                      "asks. Team and Enterprise plans need an admin to turn on channels first.")
+REMOTE_REPLIES_HOW = ("Replies work in Claude Desktop and terminal sessions started after you turn this on; VS Code "
+                      "sessions show notices only for now. Start Claude with {launcher} to have typed replies arrive "
+                      "as your own message.")
 
 
 def remote_attention_rows(worker_status: dict, *, enabled: bool) -> list[dict]:

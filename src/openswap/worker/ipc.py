@@ -34,7 +34,7 @@ IO_TIMEOUT_SECONDS = 2.0
 # Connections are served concurrently, so a slow or idle client cannot stall
 # status, pause or stop; past this many at once, a new one is closed unread.
 MAX_CONNECTIONS = 32
-# Of those, kept for status, pause and stop: notices, channels and question
+# Of those, kept for status, pause and stop: notices, channels and waiting
 # hooks never take the last of them.
 CONTROL_RESERVED = 2
 # ``accept()`` errors that mean the listening socket itself is unusable.
@@ -170,7 +170,7 @@ def _dispatch_control(request: dict, command: object, control: WorkerControl) ->
 
 
 # Connections that stay open and receive something back (plan 025 S2).
-LINKED_COMMANDS = frozenset({"channel", "question"})
+LINKED_COMMANDS = frozenset({"channel", "question", "permission"})
 
 
 def _handle_connection(
@@ -305,7 +305,7 @@ def serve(
         handlers: list[threading.Thread] = []
 
         def handle(connection: socket.socket, pool: threading.BoundedSemaphore) -> None:
-            # A channel or a waiting question hook, once accepted, gives its slot
+            # A channel or a waiting hook, once accepted, gives its slot
             # back: the attention store bounds how many of those stay open.
             released = threading.Event()
 

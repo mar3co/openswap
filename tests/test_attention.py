@@ -1631,7 +1631,10 @@ def test_settings_rows_show_the_switches_on_a_paired_mac():
                                                 "launcher": "/Apps/O S.app/Contents/MacOS/OpenSwap claude"}},
                                  enabled=True)
     assert rows[-1]["id"] == "remote_attention_replies_note"
-    assert "start Claude with /Apps/O S.app/Contents/MacOS/OpenSwap claude instead" in rows[-1]["label"]
+    assert rows[-1]["label"] == (
+        "Replies work in Claude Desktop and terminal sessions started after you turn this on; VS Code sessions show "
+        "notices only for now. Start Claude with /Apps/O S.app/Contents/MacOS/OpenSwap claude to have typed replies "
+        "arrive as your own message.")
 
 
 @pytest.mark.parametrize(("on_path", "launcher"), [
@@ -2693,7 +2696,8 @@ def test_review_the_question_hook_stops_waiting_once_claude_code_gave_up(tmp_pat
     monkeypatch.setattr(attention.os, "getppid", lambda: next(parents))
     started = time.monotonic()
     try:
-        assert attention._wait_for_answer(SESSION, "f" * 32, "", root) is None
+        assert attention._wait_for_worker({"command": "question", "session_id": SESSION, "tool_key": "f" * 32},
+                                         "answers", root) is None
     finally:
         server.close()
     assert time.monotonic() - started < 3

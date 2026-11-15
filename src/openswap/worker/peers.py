@@ -1,7 +1,7 @@
 """Which process is on the other end of the worker's socket, and what started it (plan 025 S2).
 
 Every process the owner runs can reach the socket, so a connection that
-receives anything back (an OpenSwap channel, a waiting question hook) is
+receives anything back (an OpenSwap channel, a waiting hook) is
 served only after its place in the process tree is checked.
 """
 

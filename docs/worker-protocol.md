@@ -714,14 +714,16 @@ exactly these fields, and optionally `session_id` and `detail`:
 - `detail` (optional, only while the owner sends details): a closed object
   with at least one of `tool_name` (1–100 characters), `description` (1–1,000),
   `input_preview` (1–4,000; the call as Claude Code itself previews it to
-  OpenSwap's channel, sent only for a permission that takes replies), `last_message`
+  OpenSwap's channel or, in a session without the channel, as the prompt's own
+  permission hook previews it in the same form with credentials masked; sent
+  only for a permission that takes replies), `last_message`
   (1–1,000, the start of the session's last message) and `questions` (1–4 closed objects, each with
   `question` (1–1,000), an optional `header` (1–100) and `options`, 0–4
   option labels of 1–100 characters). `tool_name`, `header` and option labels
   contain no Unicode control characters; the other text may contain newline,
   carriage return and tab, and no other control character. A tool's raw input
   is never sent: for `Bash` the worker sends the model's own description of
-  the command.
+  the command, and the call itself only as `input_preview`.
 
 `closed` holds 0–50 closed objects with exactly `id` (the item ID's grammar,
 unique within the array) and `reason`, one for each item that closed since
@@ -1776,8 +1778,13 @@ against the session files and Claude Code processes when it starts.
 #### Answering from the phone and watch
 
 A third switch, **Allow replies from my phone and watch** (off by default,
-set on this Mac only), lets the owner answer sessions started with `openswap
-claude [claude's own arguments]`. That command starts Claude Code with
+set on this Mac only), lets the owner answer Claude Code sessions in Claude
+Desktop and in a terminal; VS Code sessions stay notice-only until a check
+shows the extension closes its dialog when a hook decides it
+(mar3co/openswap#210). A session started with `openswap claude [claude's own
+arguments]` is answered through OpenSwap's channel, on any surface; any other
+is answered through its own waiting hooks (below), in sessions started after
+the switch was turned on. `openswap claude` starts Claude Code with
 OpenSwap's channel: it passes a `--mcp-config` file in OpenSwap's support
 folder (`worker/channel-mcp.json`) naming `openswap attention channel`, and
 names it with `--dangerously-load-development-channels server:openswap`, so
@@ -1818,9 +1825,32 @@ backend accepted offered for that item, and an item is never offered `allow`
 or `answer` in a report that leaves out the detail showing its call or its
 questions (details off, or the detail cut for size):
 
-- A permission prompt takes `deny`, and `allow` while details are on (the
-  phone then shows the call as Claude Code previews it to the channel). It
-  takes either only when the channel's request is provably that very call:
+- A permission prompt in a session without the channel takes `deny`, and
+  `allow` while details are on and the item shows the call its hook would
+  allow, while exactly one synchronous hook waits for that very prompt (the
+  one Claude Code ran with it: the same process, session, agent, tool and
+  input, within 5 seconds). That hook (`openswap attention permission`, a
+  `PermissionRequest` hook on every tool with a 600-second timeout, which
+  leaves `AskUserQuestion` to the question hook) is installed with the
+  question hook. It sends the worker its own call as Claude Code's channel
+  form previews it, with recognizable credentials masked (API keys and tokens
+  by their shape, private-key blocks, `Authorization:` headers, a URL's user
+  and password, the value of anything named like a password, secret, token or
+  key) and each field cut in the middle to fit the cap, and that preview is the
+  item's `input_preview`. A second hook for the same prompt takes every reply
+  away while it waits, and one with another preview takes them away for good,
+  so a command the session runs can block replies but never approve a call. It
+  gives Claude Code `allow`, or `deny` with the message "The owner denied this
+  from their phone or watch.", or nothing when the prompt closes (an answer at
+  the Mac, the session ending), the Claude Code process ends, replies are
+  turned off, the wait passes about 10 minutes or the worker is gone; in a
+  session with the channel it exits at once. A hook's deny lets Claude go on,
+  as its allow does, so either counts as `applied` when the session leaves
+  `waiting` for `busy` within 2 seconds of the hook taking it.
+- A permission prompt in a session with the channel takes `deny`, and `allow`
+  while details are on (the phone then shows the call as Claude Code previews
+  it to the channel). It takes either only when the channel's request is
+  provably that very call:
   the same tool, the same input (the hook compares a digest of Claude Code's
   preview format, and only for a preview Claude Code did not cut, mask or
   normalize), within 5 seconds, and no other waiting prompt or request with
@@ -1836,12 +1866,14 @@ questions (details off, or the detail cut for size):
   they leave. That hook
   (`openswap attention question`, a `PermissionRequest` hook on
   `AskUserQuestion` with a 600-second timeout) is installed in every managed
-  config home only while replies are on. It is served only in a session whose
-  Claude Code process holds a channel registration and whose session file
-  names its session; anywhere else it exits at once and leaves the dialog to
-  the owner. It gives Claude Code the chosen options, or nothing when the
-  question closes, the wait passes about 10 minutes or the worker is gone.
-- An idle session takes `message`, which arrives as a channel event the
+  config home only while replies are on. It is served only where its Claude
+  Code process's session file names its session, and either that process holds
+  a connected channel registration or none is registered and the session is in
+  Claude Desktop or a terminal; anywhere else it exits at once and leaves the
+  dialog to the owner. It gives Claude Code the chosen options, or nothing
+  when the question closes, the wait passes about 10 minutes or the worker is
+  gone.
+- An idle session with the channel takes `message`, which arrives as a channel event the
   channel's instructions describe as the owner's message from the paired
   device. It is handed over only while the session file says `idle` with no
   turn since the item opened: otherwise `refused` (the owner typed, a turn
@@ -1854,7 +1886,7 @@ a prompt that is no longer waiting was answered at the Mac (`item_closed`).
 It saves the record that the reply was handled first, and refuses the reply
 when that save fails; a reply arriving after the saved state had to be set
 aside at start is refused too. `sent` is reported only once the channel or
-the question hook took the reply; one that never got there (the hook left,
+the waiting hook took the reply; one that never got there (the hook left,
 the send failed) settles as `refused` (`item_closed` if the item closed) and
 the item takes a reply again. A reply a worker restart left between the two
 is never reported `refused` or `item_closed` (it may have landed), and its
@@ -1875,7 +1907,8 @@ Always sent: the kind, the provider, a session label, the time and an opaque
 folder ID. With details on, also the folder's name (an approved Remote tasks
 folder's label is always sent), the tool name and, for `Bash`, the model's own
 description of the command (never the command itself; for a prompt that takes
-replies, Claude Code's own preview of the call, which shows the command), a question with its
+replies, the preview of the call, which shows the command with credentials
+masked), a question with its
 header and option labels, and the first 1,000 characters of the session's
 last message. Never sent: prompts the owner typed, transcripts, account data
 or a tool's raw input.

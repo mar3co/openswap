@@ -109,6 +109,10 @@ MAX_PATH = 4096
 MAX_PID = 2**31 - 1
 # Session surfaces by Claude Code's ``entrypoint``.
 SURFACES = {"cli": "Terminal", "claude-vscode": "VS Code", "claude-desktop": "Claude Desktop"}
+# Surfaces whose own dialog closes when a waiting hook decides it (plan 028, step 0):
+# only their sessions take replies without OpenSwap's channel. VS Code is
+# unchecked and stays notice-only (mar3co/openswap#210).
+HOOK_REPLY_SURFACES = frozenset({"cli", "claude-desktop"})
 
 # Replies (S2). A channel's permission request and its hook's PermissionRequest
 # arrive this close together (measured: the request 0.1 s first); an unpaired
@@ -118,8 +122,8 @@ REQUEST_SECONDS = 10.0
 # A dialog that closes this soon after the watch's verdict reached it was closed
 # by that verdict; one that closed later (or earlier) was answered at the Mac.
 CONFIRM_SECONDS = 2.0
-# The question hook's own timeout is 600 s; its wait ends before that.
-QUESTION_WAIT_SECONDS = 590.0
+# The waiting hooks' own timeout is 600 s; their wait ends before that.
+HOOK_WAIT_SECONDS = 590.0
 # A handled reply's outcome is acknowledged again until this long past its expiry
 # (the service takes a first acknowledgement until 10 minutes past it).
 HANDLED_KEEP_SECONDS = 660.0
@@ -377,6 +381,7 @@ class SessionRecord:
     status_at: float = 0.0
     waiting_for: str = ""
     proc_start: str = ""  # when the process began (``procStart``, as ``ps`` lstart shows it); "" when not said
+    entrypoint: str = ""  # Claude Code's name for its surface (``cli``, ``claude-desktop``, ...); "" when not said
 
 
 def read_records(config_homes) -> tuple[list[SessionRecord], bool]:
@@ -491,18 +496,26 @@ class ChannelRequest:
     channel: tuple = ()  # (pid, start) of the channel process that relayed it
 
 
+WAITER_KINDS = frozenset({"question", "permission"})
+
+
 @dataclass
 class Waiter:
-    """A question hook waiting for the watch's answer."""
+    """A synchronous hook waiting for the watch's reply to its own prompt: a
+    question's answer or a permission's verdict."""
+    kind: str  # question | permission: the kind of item it answers
     session: str
     tool_key: str
     agent: str
     claude_pid: int
     at: float
+    home: str  # the config home whose sessions/{claude_pid}.json names the session
+    tool_name: str = QUESTION_TOOL
+    preview: str = ""  # a permission's own call as the phone and watch show it (plan 028, R1a)
     done: threading.Event = field(default_factory=threading.Event)
-    answers: list | None = None
-    item_id: str = ""  # the question item it waits for, once seen
-    reply_id: str = ""  # the reply whose answer it holds
+    result: object = None  # the answer's positions, or ``allow`` or ``deny``, once given
+    item_id: str = ""  # the item it waits for, once seen
+    reply_id: str = ""  # the reply whose result it holds
 
 
 @dataclass
@@ -517,6 +530,7 @@ class Sent:
     # Other prompts waited in the session when it was sent: the session file
     # cannot tell which of them closed, so the Mac never knows this one won.
     shared: bool = False
+    hook: bool = False  # a verdict handed to the prompt's own waiting hook, not a channel
 
 
 def _all_off():
@@ -539,7 +553,8 @@ def _session_record(data: dict, session: str, pid: int) -> SessionRecord:
     started = " ".join(started.split()) if isinstance(started, str) else ""
     return SessionRecord(session, pid, data.get("status") if isinstance(data.get("status"), str) else "",
                          at / 1000 if type(at) in (int, float) and math.isfinite(at) else 0.0,
-                         waiting if isinstance(waiting, str) else "", started if _LSTART.fullmatch(started) else "")
+                         waiting if isinstance(waiting, str) else "", started if _LSTART.fullmatch(started) else "",
+                         data["entrypoint"] if is_entrypoint(data.get("entrypoint")) else "")
 
 
 def read_session(home: str, pid: int) -> SessionRecord | None:
@@ -945,6 +960,7 @@ class AttentionStore:
                            tool_key=notice.get("tool_key", ""),
                            detail={"tool_name": tool_name, "description": notice.get("description", "")})
                 self._pair(session)
+                self._take_preview(self._items[-1])
             return True
         if event == "Notification":
             kind = notice.get("notification_type")
@@ -1287,8 +1303,11 @@ class AttentionStore:
                 if sent is not None and record is not None:
                     if sent.exit_at is None:
                         sent.exit_at = record.status_at
-                    # The dialog closed: approved (busy) or declined (idle).
-                    if self._won([item], record.status_at, "allow" if record.status == "busy" else "deny"):
+                    # The dialog closed: approved (busy) or declined (idle). A hook's deny
+                    # lets Claude go on (busy), as its allow does; a No at the Mac ends the turn.
+                    busy = record.status == "busy"
+                    effect = (sent.action if busy else "") if sent.hook else "allow" if busy else "deny"
+                    if self._won([item], record.status_at, effect):
                         won.append(item)
                         continue
                 if not self._shown(item):
@@ -1311,7 +1330,14 @@ class AttentionStore:
     def tick(self) -> None:
         """Close the answers whose grace has passed; end the Codex items whose
         process ended, expire old ones and publish those still open after
-        their wait."""
+        their wait. Replies turned off release every waiting hook, without a reply."""
+        with self._lock:
+            waiting = [w for w in self._waiters if not w.done.is_set()]
+        if waiting:
+            switches = self.switches()
+            if not (switches.notices and switches.replies):
+                for waiter in waiting:
+                    waiter.done.set()
         with self._lock:
             now = self.clock()
             due = [i for i in self._items if self._due.get(i.id, now + 1) <= now]
@@ -1455,7 +1481,7 @@ class AttentionStore:
             changed = True
         return changed
 
-    def channel_home(self, claude_pid: int) -> str | None:
+    def session_home(self, claude_pid: int) -> str | None:
         """The managed config home whose session file lists ``claude_pid``, or None."""
         for home in self.homes():
             record = read_session(str(home), claude_pid)
@@ -1481,7 +1507,7 @@ class AttentionStore:
 
         if not self._ensure_ready():
             return False
-        home = self.channel_home(claude.pid)
+        home = self.session_home(claude.pid)
         if home is None:
             return False
         with self._lock:
@@ -1614,72 +1640,124 @@ class AttentionStore:
         return all(pid == item.pid for pid, at in self._seen.get(item.session, {}).items()
                    if at >= item.created_at)
 
-    def question_waiter(self, claude, session: str, tool_key: str, agent: str = "") -> Waiter | None:
-        """A waiter for the question hook of ``session`` running under Claude Code
-        process ``claude`` (a ``peers.Process``), or None (the hook then lets the
-        dialog be): replies off, no connected channel registered for that process,
-        that process's session file names another session, or that process has
-        ``MAX_WAITERS_PER_PROCESS`` waiting already.
+    def waiter(self, kind: str, claude, session: str, tool_key: str, agent: str = "", *,
+               tool_name: str = QUESTION_TOOL, preview: str = "") -> Waiter | None:
+        """A waiter for the synchronous ``kind`` hook (``question`` or
+        ``permission``) of ``session`` running under Claude Code process
+        ``claude`` (a ``peers.Process``), or None (the hook then leaves the dialog
+        to the Mac): replies off, that process's session file not found or naming
+        another session, ``MAX_WAITERS`` waiting already (or
+        ``MAX_WAITERS_PER_PROCESS`` for that process), or:
 
-        Any command the session runs can connect as a question hook too. It
-        gains nothing: an answer reaches a waiter only while exactly one waits
-        for that question (so an extra one only keeps the question from taking
-        an answer), and the answer is what the transcript records anyway. Such
-        commands can also take all ``MAX_WAITERS_PER_PROCESS`` places, and that
-        process's questions then take no answer until they leave."""
+        - OpenSwap's channel is registered for that process: the channel answers
+          its permission prompts, and a question waits only while the channel is
+          connected and uncontested;
+        - no channel: a surface outside ``HOOK_REPLY_SURFACES``.
+
+        Any command the session runs can connect as such a hook too. It gains
+        nothing: a reply reaches a waiter only while exactly one waits for that
+        prompt, and a permission prompt waited for with two previews takes no
+        reply at all, so an extra one only keeps the prompt from taking a reply.
+        Allow reaches only the hook whose preview the watch showed, and a hook
+        that is not the prompt's own approves nothing. Such commands can also
+        take all ``MAX_WAITERS_PER_PROCESS`` places, and that process's prompts
+        then take no reply until they leave."""
+        from openswap.worker.protocol import DETAIL_CAPS as caps
+
         switches = self.switches()
-        if (not self._ensure_ready() or not (switches.notices and switches.replies) or not isinstance(session, str)
-                or not isinstance(tool_key, str) or not isinstance(agent, str)):
+        if (not self._ensure_ready() or not (switches.notices and switches.replies) or kind not in WAITER_KINDS
+                or not all(isinstance(v, str) for v in (session, tool_key, agent, tool_name, preview))
+                or (tool_name == QUESTION_TOOL) != (kind == "question")
+                or clean_text(tool_name, caps["tool_name"]) != tool_name or len(preview) > caps["input_preview"]):
             return None
         with self._lock:
             held = self._channels.get(claude.pid)
-            if held is None or held.claude_started != claude.started or held.link is None or held.contested:
+            if held is not None and (kind != "question" or held.claude_started != claude.started
+                                     or held.link is None or held.contested):
                 return None
-            home = held.home
-        record = read_session(home, claude.pid)
+            home = held.home if held is not None else None
+        home = home if home is not None else self.session_home(claude.pid)
+        record = read_session(home, claude.pid) if home is not None else None
         if record is None or record.session_id != session:
+            return None
+        if held is None and (record.entrypoint not in HOOK_REPLY_SURFACES or (
+                record.proc_start and record.proc_start != " ".join(claude.started.split()))):
             return None
         with self._lock:
             if (len(self._waiters) >= MAX_WAITERS
                     or sum(w.claude_pid == claude.pid for w in self._waiters) >= MAX_WAITERS_PER_PROCESS):
                 return None
-            waiter = Waiter(session, tool_key, agent, claude.pid, self.clock())
+            waiter = Waiter(kind, session, tool_key, agent, claude.pid, self.clock(), home, tool_name,
+                            clean_text(preview, caps["input_preview"], multiline=True))
             self._waiters.append(waiter)
+            for item in [i for i in self._items if self._waits_for(waiter, i)]:
+                waiter.item_id = item.id
+                self._take_preview(item)
             self.changed.set()
         return waiter
 
     def waiter_over(self, waiter: Waiter) -> bool:
-        """Whether a waiting question hook should stop: its question closed (or,
-        never seen, its session stopped waiting), its channel went away, or the
-        wait passed QUESTION_WAIT_SECONDS."""
+        """Whether a waiting hook should stop: its reply came (or replies were
+        turned off), its prompt closed or was answered at the Mac (or, never
+        seen, its session stopped waiting), its Claude Code process ended, or
+        the wait passed HOOK_WAIT_SECONDS."""
         with self._lock:
             if waiter.done.is_set():
                 return True
-            if self.clock() - waiter.at >= QUESTION_WAIT_SECONDS:
-                return True
-            held = self._channels.get(waiter.claude_pid)
-            if held is None or held.link is None:
+            if self.clock() - waiter.at >= HOOK_WAIT_SECONDS or not self._alive(waiter.claude_pid):
                 return True
             item = self._waited(waiter)
             if item is not None:
                 waiter.item_id = item.id
-                return False
+                return item.id in self._due
             return bool(waiter.item_id) or self._left_since(waiter.session, waiter.claude_pid) > waiter.at
 
     def _waited(self, waiter: Waiter) -> Item | None:
         return next((i for i in self._items if self._waits_for(waiter, i)), None)
 
+    def _waiters_for(self, item: Item) -> list[Waiter]:
+        """The hooks still waiting for a reply to this very prompt."""
+        return [w for w in self._waiters if not w.done.is_set() and self._waits_for(w, item)]
+
     @staticmethod
     def _waits_for(waiter: Waiter, item: Item) -> bool:
-        """Whether ``waiter`` is the question hook of this very occurrence: the
-        same process, session, agent and questions, run with the item's own
-        ``PermissionRequest`` (the synchronous and the async hook start together)."""
-        return (item.kind == "question" and item.session == waiter.session and item.tool_key == waiter.tool_key
-                and item.agent == waiter.agent and item.pid == waiter.claude_pid
-                and abs(item.created_at - waiter.at) <= PAIR_SECONDS)
+        """Whether ``waiter`` is the synchronous hook of this very occurrence: the
+        same kind, process, session, agent, tool and input (a question's: its
+        questions), run with the item's own ``PermissionRequest`` (the
+        synchronous and the async hook start together)."""
+        return (item.kind == waiter.kind and item.session == waiter.session and item.tool_key == waiter.tool_key
+                and item.tool_name == waiter.tool_name and item.agent == waiter.agent
+                and item.pid == waiter.claude_pid and abs(item.created_at - waiter.at) <= PAIR_SECONDS)
+
+    def _hook_replies(self, item: Item) -> bool:
+        """Whether replies to the item go to its own waiting hooks: no OpenSwap
+        channel is registered for its running Claude Code process. Only a
+        surface in ``HOOK_REPLY_SURFACES`` gets such hooks (``waiter``)."""
+        return item.pid not in self._channels and self._record_for(item.session, item.pid) is not None
+
+    def _take_preview(self, item: Item) -> None:
+        """Show a hook-answered permission prompt the call its own waiting hook
+        sent (R1a), so Allow names exactly the call that receives it. The first
+        preview stays: a hook with another one cannot be told from the real one,
+        so the prompt then takes no reply for good."""
+        if item.kind != "permission" or item.pid in self._channels:
+            return
+        previews = {w.preview for w in self._waiters_for(item)}
+        shown = item.detail.get("input_preview")
+        if len(previews) > 1 or (shown and previews - {shown}):
+            self._tainted.add(item.id)
+        elif len(previews) == 1 and not shown:
+            (preview,) = previews
+            if preview:
+                item.detail["input_preview"] = preview
+
+    def _shows(self, item: Item, waiter: Waiter) -> bool:
+        """Whether the item shows exactly the call ``waiter`` would allow."""
+        return (item.id not in self._tainted and bool(waiter.preview)
+                and item.detail.get("input_preview") == waiter.preview)
 
     def end_waiter(self, waiter: Waiter, *, handed: bool = False) -> None:
-        """A question hook's connection ended. An answer set for it that never
+        """A waiting hook's connection ended. A reply set for it that never
         reached the hook settles as not delivered, and its item takes a reply again."""
         with self._lock:
             if waiter in self._waiters:
@@ -1703,27 +1781,35 @@ class AttentionStore:
     # --- replies: the gate ------------------------------------------------------
 
     def _actions(self, item: Item, switches) -> list[str]:
-        """The replies an item takes now. Only an item a registered channel can
-        answer takes any, and only while nothing but its own Claude Code process
-        has been seen for its session since it opened: a permission prompt paired
-        with the channel's own request (Allow only while details are on, since
-        nothing else shows what it would allow), a question shown whole whose one
-        synchronous hook waits for it, an idle session."""
+        """The replies an item takes now, and only while nothing but its own
+        Claude Code process has been seen for its session since it opened. A
+        session with a live channel: a permission prompt paired with the
+        channel's own request, a question shown whole whose one synchronous hook
+        waits for it, an idle session. A session without one, on a surface in
+        ``HOOK_REPLY_SURFACES`` (plan 028): a permission prompt or a question
+        shown whole whose one synchronous hook waits for it. Allow only while
+        details are on and show the very call it would allow."""
         if (not (switches.notices and switches.replies) or item.provider != "claude" or not item.published
-                or item.id in self._unknown or not self._alone(item) or self._live_channel(item) is None
-                or self._unsure(item)):
+                or item.id in self._unknown or not self._alone(item) or self._unsure(item)):
+            return []
+        channel = self._live_channel(item)
+        if channel is None and not self._hook_replies(item):
             return []
         if item.kind == "permission":
+            if channel is None:
+                waiters = self._waiters_for(item)
+                if len(waiters) != 1 or item.id in self._tainted:
+                    return []
+                return ["allow", "deny"] if switches.details and self._shows(item, waiters[0]) else ["deny"]
             request = self._attached.get(item.id)
-            held = self._channels.get(item.pid)
             # Only the channel that relayed the request can answer it.
-            if request is None or item.id in self._tainted or request.channel != (held.pid, held.started):
+            if request is None or item.id in self._tainted or request.channel != (channel.pid, channel.started):
                 return []
             return ["allow", "deny"] if switches.details else ["deny"]
         if item.kind == "question":
             whole = switches.details and item.answerable and item.detail.get("questions")
-            return ["answer"] if whole and sum(self._waits_for(w, item) for w in self._waiters) == 1 else []
-        return ["message"] if item.kind == "idle" else []
+            return ["answer"] if whole and len(self._waiters_for(item)) == 1 else []
+        return ["message"] if item.kind == "idle" and channel is not None else []
 
     def queue_replies(self, replies: object, source: object = None) -> None:
         """From the heartbeat thread: keep the replies for the attention thread,
@@ -1849,20 +1935,33 @@ class AttentionStore:
         ``sent`` was recorded here."""
         action = reply["action"]
         with self._lock:
-            request = self._attached.get(item.id) if action in ("allow", "deny") else None
-            # A verdict goes only to the channel of the process that relayed its request.
-            held = self._channels.get(request.claude_pid) if request is not None else self._live_channel(item)
-            if held is not None and (held.contested or (request is not None and (
-                    request.channel != (held.pid, held.started) or request.claude_pid != item.pid))):
-                held = None
-            home, pid, link = (held.home, held.claude_pid, held.link) if held is not None else (None, 0, None)
+            hook = self._hook_replies(item)
+            if hook:
+                # The prompt's own waiting hook takes it, through that hook's config home.
+                chosen = self._waiters_for(item)
+                request, link = None, None
+                home, pid = (chosen[0].home, item.pid) if len(chosen) == 1 else (None, 0)
+            else:
+                request = self._attached.get(item.id) if action in ("allow", "deny") else None
+                # A verdict goes only to the channel of the process that relayed its request.
+                held = self._channels.get(request.claude_pid) if request is not None else self._live_channel(item)
+                if held is not None and (held.contested or (request is not None and (
+                        request.channel != (held.pid, held.started) or request.claude_pid != item.pid))):
+                    held = None
+                home, pid, link = (held.home, held.claude_pid, held.link) if held is not None else (None, 0, None)
         record = read_session(home, pid) if home is not None else None
         with self._lock:
             if item not in self._items or item.id in self._due:
                 return "item_closed"
             if item.id in self._sent or item.id in self._unknown or not self._alone(item):
                 return "refused"
-            if link is None or (action in ("allow", "deny") and request is None):
+            waiters = self._waiters_for(item) if hook or action == "answer" else []
+            if hook:
+                # The hook that would take it changed, or would allow a call not shown.
+                if (action == "message" or len(waiters) != 1 or waiters != chosen
+                        or (action == "allow" and not self._shows(item, waiters[0]))):
+                    return "refused"
+            elif link is None or (action in ("allow", "deny") and request is None):
                 return "refused"  # the channel went away, or the prompt's pairing did
             if record is None or record.session_id != item.session:
                 return "item_closed"  # that session ended or was cleared
@@ -1879,14 +1978,15 @@ class AttentionStore:
                 return "refused"  # queued dialogs: which was answered is not known yet
             sent = Sent(reply["id"], action, self.clock(), shared=action != "message" and any(
                 i is not item and i.session == item.session and i.kind in ("permission", "question")
-                for i in self._items))
-            waiters = []
+                for i in self._items), hook=hook and action != "answer")
+            message = None
             if action == "answer":
                 sent.answers = sorted([a["question"], a["option"]] for a in reply["answers"])
-                waiters = [w for w in self._waiters if self._waits_for(w, item)]
                 if len(waiters) != 1:
                     return "refused"
-                message = None
+                result = sent.answers
+            elif hook:
+                result = action
             elif action == "message":
                 sent.token = secrets.token_hex(8)
                 message = {"message": {"content": reply["text"], "reply": sent.token}}
@@ -1908,7 +2008,7 @@ class AttentionStore:
                 return "refused"
             self.changed.set()
             for waiter in waiters:
-                waiter.answers, waiter.reply_id = sent.answers, reply["id"]
+                waiter.result, waiter.reply_id = result, reply["id"]
                 waiter.done.set()
         if message is not None:
             if link.send(message):
@@ -1919,7 +2019,7 @@ class AttentionStore:
         return None
 
     def handed_over(self, reply_id: str) -> None:
-        """A reply reached its session (the channel or a waiting question hook took it)."""
+        """A reply reached its session (the channel or a waiting hook took it)."""
         with self._lock:
             self._inflight.pop(reply_id, None)
             if self._handled.get(reply_id, [""])[0] == "sent":
