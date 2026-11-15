@@ -542,3 +542,26 @@ union verified, linear time). Minors:
   mar3co/openswap#218 from claude/charming-montalcini-f4134e (base main).
   Auto-fix is on. Requested a Codex review. Merge and release stay with the
   owner, through the managing session.
+
+### PR follow-ups and convergence
+
+- **Codex finding (P1):** prose masked only 1000 characters past its cap, so
+  a construct needing its end (a URL password's `@`) could show its first part.
+  Fixed in abccfca: `MASK_MARGIN` raised to 64 KiB; thread answered and
+  resolved.
+- **CI `macos-keychain`:** the 260k hostile timing test flaked at 0.6 s.
+  Fixed in 235ea0f: each check is timed at its production size.
+- **Seat follow-ups:**
+  - c66fcf4: escape only the part of a question that can be shown, because
+    the hook's time could overrun on crafted input.
+  - 5f20032: strip leading blanks before that cut, because a `[REDACTED]`
+    fragment or dropped field could appear; fuzz-verified by the seat.
+- **Convergence ruling** (managing session, applying the owner's review
+  rules, 2026-11-15). Every round since the PR opened found issues only in code
+  the previous round added. From the fuzz check on 5f20032 on:
+  - any non-Critical finding is a tracked issue, with no new fix round;
+  - only a Critical (a credential shown on the watch, or a hidden command that
+    could be allowed) reopens the code, and the managing session is told first;
+  - Codex findings are handled the same way: fix Criticals, and fix Importants
+    only when reachable on production and not in code this PR's fix rounds
+    added.
