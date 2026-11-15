@@ -56,6 +56,16 @@ scratchpad (not kept).
   that turn; it started its own turn right after (24.7 s → 26.4 s). So a reply
   handed over just before the owner types runs after the owner's turn, never
   inside it.
+- **Terminal wake (Task 2 step 0, 2026-11-15).** Interactive `claude` 2.1.311
+  under `expect`, with a project `Stop` hook set to `asyncRewake` that exits 2
+  after 5 s. A new turn ran; the TUI showed "Stop hook feedback", then the reply.
+  `UserPromptSubmit` fired with the task-notification prompt holding the hook's
+  stderr, the woken turn's `Stop` came with `stop_hook_active: true`, and
+  `idle_prompt` fired about 60 s later. Passes, so `cli` keeps typed replies.
+- **Woken turn's `UserPromptSubmit`** (headless 2.1.325): the prompt is
+  `<task-notification>…Stop hook feedback…</task-notification><system-reminder>Stop hook blocking error from command "Stop": <stderr></system-reminder>`.
+  Task 2 settles a reply on this prompt containing the note line and the exact
+  text sent.
 - **Wake-hook timeout (Task 2 step 0).** Desktop's 2.1.325 headless: a `Stop`
   hook with `asyncRewake: true` and `timeout: 900` woke at 660 s, past the
   600 s default, and the turn ran (665.8 s). A configured timeout above the
@@ -290,3 +300,19 @@ T4, T5, T7, T8, T9, T10, T11 and T12. The notes are being amended after
 measuring the woken turn's `UserPromptSubmit` and the terminal wake.
 Headless 2.1.325: the woken turn's prompt is
 `<task-notification>…Stop hook feedback…</task-notification><system-reminder>Stop hook blocking error from command "Stop": <stderr></system-reminder>`.
+
+### Task 2 dispatched (2026-11-15)
+
+Notes amended after the ruling check:
+- T3: a replacement must pair with its own `Stop`.
+- T4/T5: a reply settles only on the woken turn's own prompt (note plus text);
+  the owner's typing first means `answered_on_mac`; background tasks and `busy`
+  decide nothing; `Stop` never supersedes a handed-over item.
+- T8: wall-clock hour, enforced by the worker with a 60 s margin.
+- T9: release by the session file, not by item pairing.
+- T11: exact stderr bytes.
+- T12: separate caps for wake hooks (1 per process, 32 in all).
+- Accepted: after a no-turn slash command, no reply box shows until the next
+  turn; a reply handed over just before a restart stays `sent`.
+
+Implementer: a fresh Opus agent.
