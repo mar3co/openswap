@@ -644,6 +644,14 @@ def test_a_desktop_session_file_without_a_status_does_not_hold_the_notice(store)
     assert [i["kind"] for i in published(items)] == ["idle"]
 
 
+def test_a_desktop_session_cleared_while_the_worker_was_down_is_never_published(store):
+    items, clock = store
+    items.notice(desktop(hook("Stop", last_assistant_message="Done.")))
+    items.observe(record("idle", clock.now + 10, session=OTHER), True)  # the same process, after /clear
+    wait(items, clock, 61)
+    assert published(items) == []
+
+
 def test_a_later_desktop_turn_restarts_the_wait_and_reports_nothing_for_the_first(store):
     items, clock = store
     items.notice(desktop(hook("Stop", last_assistant_message="Launched it.")))

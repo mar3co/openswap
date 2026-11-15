@@ -1367,9 +1367,12 @@ class AttentionStore:
 
     def _still_idle(self, item: Item) -> bool:
         """Whether the session file, if one is read and says, still says ``idle``:
-        not a dialog on screen or a turn the owner did not start."""
+        not a dialog on screen or a turn the owner did not start. A process now
+        recorded under another session left this one (``/clear``)."""
         record = self._record_for(item.session, item.pid)
-        return record is None or record.status in ("", "idle")
+        if record is None:
+            return not item.pid or not any(r.pid == item.pid for rs in self._records.values() for r in rs)
+        return record.status in ("", "idle")
 
     def _waiting_again(self, item: Item) -> bool:
         """Whether the item's session, having left ``waiting`` (its answer is
