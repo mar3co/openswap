@@ -1,7 +1,8 @@
 # OpenSwap feature plan: answer Claude Desktop and VS Code sessions from the watch
 
-Status: PROPOSED (2026-11-15); owner decisions R1–R4 ruled 2026-11-15, plan
-approval pending. Extends plan 025 (session attention), whose
+Status: IN PROGRESS. Accepted by the owner 2026-11-15, with its copy, after
+rulings R1–R4 the same day. Progress, rulings and review dispositions:
+[028-desktop-replies-record.md](028-desktop-replies-record.md). Extends plan 025 (session attention), whose
 Safety rules, data boundary and required outcomes still hold except where this
 plan says otherwise. The evidence is
 [research/025-desktop-replies.md](research/025-desktop-replies.md). Claude Code
