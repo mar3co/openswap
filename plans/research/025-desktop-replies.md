@@ -1,5 +1,8 @@
 # Replies to Claude Desktop sessions from the phone or watch (plan 025 spike)
 
+Followed by [plan 028](../028-desktop-replies.md). The owner chose to offer typed
+replies too (ruling R2, 2026-11-15), so recommendation 3 below is superseded.
+
 2026-11-15. Claude Desktop (Claude Code 2.1.325 bundled in the "Claude VS Personal"
 profile), OpenSwap at `8fdd5c8`. No shipping code changed.
 
