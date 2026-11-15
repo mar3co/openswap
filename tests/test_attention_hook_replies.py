@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 
 from openswap import attention
+from openswap.redact import REDACTED
 from openswap.settings import AttentionSettings
 from openswap.worker import attention as store_module
 from openswap.worker import channel_link, ipc, peers
@@ -1090,6 +1091,13 @@ def test_a_credential_that_ends_far_past_the_cap_shows_no_part(credential):
     assert "ppppp" not in shown and "Zq9" not in shown
     [question] = shown_questions([{"question": text, "options": ["A"]}])
     assert "ppppp" not in question["question"] and "Zq9" not in question["question"]
+
+
+@pytest.mark.parametrize("blanks", [" " * 1100, "\n" * 2500, "\x00" * 300])
+def test_leading_blanks_never_move_the_cut_into_what_is_shown(blanks):
+    [shown] = shown_questions([{"question": blanks + "x" * 980 + f" ghp_{SECRET} end", "options": [blanks + "Yes"]}])
+    assert shown["question"].startswith("x" * 980) and "[RED" not in shown["question"].replace(REDACTED, "")
+    assert shown["options"] == ["Yes"]
 
 
 def test_questions_as_long_as_the_margin_and_full_of_escapes_are_shown_quickly():

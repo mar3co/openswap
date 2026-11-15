@@ -252,6 +252,9 @@ def scrub(value):
     return value
 
 
+_ASCII_BLANKS = "".join(map(chr, range(33)))
+
+
 def _shown_text(value: object, limit: int, *, multiline: bool = False) -> str:
     """Question text as the phone and watch show it: ``mask_shapes`` (of the
     text as it is, so an escape never hides a token's edge), then
@@ -259,9 +262,10 @@ def _shown_text(value: object, limit: int, *, multiline: bool = False) -> str:
     if not isinstance(value, str):
         return ""
     # Only what can be shown is escaped (an escape can be 12 times its character): masking alone
-    # needs the margin.
-    shown = escape_hidden(mask_shapes(value[:limit + MASK_MARGIN])[:2 * limit + len(REDACTED)])
-    return _masked_cut(clean_text(shown, 2 * limit + len(REDACTED), multiline=multiline), limit)
+    # needs the margin. The ASCII blanks ``clean_text`` would strip go first, so the cut never
+    # moves into what is shown.
+    masked = mask_shapes(value[:limit + MASK_MARGIN]).lstrip(_ASCII_BLANKS)[:limit + len(REDACTED)]
+    return _masked_cut(clean_text(escape_hidden(masked), limit + MASK_MARGIN, multiline=multiline), limit)
 
 
 def question_entries(value: object) -> list[tuple[dict, str, list[str]]]:
