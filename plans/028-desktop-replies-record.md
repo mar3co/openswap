@@ -512,3 +512,14 @@ hook pairs for `Stop` hooks starting up to 4 s late. Its findings:
   (the owner was told). Fix b866021: a backslash inside a single-quoted value
   masks the rest of the line, more than either reading (suite 7782 passed).
   One scoped cold seat on b866021.
+
+Scoped seat on b866021 found one more prose case in code b866021 added: a
+second login flag ending its line, after a backslashed single-quoted password,
+had its next-line password shown. Doc Minors too. Patching each reading kept
+producing narrower cases, so prose login-password masking is now **the union**
+of the four readings this branch has used (the shell's, a writer's escapes, a
+backslash swallowing the rest of the line, quotes alone). That masks at least
+as much as each by construction (60b38b7, suite 7784 passed). The timing test
+now times `holds_credential` and `mask_shapes` separately (0.5 s each). In
+production `mask_shapes` only sees prose cut to its cap plus a 1000-character
+margin. Doc wording fixed. One scoped cold seat on 60b38b7.
