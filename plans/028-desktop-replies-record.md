@@ -430,3 +430,29 @@ Review: cold, silent-failure, API surface (701 lines), all Opus.
 All of these are in code the last round added, or are narrow, so by the
 convergence rule they go to the whole-branch final review's single fix
 dispatch, with Task 1's items I-a to I-f.
+
+### Whole-branch final review (origin/main..HEAD; cold and silent-failure, Opus)
+
+No Critical or Important finding needing another round.
+- **Cold:** Minors only: the dead `answerable` waiter field; the CHANGELOG
+  missing the masking and withholding change (which also affects
+  `openswap claude` sessions) and the restart note; docstrings.
+- **Silent:**
+  - A backward wall-clock step keeps a wake hook paired through an unseen turn
+    (low reach). Filed mar3co/openswap#216.
+  - After a worker restart, idle sessions take no typed reply until their next
+    turn (fails safe). Filed mar3co/openswap#215, plus a docs limit.
+  - Defense in depth: the worker itself refuses Allow on a withheld item (B5).
+- **CHANGELOG addition** sent to the owner for approval (relay, 2026-11-15);
+  the implementer uses the draft.
+
+Final single fix dispatch notes: planning session scratchpad
+`028-final-notes.md`:
+- A1–A6: Task 1's routed items I-a, I-c to I-f, and the docstrings. I-b, the
+  prose over-masking, is dropped: narrowing it would let a numeric prose
+  password through.
+- B1–B5: Task 2's routed items and B5.
+- C1–C5: docs, leftovers and the CHANGELOG.
+
+After it: ONE cold seat, the gates, then the PR. Every non-Critical finding
+from that seat becomes a tracked issue.
