@@ -727,7 +727,7 @@ exactly these fields, and optionally `session_id` and `detail`:
   to its closing quote, and quoted parts after `=` in an unquoted value), the
   password after a login flag such as `curl -u user:` (as far as any reading
   of its quotes and backslashes takes it, the shell's or a writer's, and never
-  past the end of its line) and a word of 20 or more
+  past a newline or carriage return) and a word of 20 or more
   token characters after `Bearer` or `Basic` masked as `[REDACTED]`, never cut
   through) and
   `questions` (1–4 closed objects, each with
