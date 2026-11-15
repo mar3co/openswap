@@ -19,6 +19,12 @@ results, review dispositions, hand-overs. Newest last within each section.
   the typed-reply note, the Settings hint, the CHANGELOG line.
 - **2026-11-15, implementer model (owner, relayed: "Opus (Recommended)").** Opus
   for every implementer dispatch and fix round of this plan.
+- **2026-11-15, VS Code (owner, relayed, quoting their pick "Notices only for
+  now (Recommended)").** VS Code sessions stay notice-only; Desktop and terminal
+  sessions take hook replies. VS Code was not checked here and the extension is
+  not to be downloaded. Tracked in mar3co/openswap#210 (the live check and the
+  one-entry change). Makes the approved copy name VS Code wrongly: amended copy
+  sent to the owner for approval, pending.
 - **2026-11-15, merge and release.** Not this session's: the managing session
   gets the owner's approval for both.
 
@@ -35,8 +41,8 @@ scratchpad (not kept).
   `updatedInput.answers` allow after 6 s: the menu showed, then "User answered
   Claude's questions: Pick a color → Blue". Passes.
 - **Desktop.** Passed in the research (live probe 3 plus Desktop's code).
-- **VS Code.** Not installed on this Mac: unchecked. Owner asked how to proceed
-  (relayed 2026-11-15); until answered, VS Code sessions take no hook replies.
+- **VS Code.** Not installed on this Mac: unchecked. Ruled notice-only for now
+  (see Rulings); mar3co/openswap#210.
 - **Second typed reply (row 11).** Desktop's 2.1.325 headless: a woken turn's
   `Stop` runs the wake hook again, with `stop_hook_active: true`; the second
   text started a second turn. Passes. The wake hook must not treat
