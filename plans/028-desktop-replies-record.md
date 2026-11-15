@@ -123,3 +123,24 @@ entitlement changed.
 
 Fix-round implementer: fresh Opus agent, with the notes file and the Task 1
 report as inputs.
+
+### Task 1 fix round 1 (3eac7df, 5828809)
+
+- 3eac7df: F1–F8 and the Minors, by a fresh Opus implementer (suite 7479
+  passed). Its context reached 471k, past the 400k line, so it is not resumed.
+- Controller rulings on its report (2026-11-15):
+  - **Space runs.** "4 or more spaces → deny only" would make indented code
+    deny-only, against F1's aim. Ruled: only a run of more than 16 spaces is
+    marked and deny-only; indentation stays exact.
+  - **R1 revisit.** No objection from the owner yet; F1 stands as written.
+  - **Suggestion 1 (credit a hook Allow only on its own `PostToolUse`).**
+    Declined. It is the same reporting-only imprecision as the accepted Deny
+    case: in Desktop a Mac "No" also continues the turn, and the call is denied
+    either way.
+  - **Suggestion 2 (release a never-recorded hook early).** Adopted, amending
+    F5: a hook whose prompt is never recorded is released once its session
+    file says `idle` after it, past `PAIR_SECONDS`. Such a hook can't take a
+    reply, and releasing it frees about 36 MB.
+- 5828809: both rulings, made inline by the controller (24 lines changed, TDD);
+  suite 7482 passed.
+- Review round 2 dispatched on 983c44b..5828809: the same four Opus seats.
