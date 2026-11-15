@@ -165,3 +165,23 @@ report as inputs.
 Controller notes:
 - **The masker is narrowed (G3).** Round 1's F2 asked for more heuristics than the data boundary needs. Plan 025 D1 accepted masking that catches recognizable credentials only, and the heuristics produced most of round 2's findings. `mysql -pX` and `login -p X` drop out of scope as a documented limit.
 - **Convergence.** Most round 2 findings are in code round 1 added. Two Criticals reopen the loop, as the review rules require. Round 3 rewrites the masker to a narrower scope rather than patching it, to converge.
+
+Round 2 pre-dispatch ruling check (Opus, one pass) found wrong states in every
+ruling. Amendments:
+- **G3 replaced by "withhold, don't mask"**: a call holding a recognizable
+  token shape or a secret-sounding name gets no preview, a fixed line, and Deny
+  only. Masking in place needed shell-accurate parsing and kept leaking or
+  hiding ordinary commands. Second revisit flag on R1 sent to the owner (relay
+  2026-11-15); proceeding unless they object. Documented limit: a password with
+  no recognizable shape and no secret-sounding name nearby (`sshpass -p x`).
+- **G1**: the confirm bound is kept; a denied item still queues prompts
+  recorded before its exit; a session still `waiting` at the end of the grace
+  means `answered_on_mac`; allows are unchanged from 983c44b.
+- **G2**: bidi classes R, AL and AN make a preview deny-only and a question not
+  whole; line breaks separated only by whitespace count as consecutive; space
+  runs in questions are covered; confusables are an accepted residual.
+- **G4**: the worker masks prose on every notice; an old question hook's
+  `answerable` is ignored.
+
+Fix round 2 implementer: fresh Opus agent. The round 1 agent is over the 400k
+line.
