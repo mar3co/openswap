@@ -33,10 +33,12 @@ pytestmark = pytest.mark.skipif(os.name != "posix", reason="the worker and its h
 NOTE = "Reply from the owner's phone or watch:"
 
 
-def stop(env, offset=0.0, **fields):
-    """The turn's ``Stop`` notice, dated ``offset`` from now."""
+def stop(env, offset=0.0, launched=None, **fields):
+    """The turn's ``Stop`` notice, dated ``offset`` from now, from a hook whose
+    process under Claude Code began at ``launched`` (None: not known)."""
     entry = {"entrypoint": env.entrypoint} if getattr(env, "entrypoint", "") else {}
-    env.store.notice(hook("Stop", **{"last_assistant_message": "Done.", **fields}) | entry | env.at(offset))
+    env.store.notice(hook("Stop", **{"last_assistant_message": "Done.", **fields}) | entry | env.at(offset),
+                     launched=launched)
 
 
 def wake(env, claude=CLAUDE, session=SESSION, launched=None):
@@ -679,7 +681,61 @@ def test_k1_a_hook_whose_process_under_claude_code_started_during_the_turn_never
     assert (wake(desktop, launched=t + started) is None) is not pairs
 
 
-def test_k1_a_stop_older_than_the_one_recorded_pairs_and_releases_nothing(desktop):
+@pytest.mark.parametrize(("started", "pairs"), [(1, True), (0, True), (-1, True), (-2, False), (-30, False)])
+def test_b2_a_hook_started_two_seconds_or_more_before_the_stop_hooks_own_launch_never_pairs(desktop, started,
+                                                                                           pairs):
+    t = desktop.clock.now  # a whole second, as ``ps`` gives the launches
+    desktop.status("idle", t)
+    waker = wake(desktop, launched=t + started)
+    stop(desktop, launched=t)
+    desktop.clock.now = t + 61
+    desktop.store.tick()
+    [item] = desktop.store._items
+    assert desktop.actions(item) == (["message"] if pairs else [])
+    assert waker.done.is_set() is not pairs
+    assert (wake(desktop, launched=t + started) is None) is not pairs
+
+
+def test_b2_a_slow_starting_stop_hook_keeps_its_turns_own_wake_hook(desktop):
+    t = desktop.clock.now
+    desktop.status("idle", t)
+    desktop.clock.now = t + 0.9  # Claude Code started both hooks then: ``ps`` says t for each
+    waker = wake(desktop, launched=t)
+    stop(desktop, offset=1.5, launched=t)  # the Stop hook read its clock 1.5 s after its start
+    assert not waker.done.is_set()
+    desktop.clock.now = t + 64
+    desktop.store.tick()
+    [item] = desktop.store._items
+    assert desktop.actions(item) == ["message"]
+    sent(desktop, item, waker)
+
+
+@pytest.mark.parametrize(("event", "under", "launch", "expected"), [
+    ("Stop", PID, "Fri Jan 15 07:59:59 2027", 1_800_000_000 - 1),
+    ("Stop", PID, None, None),
+    ("Stop", PID + 1, "Fri Jan 15 07:59:59 2027", None),
+    ("Stop", PID, "not a start", None),
+    ("Notification", PID, "Fri Jan 15 07:59:59 2027", None),
+    ("codex Stop", PID, "Fri Jan 15 07:59:59 2027", None),
+], ids=["its own hook", "launch unknown", "under another Claude Code", "start unreadable", "not a Stop", "Codex"])
+def test_b2_a_stop_notice_is_dated_by_its_own_hooks_launch_read_from_its_connection(monkeypatch, event, under,
+                                                                                     launch, expected):
+    claude = Process(under, 1, "Fri Jan 15 07:00:00 2027", ("claude",))
+    shell = Process(PID + 8, under, launch, ("/bin/sh", "-c", "...")) if launch else None
+    monkeypatch.setattr(peers, "peer_pid", lambda _c: PID + 9)
+    monkeypatch.setattr(peers, "hook_launch", lambda pid: (claude, shell) if shell and pid == PID + 9 else None)
+    if event == "codex Stop":
+        notice = {"provider": "codex", "event": "Stop", "session_id": SESSION, "cwd": "/x", "pid": PID}
+    else:
+        notice = hook(event, **({"notification_type": "idle_prompt"} if event == "Notification" else {}))
+    taken = []
+    store = SimpleNamespace(notice=lambda n, launched=None: taken.append(launched))
+    assert ipc._dispatch({"version": 1, "command": "notice", "notice": notice}, None, store,
+                         connection=object()) == ({}, None)
+    assert taken == [expected]
+
+
+def test_k1_a_stop_older_than_the_one_recorded_pairs_nothing_and_releases_nothing(desktop):
     item, waker = finished(desktop)
     stop(desktop, offset=-61 - 10)  # an earlier turn's Stop, arriving late
     assert not waker.done.is_set() and desktop.actions(item) == ["message"]
@@ -708,7 +764,7 @@ def test_k1_a_process_keeps_at_most_one_paired_and_two_unpaired_hooks(desktop):
 # --- K2: no text after a turn the owner did not see ---------------------------------------------
 
 
-@pytest.mark.parametrize("turn", ["task prompt", "busy", "waiting"])
+@pytest.mark.parametrize("turn", ["task prompt", "busy"])
 def test_k2_a_turn_seen_after_the_items_stop_closes_it_to_messages(desktop, turn):
     item, waker = finished(desktop)
     desktop.accepted()  # the phone shows the item with its message action
@@ -722,6 +778,15 @@ def test_k2_a_turn_seen_after_the_items_stop_closes_it_to_messages(desktop, turn
     assert desktop.actions(item) == []
     desktop.reply(item.id, "message", text="Run the tests", offered=False)
     assert desktop.outcomes() == {"r1": "item_closed"} and not waker.done.is_set()
+
+
+def test_b1_a_background_subagents_dialog_after_the_stop_is_not_a_newer_turn(desktop):
+    item, waker = finished(desktop)
+    desktop.status("waiting", desktop.clock.now)  # a background subagent asks
+    desktop.clock.now += 5
+    desktop.status("idle", desktop.clock.now)  # declined at the Mac
+    assert desktop.actions(item) == ["message"]
+    sent(desktop, item, waker)
 
 
 def test_k2_the_turns_own_busy_and_a_late_idle_are_not_a_newer_turn(desktop):
@@ -786,6 +851,23 @@ def test_k3_a_woken_prompt_from_before_the_hand_over_decides_nothing(desktop):
     assert [i.id for i in desktop.store._items] == [item.id]
     desktop.store.notice(hook("UserPromptSubmit", prompt=woken("Run the tests")) | desktop.at(0.2))
     assert desktop.outcomes() == {"r1": "applied"}
+
+
+def test_b3_a_matching_woken_prompt_dated_before_the_hand_over_settles_nothing(desktop):
+    item, waker = finished(desktop)
+    sent(desktop, item, waker)
+    desktop.store.notice(hook("UserPromptSubmit", prompt=woken("Run the tests")) | desktop.at(-1))
+    assert item in desktop.store._items and desktop.outcomes() == {}
+    desktop.store.notice(hook("UserPromptSubmit", prompt=woken("Run the tests")) | desktop.at(0.2))
+    assert desktop.closes() == {item.id: "answered_from_watch"} and desktop.outcomes() == {"r1": "applied"}
+
+
+def test_b4_a_message_to_an_item_already_holding_one_is_refused(desktop):
+    item, waker = finished(desktop)
+    sent(desktop, item, waker)
+    desktop.status("busy", desktop.clock.now + 0.1)  # the woken turn runs
+    desktop.reply(item.id, "message", reply_id="r2", text="Again", offered=False)
+    assert desktop.outcomes() == {"r2": "refused"}
 
 
 @pytest.mark.parametrize("its_stop", [True, False], ids=["its turn's Stop seen", "no Stop either"])

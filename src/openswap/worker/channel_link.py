@@ -32,8 +32,7 @@ POLL_SECONDS = 0.5
 # goes in, and the fields carrying its own prompt as shown and its word that
 # this is the prompt exactly or whole.
 WAITERS = {
-    # An older question hook's "answerable" is taken and ignored: it says "whole" by older rules.
-    "question": ({"version", "command", "session_id", "tool_key"}, {"agent_id", "questions", "whole", "answerable"},
+    "question": ({"version", "command", "session_id", "tool_key"}, {"agent_id", "questions", "whole"},
                  "answers", "questions", "whole"),
     "permission": ({"version", "command", "session_id", "tool_key", "tool_name"}, {"agent_id", "preview", "exact"},
                    "behavior", "preview", "exact"),
@@ -140,11 +139,13 @@ def _serve_waiter(store, connection, request, kind, stop_event, release) -> None
     pid = peers.peer_pid(connection)
     hook = peers.process(pid)
     _, _, field, shown, whole = WAITERS[kind]
-    # The session's own synchronous hook: OpenSwap's command for ``kind``, under Claude Code.
+    # The session's own reply hook (question, permission or wake): OpenSwap's command for ``kind``,
+    # under Claude Code.
     ours = hook is not None and hook.args[-2:] == ("attention", kind)
     waiter = None
     if ours and kind == "wake":
-        # Paired only when Claude Code started its line for the turn's own Stop.
+        # Taken only when its launch is known: it takes a message only once paired with the turn's
+        # own Stop (``_paired``).
         launch = peers.hook_launch(pid)
         if launch is not None:
             waiter = store.wake_waiter(launch[0], request["session_id"], peers.started_at(launch[1]))

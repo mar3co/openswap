@@ -1983,16 +1983,22 @@ questions (details off, or the detail cut for size):
   whichever of the two reaches the worker first, when that `Stop` is dated
   after the process's latest prompt, the hook registered within 5 seconds of
   it, and the process of the hook's line that Claude Code started itself began
-  no more than 2 seconds before it (so a background task's shell, started
-  during the turn, never pairs). When two hooks qualify, neither pairs and the
-  item takes no `message`. A `Stop` older than the one recorded pairs and
+  no earlier than the second before the one the `Stop` notice's own hook's line
+  began in (both read from `ps`, in whole seconds). When that launch can't be
+  read, or that hook runs under another Claude Code process than the notice
+  names, it must have begun no more than 2 seconds before the `Stop`'s time
+  instead. So a session command started 2 s or more before the `Stop` (a
+  background task's shell, started during the turn) never pairs, unless a
+  forged `Stop` notice is used and the real one is suppressed (both need a
+  hostile local process). When two hooks qualify, neither pairs and the item
+  takes no `message`. A `Stop` older than the one recorded pairs nothing and
   releases nothing. A newer `Stop` releases the hooks that can no longer pair;
   the owner typing releases every hook of that process except one paired with
   a `Stop` dated after the prompt (its notice came late). A process keeps at
   most the paired hook and two others (a newcomer past that releases the
   oldest of the others), and 32 wait in all, apart from the question and
   permission hooks' places; past that a hook exits at once. What remains: a
-  command the session runs that starts within about 2 seconds of the `Stop`
+  command the session runs that starts less than 2 seconds before the `Stop`
   and runs OpenSwap's wake command can pair and receive a typed reply meant
   for that session (the same class as the channel's limit, mar3co/openswap#181);
   it never approves anything. Given a message, the hook writes "Reply from the
@@ -2007,25 +2013,28 @@ questions (details off, or the detail cut for size):
   away, its Claude Code process ends, a newer `Stop` or newcomer releases it
   (above), replies or notices are turned off (unreadable settings keep it
   waiting and refuse messages), the worker is gone (a worker restart ends
-  every wake hook, and the item takes no `message` until the next turn's
-  hook), or an hour passes on the wall clock (a Mac's sleep counts); never
-  because no idle item is recorded yet, since a terminal's comes a minute
-  after its `Stop`. The worker stops offering and handing over messages a
-  minute before that hour, and the item then stays open with no `message`.
+  every wake hook, and an idle session takes no `message` until its next
+  turn's hook, mar3co/openswap#215), or an hour passes on the wall clock (a
+  Mac's sleep counts); never because no idle item is recorded yet, since a
+  terminal's comes a minute after its `Stop`. The worker stops offering and
+  handing over messages a minute before that hour, and the item then stays
+  open with no `message`.
   A `message` whose text is blank once whitespace and byte order marks are
   trimmed from its ends, is not strict UTF-8 (a lone surrogate) or holds
   `</system-reminder>` is `refused`. One to an item after whose `Stop` a turn
-  began, shown by a prompt dated after that `Stop` or a `busy` or `waiting`
-  status set after it, gets `item_closed` (a newer `Stop` supersedes the item,
-  as above); the first `idle` after the `Stop` belongs to the turn it ended,
-  however late it is written.
+  began, shown by a prompt dated after that `Stop` or a `busy` status set
+  after it, gets `item_closed` (a newer `Stop` supersedes the item, as above;
+  a background subagent's dialog, `waiting`, is not a newer turn); one to an
+  item already holding a message is `refused`; the first `idle` after the
+  `Stop` belongs to the turn it ended, however late it is written.
   A `message` handed to the hook is `sent`, and settles on the first decisive
   signal: the woken turn's `UserPromptSubmit`, a `<task-notification>` prompt
-  holding that note line followed by the text sent (up to the first
-  `</system-reminder>` after it, with whitespace and byte order marks trimmed
-  from both ends; the hook sends the worker a digest of it, never the text),
-  makes it `applied` and closes the item as `answered_from_watch`; a prompt
-  the owner typed first closes it as `answered_on_mac` and the reply stays
+  dated at or after the hand-over holding that note line followed by the text
+  sent (up to the first `</system-reminder>` after it, with whitespace and
+  byte order marks trimmed from both ends; the hook sends the worker a digest
+  of it, never the text), makes it `applied` and closes the item as
+  `answered_from_watch`; a prompt the owner typed first closes it as
+  `answered_on_mac` and the reply stays
   `sent` (a text already handed over then runs after the owner's turn); the
   session ending or `/clear` first closes it as `session_ended`. The session
   going `busy`, a background turn's prompt without the note and another turn's
@@ -2040,11 +2049,14 @@ questions (details off, or the detail cut for size):
   the woken turn the reply stays `sent`; it is never handed over twice.
 - Any local process can forge hook notices for any session (session IDs are
   readable from the session files). Typed replies accept what that allows,
-  none of which approves anything or sends text elsewhere: blocking typed
-  replies (forged prompts, `SessionEnd` notices or a flood of `Stop` notices),
-  a handed-over reply settling `sent` instead of `applied` (a forged
-  note-carrying prompt followed by a `Stop`), and a forged future-dated `Stop`
-  keeping hooks from pairing for up to an hour.
+  none of which approves anything: blocking typed replies (forged prompts,
+  `SessionEnd` notices or a flood of `Stop` notices), a handed-over reply
+  settling `sent` instead of `applied` (a forged note-carrying prompt followed
+  by a `Stop`), a forged future-dated `Stop` keeping hooks from pairing for up
+  to an hour, and, with the real `Stop` notice suppressed, a forged `Stop`
+  letting such a process's own wake command pair and receive a typed reply
+  meant for that session, which it can then make read `applied` with a forged
+  prompt naming the text (mar3co/openswap#181).
 
 Before handing a verdict or an answer over, the worker reads the session file:
 a prompt that is no longer waiting was answered at the Mac (`item_closed`).

@@ -538,7 +538,8 @@ def permission_main(*, backup_root: Path | None = None) -> int:
 
 def wake_main(*, backup_root: Path | None = None) -> int:
     """``openswap attention wake``: the ``Stop`` hook with ``asyncRewake``,
-    installed only while replies are on (plan 028).
+    installed with the question and permission hooks only while replies are on
+    (plan 028).
 
     At every ``Stop`` (the woken turn's own too) it waits for a typed reply to
     the session from the phone or watch. Given one, it writes the note line, a
@@ -1699,8 +1700,8 @@ def codex_hooks_status(codex_home: Path, backup_root: Path) -> str | None:
 
 def apply(backup_root: Path, enabled: bool, replies: bool = False, *, owner: bool = False,
           problems: list | None = None, notes: list | None = None) -> bool:
-    """Install the hooks in every managed config home (the question and
-    permission hooks only while ``replies`` too) and in the Codex home, or take them out of every
+    """Install the hooks in every managed config home (the question,
+    permission and wake hooks only while ``replies`` too) and in the Codex home, or take them out of every
     file OpenSwap ever put them in. Every place is tried; returns whether
     anything changed. What could not be changed goes into ``problems``, and
     what the owner should know into ``notes``, in words. ``owner`` is True for
@@ -1788,8 +1789,8 @@ def set_notices(backup_root: Path, enabled: bool) -> list[str]:
 
 def set_replies(backup_root: Path, enabled: bool) -> list[str]:
     """Settings › Remote › "Allow replies from my phone and watch" (this Mac
-    only): the switch, then the question and permission hooks in every managed
-    config home.
+    only): the switch, then the question, permission and wake hooks in every
+    managed config home.
     Not an owner's action for Codex: it never turns Codex's hooks feature on
     or moves the owner's Codex hooks."""
     from openswap import bundle

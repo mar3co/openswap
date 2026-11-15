@@ -764,9 +764,8 @@ def test_the_permission_hook_says_when_its_preview_shows_the_call_exactly(tmp_pa
     assert seen[0]["preview"] == attention.input_preview(bash("npm test"))[0] and seen[0]["exact"] is True
 
 
-@pytest.mark.parametrize("kind", ["permission", "question", "older question"])
+@pytest.mark.parametrize("kind", ["permission", "question"])
 def test_what_a_hook_sends_of_its_prompt_reaches_its_waiter(desktop, monkeypatch, kind):
-    older, kind = kind == "older question", kind.split()[-1]
     process = Process(PID + 9, PID, "Fri Nov  6 14:00:03 2026", ("openswap", "attention", kind))
     monkeypatch.setattr(peers, "peer_pid", lambda _c: process.pid)
     monkeypatch.setattr(peers, "hook_claude", lambda pid: CLAUDE)
@@ -777,9 +776,7 @@ def test_what_a_hook_sends_of_its_prompt_reaches_its_waiter(desktop, monkeypatch
                    "exact": True}
     else:
         shown = shown_questions(QUESTIONS)
-        # An older question hook said "answerable", by older rules: only the new hook's "whole" counts.
-        request = {"tool_key": attention.question_key({"questions": QUESTIONS}), "questions": shown,
-                   "answerable" if older else "whole": True}
+        request = {"tool_key": attention.question_key({"questions": QUESTIONS}), "questions": shown, "whole": True}
     stop = threading.Event()
     a, b = socket.socketpair()
     with a, b:
@@ -790,7 +787,7 @@ def test_what_a_hook_sends_of_its_prompt_reaches_its_waiter(desktop, monkeypatch
         while not desktop.store._waiters and time.monotonic() < deadline:
             time.sleep(0.01)
         [waiter] = desktop.store._waiters
-        assert waiter.shown == shown and waiter.whole is not older
+        assert waiter.shown == shown and waiter.whole
         stop.set()
         serving.join(5)
 
@@ -946,6 +943,30 @@ def test_g3_a_call_that_may_hold_a_credential_is_withheld_and_takes_deny_only(de
     [entry] = desktop.report()["items"]
     assert entry["detail"] == {"tool_name": "Bash", "description": attention.PREVIEW_WITHHELD}
     assert entry["actions"] == ["deny"]
+
+
+@pytest.mark.parametrize("hook_first", [True, False], ids=["hook first", "notice first"])
+def test_b5_a_withheld_call_takes_no_preview_and_no_allow_even_from_a_hook_sending_an_exact_one(desktop,
+                                                                                                hook_first):
+    tool_input = bash(f"deploy --token ghp_{SECRET}")
+    shown = attention.input_preview(bash("deploy"))[0]
+    t = desktop.clock.now
+    desktop.clock.now = t + 0.1
+    if hook_first:
+        desktop.store.waiter("permission", CLAUDE, SESSION, attention.tool_key(tool_input), tool_name="Bash",
+                             shown=shown, whole=True)
+    desktop.store.notice(hook("PermissionRequest", tool_name="Bash", tool_input=tool_input) | {"at": t + 0.1})
+    if not hook_first:
+        desktop.store.waiter("permission", CLAUDE, SESSION, attention.tool_key(tool_input), tool_name="Bash",
+                             shown=shown, whole=True)
+    desktop.status("waiting", t + 0.05)
+    desktop.store.notice(hook("Notification", notification_type="permission_prompt") | {"at": t + 6.1})
+    desktop.clock.now = t + 7
+    [entry] = desktop.report()["items"]
+    assert entry["detail"] == {"tool_name": "Bash", "description": attention.PREVIEW_WITHHELD}
+    assert entry["actions"] == ["deny"]
+    desktop.reply(entry["id"], "allow")
+    assert desktop.outcomes() == {"r1": "refused"}
 
 
 @pytest.mark.parametrize("relay", [True, False], ids=["paired", "unpaired"])

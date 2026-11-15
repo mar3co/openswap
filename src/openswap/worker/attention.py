@@ -142,9 +142,10 @@ WAKE_SECONDS = 3600.0
 WAKE_OFFER_SECONDS = WAKE_SECONDS - 60
 MAX_WAKERS = 32
 MAX_UNPAIRED_WAKERS = 2
-# A wake hook pairs only if the process Claude Code started for it began no
-# earlier than this before the Stop: ``ps`` gives whole seconds, and the hook's
-# wrapper starts before the Stop notice reads its clock.
+# When the Stop's own hook's launch is not known, a wake hook pairs only if the
+# process Claude Code started for it began no earlier than this before the Stop:
+# ``ps`` gives whole seconds, and the hook's wrapper starts before the Stop
+# notice reads its clock.
 LAUNCH_SECONDS = 2.0
 # What ends a wake hook's text in the woken turn's prompt (measured on 2.1.325):
 # a text holding it could not be told apart there.
@@ -768,7 +769,9 @@ class AttentionStore:
         self._waiters: list[Waiter] = []  # question and permission hooks waiting for a reply
         self._wakers: list[Waiter] = []  # wake hooks waiting for a message
         self._stopped: dict[tuple[str, int], float] = {}  # (session, Claude Code PID) -> its latest Stop
-        self._busy_at: dict[tuple[str, int], float] = {}  # (session, PID) -> its latest busy or waiting status
+        # The same -> when the process Claude Code started for that Stop's own hook began, when known.
+        self._stop_launch: dict[tuple[str, int], float] = {}
+        self._busy_at: dict[tuple[str, int], float] = {}  # (session, PID) -> its latest busy status
         self._read_at = 0.0  # when the session files were last read whole (0 while the last read was not)
         self._sent: dict[str, Sent] = {}  # item ID -> the reply delivered to it, until the item closes
         self._handled: dict[str, list] = {}  # reply ID -> [outcome, keep until]
@@ -1037,8 +1040,9 @@ class AttentionStore:
         at = notice.get("at")
         return at if isinstance(at, (int, float)) and abs(at - now) <= MAX_HOOK_AGE_SECONDS else now
 
-    def notice(self, notice: dict) -> None:
-        """Apply one validated notice (see ``validate_notice``) to the items.
+    def notice(self, notice: dict, launched: float | None = None) -> None:
+        """Apply one validated notice (see ``validate_notice``) to the items; a
+        Claude ``Stop`` notice's own hook began at ``launched`` (None: not known).
 
         Dropped while notices are off. While the settings cannot be read it is
         applied, but nothing new is published until they read again (an item
@@ -1060,7 +1064,7 @@ class AttentionStore:
                 i.session == notice.get("session_id") for i in self._items if i.id in self._sent)):
             self.refresh(for_notice=True)
         with self._lock:
-            if self._apply(notice, publishes):
+            if self._apply(notice, publishes, launched):
                 self._commit()
 
     def _shown(self, item: Item) -> bool:
@@ -1073,7 +1077,7 @@ class AttentionStore:
         else:
             self._held.add(item.id)
 
-    def _apply(self, notice: dict, publishes: bool) -> bool:
+    def _apply(self, notice: dict, publishes: bool, launched: float | None = None) -> bool:
         """One notice; without ``publishes``, what it would publish is held
         (``_held``) until the settings read again."""
         if notice["provider"] == "codex":
@@ -1159,11 +1163,15 @@ class AttentionStore:
             if at > self._stopped.get(key, -math.inf):
                 self._stopped.pop(key, None)
                 self._stopped[key] = at
+                self._stop_launch.pop(key, None)
+                if launched is not None:
+                    self._stop_launch[key] = launched
                 for oldest in list(self._stopped)[:-MAX_LAST_MESSAGES]:
                     del self._stopped[oldest]
+                    self._stop_launch.pop(oldest, None)
                 # Those that can pair with no Stop from this one on (``_paired``).
                 self._release([w for w in self._wakers_of(session, pid)
-                               if w.at < at - PAIR_SECONDS or w.launched < at - LAUNCH_SECONDS])
+                               if w.at < at - PAIR_SECONDS or not self._started_for_stop(key, w.launched)])
                 self.changed.set()
             if at > self._prompted.get(key, 0.0):
                 if notice.get("last_message"):
@@ -1211,7 +1219,8 @@ class AttentionStore:
             self._release([w for w in self._wakers_of(session, pid) if w is not paired])
             return self._close([i for i in mine if i.created_at <= at], "answered_on_mac")
         if event == "SessionEnd":
-            for table in (self._last_message, self._prompted, self._left_waiting, self._stopped, self._busy_at):
+            for table in (self._last_message, self._prompted, self._left_waiting, self._stopped, self._stop_launch,
+                          self._busy_at):
                 table.pop(key, None)
             self._release(self._wakers_of(session, pid))
             return self._close(mine, "session_ended")
@@ -1285,7 +1294,7 @@ class AttentionStore:
         named, after it was handed over, holds it no longer: its turn's
         ``Stop``, or the latest one if that came first, supersedes it."""
         held = [i for i in mine if i.kind == "idle" and self._hook_message(i)]
-        delivered = [i for i in held if reply and self._sent[i.id].token == reply]
+        delivered = [i for i in held if reply and self._sent[i.id].token == reply and at >= self._sent[i.id].at]
         missed = [i for i in held if reply and i not in delivered and at >= self._sent[i.id].at]
         for item in missed:
             self._sent[item.id].mismatch = True
@@ -1472,7 +1481,7 @@ class AttentionStore:
                 key = (record.session_id, record.pid)
                 if record.status in NOT_WAITING and record.status_at:
                     self._left_waiting[key] = max(record.status_at, self._left_waiting.get(key, 0.0))
-                if record.status in ("busy", "waiting"):
+                if record.status == "busy":
                     self._busy_at[key] = max(record.status_at, self._busy_at.get(key, 0.0))
             # A channel request whose session has stopped waiting since lost its prompt.
             self._requests = [r for r in self._requests if r.at >= self._left_since(r.session, r.claude_pid)]
@@ -1530,7 +1539,8 @@ class AttentionStore:
                     self._due_exit[item.id] = exit_at
             for item in ended:
                 key = (item.session, item.pid)
-                for table in (self._last_message, self._prompted, self._left_waiting, self._stopped, self._busy_at):
+                for table in (self._last_message, self._prompted, self._left_waiting, self._stopped,
+                              self._stop_launch, self._busy_at):
                     table.pop(key, None)
                 self._known_procs.discard(key)
                 if not live.get(item.session):
@@ -1990,7 +2000,8 @@ class AttentionStore:
         if not self._serves(home, claude, session, channel=False):
             return None
         with self._lock:
-            if launched is None or launched < self._stopped.get((session, claude.pid), -math.inf) - LAUNCH_SECONDS:
+            key = (session, claude.pid)
+            if launched is None or (key in self._stopped and not self._started_for_stop(key, launched)):
                 return None
             paired = self._paired(session, claude.pid)
             others = [w for w in self._wakers if not w.done.is_set() and w.claude_pid == claude.pid and w is not paired]
@@ -2011,20 +2022,32 @@ class AttentionStore:
         Code process ``pid``, whichever came first: that ``Stop`` is dated after
         the latest prompt, and exactly one waiting hook registered within
         PAIR_SECONDS of it, from a process Claude Code started for it
-        (``LAUNCH_SECONDS``). With two such hooks, neither: which one ran with
-        the ``Stop`` is not known."""
+        (``_started_for_stop``). With two such hooks, neither: which one ran
+        with the ``Stop`` is not known."""
         key = (session, pid)
         at = self._stopped.get(key)
         if at is None or at <= self._prompted.get(key, 0.0):
             return None
         hooks = [w for w in self._wakers_of(session, pid)
-                 if abs(w.at - at) <= PAIR_SECONDS and w.launched >= at - LAUNCH_SECONDS]
+                 if abs(w.at - at) <= PAIR_SECONDS and self._started_for_stop(key, w.launched)]
         return hooks[0] if len(hooks) == 1 else None
+
+    def _started_for_stop(self, key: tuple[str, int], launched: float) -> bool:
+        """Whether a wake hook whose process under Claude Code began at
+        ``launched`` may have been started for the latest ``Stop`` of ``key``:
+        it began no earlier than the second before that ``Stop``'s own hook
+        did (both read from ``ps``, in whole seconds), or, when that is not
+        known, no earlier than ``LAUNCH_SECONDS`` before the ``Stop``'s time."""
+        stop_launch = self._stop_launch.get(key)
+        if stop_launch is not None:
+            return stop_launch - launched <= 1
+        return launched >= self._stopped[key] - LAUNCH_SECONDS
 
     def _turned_since(self, item: Item) -> bool:
         """Whether a turn began in the item's process after its latest ``Stop``:
-        a prompt dated after it, or a busy or waiting status set after it. The
-        first ``idle`` after it belongs to the turn it ended, however late."""
+        a prompt dated after it, or a ``busy`` status set after it. A
+        ``waiting`` one is not (a background subagent's dialog), and the first
+        ``idle`` after it belongs to the turn it ended, however late."""
         key = (item.session, item.pid)
         at = self._stopped.get(key)
         return at is not None and max(self._prompted.get(key, 0.0), self._busy_at.get(key, 0.0)) > at
@@ -2115,7 +2138,7 @@ class AttentionStore:
         cannot be told from the real one, so the prompt then takes no reply for
         good."""
         detail = SHOWN_DETAIL.get(item.kind)
-        if detail is None or (item.kind == "permission" and item.pid in self._channels):
+        if detail is None or (item.kind == "permission" and item.pid in self._channels) or _withheld(item):
             return
         sent = []
         for waiter in self._waiters_for(item):
@@ -2166,13 +2189,14 @@ class AttentionStore:
         """The replies an item takes now, and only while nothing but its own
         Claude Code process has been seen for its session since it opened. A
         session with a live channel: a permission prompt paired with the
-        channel's own request, a question shown whole whose one synchronous hook
+        channel's own request, a question shown whole whose one question hook
         waits for it, an idle session. A session without one, on a surface in
-        ``HOOK_REPLY_SURFACES`` (plan 028): a permission prompt or a question
-        shown whole whose one synchronous hook waits for it, an idle session
-        whose file says ``idle`` while its one wake hook can take a message
+        ``HOOK_REPLY_SURFACES`` (plan 028), through its own reply hooks: a
+        permission prompt whose one permission hook waits for it, a question
+        shown whole whose one question hook waits for it, an idle session whose
+        file says ``idle`` while its one wake hook can take a message
         (``_waker``). Allow only while details are on and show the very call it
-        would allow."""
+        would allow, never for a withheld call (``_withheld``)."""
         if (not (switches.notices and switches.replies) or item.provider != "claude" or not item.published
                 or item.id in self._unknown or not self._alone(item) or self._unsure(item)):
             return []
@@ -2184,7 +2208,8 @@ class AttentionStore:
                 waiters = self._waiters_for(item)
                 if len(waiters) != 1 or item.id in self._tainted:
                     return []
-                return ["allow", "deny"] if switches.details and self._shows(item, waiters[0]) else ["deny"]
+                return (["allow", "deny"] if switches.details and self._shows(item, waiters[0])
+                        and not _withheld(item) else ["deny"])
             request = self._attached.get(item.id)
             # Only the channel that relayed the request can answer it.
             if request is None or item.id in self._tainted or request.channel != (channel.pid, channel.started):
@@ -2306,6 +2331,8 @@ class AttentionStore:
             # Answered at the Mac (it closes after its grace), unless queued dialogs hide which.
             return ("refused" if self._waiting_again(item) else "item_closed"), None
         if reply["action"] == "message" and item.kind == "idle" and self._hook_replies(item):
+            if item.id in self._sent:
+                return "refused", None
             if self._turned_since(item):
                 return "item_closed", None  # a turn the owner did not see began since
             if not wakes_with(reply["text"]):
