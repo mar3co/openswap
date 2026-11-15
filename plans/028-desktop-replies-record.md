@@ -565,3 +565,21 @@ union verified, linear time). Minors:
   - Codex findings are handled the same way: fix Criticals, and fix Importants
     only when reachable on production and not in code this PR's fix rounds
     added.
+- **Codex on 6d90b0a:**
+  - two P1s, each sending a credential part off the Mac: an apostrophe in a
+    URL password (call check and prose), and an escaped quote inside a JSON
+    header value (prose). Treated as Critical; the managing session was told
+    first. Fixed in bd0856e (widening only, tests); threads answered and
+    resolved;
+  - the earlier P1 on text from past the cap: tracked as mar3co/openswap#219.
+- **Masking-scope ruling** (managing session, applying the owner's rules,
+  2026-11-15). On main, Claude's last message and question text already reach
+  the watch unmasked whenever details are on (plan 025 D1), so prose masking in
+  this PR only reduces exposure, and pattern masking can never be complete; the
+  hard boundary is the "Send details" switch. From here on:
+  - a new prose-masking miss becomes a tracked issue, not a fix round;
+  - only a gap that lets a hidden command be allowed from the watch, or that
+    shows a credential main would not show, reopens the code. Call previews are
+    new in this PR, so a credential-check miss counts.
+  
+  The PR body says so.
