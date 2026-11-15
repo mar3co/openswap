@@ -139,6 +139,8 @@ def test_prose_has_token_shapes_masked(shape):
     ("Run curl -u admin:'p\\'q'r st'uv then", ("st", "uv")),
     ('Run -u a:\\"\\"SE" CR ok', ("SE", "CR")),
     ("Run curl -u admin:'it'\\''s secret' x", ("secret",)),
+    ("Run curl -u 'admin:it\\'s secret' now", ("secret",)),
+    ("Run curl -u admin:'pa\\'ss word' now", ("ss", "word")),
 ])
 def test_prose_shows_no_part_of_a_login_password_quoted_as_the_shell_reads_it(text, hidden):
     shown = mask_shapes(text)

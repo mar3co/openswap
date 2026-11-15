@@ -1990,8 +1990,11 @@ questions (details off, or the detail cut for size):
   is not that turn's own `Stop` hook), the hook must have begun no more than 2
   seconds before the `Stop`'s time instead. So a session command started 2 s or more before the `Stop` (a
   background task's shell, started during the turn) never pairs, unless a
-  forged `Stop` notice is used and the real one is suppressed (both need a
-  hostile local process). When two hooks qualify, neither pairs and the item
+  forged `Stop` notice is used, dated near the command's own start, and no real
+  `Stop` comes later (the real one is suppressed, or the turn ended by Esc,
+  which runs no `Stop`); both need a hostile local process. A `Stop` hook that
+  takes more than 5 seconds to start (a cold start under memory pressure)
+  leaves that turn without a typed-reply box. When two hooks qualify, neither pairs and the item
   takes no `message`. A `Stop` older than the one recorded pairs nothing and
   releases nothing. A newer `Stop` releases the hooks that can no longer pair;
   the owner typing releases every hook of that process except one paired with
