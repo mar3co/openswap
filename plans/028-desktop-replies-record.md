@@ -587,3 +587,12 @@ union verified, linear time). Minors:
   Prose-masking interplay (one pattern's mask hiding another credential's
   start, partly predating it): tracked as mar3co/openswap#220 under the
   masking-scope ruling.
+- **Codex on a869311:** two call-check misses (a `pwd` object key; an
+  apostrophe in a URL username). These are new exposure, since Desktop call
+  previews are new, so they reopened the code with the managing session's
+  agreement. Fixed in d60af95 (widening only, tests); threads resolved.
+- **Final-round ruling** (managing session, 2026-11-15). After this round the
+  loop ends. Another call-preview miss from Codex is filed as a tracked issue
+  with its example, not fixed in this PR. The managing session will put the
+  trade-off to the owner first: ship with a known denylist gap, or withhold
+  Desktop call previews by default.
