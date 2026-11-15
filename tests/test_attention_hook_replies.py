@@ -364,6 +364,19 @@ def test_h8_an_exit_seen_late_in_the_grace_restarts_it_for_the_calls_own_signal(
     assert desktop.closes() == {item.id: "answered_on_mac"} and desktop.outcomes() == {}
 
 
+def test_an_exit_seen_early_keeps_the_grace_from_the_hand_over_for_the_calls_own_signal(desktop):
+    item = _denied(desktop, closed=None)
+    sent = desktop.clock.now
+    desktop.clock.now = sent + 0.5
+    desktop.status("busy", sent + 0.5)  # the Mac's Yes, seen early: the call runs for a while
+    desktop.clock.now = sent + 2.5
+    desktop.store.tick()
+    assert desktop.closes() == {}
+    desktop.store.notice(hook("PostToolUse", tool_name="Bash", tool_input=bash("npm test")) | desktop.at(0))
+    _after_grace(desktop)
+    assert desktop.closes() == {item.id: "answered_on_mac"} and desktop.outcomes() == {}
+
+
 def test_h8_a_hook_deny_whose_hook_left_before_taking_it_settles_refused_and_closes_on_its_own_signal(desktop):
     item = desktop.prompt(relay=False)
     waiter = desktop.permission(item)
