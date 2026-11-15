@@ -47,7 +47,7 @@ def _userinfo(space: str) -> str:
     """A URL's ``user:password@``, or a user alone as long as a token
     (``https://<token>@github.com``), ending at a character of ``space``."""
     return (rf"(?i:(?<![a-z0-9+.-])([a-z][a-z0-9+.-]*+://)"
-            rf"(?:[^/{space}@:\"'<>]*+:[^/{space}@\"<>]++|[A-Za-z0-9_-]{{20,}}+)@)")
+            rf"(?:[^/{space}@:\"<>]*+:[^/{space}@\"<>]++|[A-Za-z0-9_-]{{20,}}+)@)")
 
 
 # In a call only ASCII whitespace ends one: a password may hold any other space.
@@ -135,8 +135,12 @@ def holds_credential(value: object) -> bool:
     (``HTTP_AUTH``, ``OPENAI_KEY``, ``--signing-key``, ``X-Master-Key:``; not
     a header's non-secret key, such as ``Idempotency-Key:``). A value past
     ``CHECK_BUDGET`` is taken to hold one."""
-    strings = _strings(value)
+    keys: list[str] = []
+    strings = _strings(value, keys)
     if strings is None:
+        return True
+    # An object key ``pwd`` names a password; only the shell's ``$PWD`` and ``$(pwd)`` don't.
+    if any(key.lower() in ("pwd", "oldpwd") and not key.isupper() for key in keys):
         return True
     text = "\n".join(strings)
     return _CREDENTIAL.search(text) is not None or any(
@@ -177,8 +181,9 @@ def _mask_flag_passwords(text: str) -> str:
     return "".join(pieces) + text[at:]
 
 
-def _strings(value: object) -> list[str] | None:
-    """Every string in ``value``, keys included, or None past ``CHECK_BUDGET``."""
+def _strings(value: object, keys: list[str]) -> list[str] | None:
+    """Every string in ``value``, keys included (and also added to ``keys``),
+    or None past ``CHECK_BUDGET``."""
     strings, stack, size = [], [value], 0
     while stack:
         value = stack.pop()
@@ -188,6 +193,7 @@ def _strings(value: object) -> list[str] | None:
         if isinstance(value, str):
             strings.append(value)
         elif isinstance(value, dict):
+            keys += [key for key in value if isinstance(key, str)]
             stack += [*value, *value.values()]
         elif isinstance(value, list):
             stack += value[::-1]  # in order, so a command list reads as its words do

@@ -147,6 +147,18 @@ def test_prose_shows_no_part_of_a_credential_holding_a_quote(text, hidden):
     assert REDACTED in shown and not any(part in shown for part in hidden)
 
 
+@pytest.mark.parametrize("value", [
+    {"pwd": "hunter2"}, {"login": {"user": "a", "pwd": "x"}}, {"command": "curl https://o'connor:hunter2@example.com"},
+])
+def test_a_pwd_key_or_a_url_user_holding_an_apostrophe_holds_a_credential(value):
+    assert holds_credential(value)
+
+
+@pytest.mark.parametrize("value", [{"env": {"PWD": "/tmp"}}, {"command": "cd $PWD && pwd"}, {"command": 'echo "$(pwd)"'}])
+def test_the_shells_working_directory_holds_no_credential(value):
+    assert not holds_credential(value)
+
+
 def test_a_url_password_holding_an_apostrophe_holds_a_credential():
     assert holds_credential({"command": "curl https://user:p'ass@example.com/x"})
 
