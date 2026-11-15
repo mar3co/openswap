@@ -238,3 +238,25 @@ Round 3 ruling check (Opus, one pass), with amendments before dispatch:
   and `SORT_KEY` now lose Allow (accepted false positive).
 - Review round 4: 275+/85− lines, below the 400 line, so one cold seat and the
   silent-failure seat, both Opus.
+
+### Task 1 review round 4 (1834993..6925c6b; cold and silent-failure seats)
+
+No Critical findings; the safety rules have converged. The Importants are
+mostly needless withholds, plus two narrow leaks in prose. Made inline by the
+controller (d715367, TDD, suite 7632 passed), since each fix only narrows a
+false positive under a conservative condition or closes a gap:
+- `pass` counts only in upper-case names, flags and header names, so Python's
+  `pass` keyword and "tests pass" keep Allow.
+- Login flags skip `uid:gid`, formats (`date -u +%H:%M`), substitutions, another
+  flag, and a URL or path after the colon.
+- `SSH_AUTH_SOCK` is exempt. The docs now say upper-case constants in code
+  count (accepted).
+- Header-style names before a colon (`X-Auth-Key:`) are read like flags.
+- `Bearer`/`Basic` in prose needs a digit in the token.
+- Prose masks a login flag's password, and quoted parts after `=` in an
+  unquoted header value. URL userinfo excludes only ASCII whitespace.
+- `max()` grace is pinned by a mutation-checked test.
+
+Not changed: an early close by a hostile sole waiter (mar3co/openswap#212).
+
+Review: one cold seat (112 changed lines).
