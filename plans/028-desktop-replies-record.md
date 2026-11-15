@@ -102,3 +102,24 @@ items F1–F8.
 
 Implementer for the fix round: a fresh Opus agent. The Task 1 implementer
 measured 371k of context, and a round this size would pass the 400k line.
+
+Pre-dispatch ruling check (Opus adversarial reader, one pass, 2026-11-15). It
+found wrong states in F1, F2, F4, F5, F6, F7 and F8. The notes were amended
+before dispatch:
+- JSON escapes count as exact; Zl/Zp and runs of spaces make a preview
+  deny-only.
+- Masking is done with cut-straddling secrets in mind; quoted values are masked
+  whole; only substitutions and variable references stay readable. The token
+  shapes also apply to the Bash `description` and `last_message` (a fold-in).
+- A question's wholeness comes from the waiting hook.
+- Plan row 3 is amended for queued prompts.
+- F8 decides only on the call's own signals.
+
+F8's premise was measured: on 2.1.325, neither a hook deny nor a host deny
+fires `PostToolUseFailure`. Both continue the turn and end with `Stop`. **Known
+imprecision, accepted:** a Mac "No" within 2 s of a watch Deny can be credited
+to the watch; the call is denied either way. No re-pass: no ruling on money or
+entitlement changed.
+
+Fix-round implementer: fresh Opus agent, with the notes file and the Task 1
+report as inputs.

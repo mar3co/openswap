@@ -171,7 +171,7 @@ designs the mechanism, and its review seats check these.
 |---|---|---|
 | 1 | A prompt in a session with a live channel | Answered through the channel exactly as today; the new hooks exit at once and take no reply |
 | 2 | A prompt in a session without a channel, one waiter | Takes the actions above; a watch verdict that arrives first decides it, and the Mac's dialog closes |
-| 3 | The owner answers at the Mac first | The item closes as `answered_on_mac`; the waiter is released within 2 s of the worker seeing the session leave `waiting`; a verdict already handed to the hook has no effect and is never reported `applied` |
+| 3 | The owner answers at the Mac first | The item closes as `answered_on_mac`; the waiter is released within 2 s of the worker seeing the session leave `waiting` (amended 2026-11-15: when another prompt of the same process is queued behind it, or its item isn't recorded yet, within 2 s of its own item closing); a verdict already handed to the hook has no effect and is never reported `applied` |
 | 4 | The watch's verdict reaches the hook just as the Mac answers | `applied` and `answered_from_watch` only when plan 025 row 12's rule shows the watch won; otherwise `answered_on_mac`, and the reply settles as not applied |
 | 5 | Two waiters (or none) claim one item | The item takes no reply (a command the session runs can block replies, never approve a call) |
 | 6 | The session ends or `/clear`s while a hook waits | The item closes as `session_ended`; the hook exits without output; no OpenSwap process outlives its Claude Code process by more than 2 s |
