@@ -41,32 +41,36 @@ _KEY_LABEL = r"[A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----"
 _USERINFO = (r"(?i:(?<![a-z0-9+.-])([a-z][a-z0-9+.-]*+://)"
              r"(?:[^/ \t\r\n\f\v@:\"'<>]*+:[^/ \t\r\n\f\v@\"'<>]++|[A-Za-z0-9_-]{20,}+)@)")
 # ``user:password`` given to a login flag (``curl -u``, ``psql -U``, ``http --auth``); the user is
-# bounded so that flags packed into one long word stay linear. Not a ``uid:gid``, a format
-# (``date -u +%H:%M``), a substitution, another flag, or a URL or path after the colon.
-_FLAG_USER = (r"(?<![A-Za-z0-9_-])(?:-[uUa]|--(?:(?:proxy-)?user|auth)(?=[=\s]))(?:=|\s*+)[\"']?"
-              r"(?!\d{1,10}+:\d{1,10}+(?![^\s\"']))(?!-)[^\s:\"'%$()]{0,128}+:(?![/\"'])")
-_CREDENTIAL = re.compile("|".join([*_TOKENS, rf"-----(?:BEGIN|END){_KEY_LABEL}", _USERINFO, rf"{_FLAG_USER}\S"]))
+# bounded so that flags packed into one long word stay linear.
+_FLAG = r"(?<![A-Za-z0-9_-])(?:-[uUa]|--(?:(?:proxy-)?user|auth)(?=[=\s]))(?:=|\s*+)"
+_LOGIN_USER = r"[^\s:\"']{0,128}+:"
+_CREDENTIAL = re.compile("|".join([*_TOKENS, rf"-----(?:BEGIN|END){_KEY_LABEL}", _USERINFO,
+                                   rf"{_FLAG}[\"']?{_LOGIN_USER}[^\s\"']"]))
 
 _SHAPES = re.compile("|".join([rf"-----BEGIN{_KEY_LABEL}.*?(?:-----END{_KEY_LABEL}|\Z)", *_TOKENS]), re.DOTALL)
 _URL_PASSWORD = re.compile(_USERINFO)
-_FLAG_PASSWORD = re.compile(rf"({_FLAG_USER})[^\s\"'`]++")
+# The password after a login flag in prose: to the quote that opened before the user, or to the
+# end of the word, quoted parts included.
+_FLAG_PASSWORD = re.compile(rf"({_FLAG}\"{_LOGIN_USER})[^\r\n\"]++|({_FLAG}'{_LOGIN_USER})[^\r\n']++"
+                            rf"|({_FLAG}{_LOGIN_USER})(?:[^\s\"'`]|\"[^\r\n\"]*+\"?|'[^\r\n']*+'?)++")
 # An ``Authorization`` or ``Cookie`` header (``HTTP_AUTHORIZATION`` too, and a quoted name, as in
 # JSON): a quoted value up to its closing quote, or an unquoted one up to the line's end or a
 # quote, quoted parts after ``=`` included (``sessionid="…"``, ``Digest response="…"``).
 _HEADER = re.compile(r"(?i)(?<![A-Za-z0-9_])((?:[A-Za-z0-9]++_)*+(?:(?:proxy-)?authorization|(?:set-)?cookie)"
                      r"[\"']?[ \t]*+:[ \t]*+[\"']?)(?:(?<=\")[^\r\n\"]*+|(?<=')[^\r\n']*+"
                      r"|(?:[^\r\n\"']|(?<==)\"[^\r\n\"]*+\"?|(?<==)'[^\r\n']*+'?)++)")
-# A scheme's word before a token-long word with a digit, as a header value is written (not a path
-# or an identifier in prose: ``basic tests/test_x.py``).
-_SCHEME_TOKEN = re.compile(rf"(?i){_START}((?:bearer|basic)[ \t]++)(?=[A-Za-z_.~+/=-]*+\d)[A-Za-z0-9_.~+/=-]{{20,}}+")
-# A header-style name before its colon (``X-Auth-Key: …``): read like a flag.
-_HEADER_COLON = re.compile(r"[ \t]*+:")
+# A scheme's word before a token-long word, as a header value is written.
+_SCHEME_TOKEN = re.compile(rf"(?i){_START}((?:bearer|basic)[ \t]++)[A-Za-z0-9_.~+/=-]{{20,}}+")
+# A header's name before its colon and value (``X-Auth-Key: …``, ``Ocp-Apim-Subscription-Key: …``):
+# read like a flag. Not a YAML key or CSS selector (``auth-service:``, ``.auth-form:hover``).
+_HEADER_NAME = re.compile(r"[Xx]-[A-Za-z0-9-]+|[A-Z][a-z0-9]*+(?:-[A-Z][a-z0-9]*+)++")
+_HEADER_COLON = re.compile(r"[ \t]*+:[ \t]++\S")
 # A name (``DB_PASSWORD``, ``--api-key``, ``apiKey``) that may hold a secret
 # word; whether it does is decided by its segments (``_secret_name``).
 _NAMED = re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]*?(?i:pass|pw|secret|credential|token|key|auth|bearer"
                     r"|cookie)[A-Za-z0-9_-]*+")
 _CAMEL = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|\d+")
-_SECRET_SEGMENTS = frozenset({"password", "passwd", "pwd", "secret", "credential", "credentials", "token",
+_SECRET_SEGMENTS = frozenset({"password", "passwd", "pass", "pwd", "secret", "credential", "credentials", "token",
                               "apikey", "authorization", "bearer", "cookie"})
 _SECRET_PAIRS = frozenset({("api", "key"), ("access", "key"), ("private", "key")})
 # The shell's working directories (``$PWD``, ``$(pwd)``) and the SSH agent's socket.
@@ -75,10 +79,10 @@ _PLAIN_NAMES = frozenset({"pwd", "oldpwd", "ssh_auth_sock"})
 # ``clientsecret``): a false alarm only costs a preview its Allow.
 _SECRET_WORDS = ("password", "passwd", "passphrase", "secret", "credential")
 # Segments that make a name secret only in an environment variable's name, a
-# command-line flag or a header name (``HTTP_AUTH``, ``DB_PASS``, ``--auth``,
-# ``X-Auth-Key:``): in code, prose and paths they are ordinary (``useAuth``,
-# ``auth/views.py``, Python's ``pass``).
-_FLAG_SEGMENTS = frozenset({"auth", "pw", "pass"})
+# command-line flag or a header name (``HTTP_AUTH``, ``DB_PW``, ``--auth``,
+# ``X-Auth-Key:``): in code and paths they are ordinary (``useAuth``,
+# ``auth/views.py``).
+_FLAG_SEGMENTS = frozenset({"auth", "pw"})
 
 
 def holds_credential(value: object) -> bool:
@@ -96,7 +100,8 @@ def holds_credential(value: object) -> bool:
         return True
     text = "\n".join(strings)
     return _CREDENTIAL.search(text) is not None or any(
-        _secret_name(m[0], header="-" in m[0] and _HEADER_COLON.match(text, m.end()) is not None)
+        _secret_name(m[0], header=_HEADER_NAME.fullmatch(m[0]) is not None
+                     and _HEADER_COLON.match(text, m.end()) is not None)
         for m in _NAMED.finditer(text))
 
 
@@ -110,7 +115,7 @@ def mask_shapes(text: str) -> str:
     text = _SHAPES.sub(REDACTED, text)
     text = _URL_PASSWORD.sub(rf"\1{REDACTED}@", text)
     text = _HEADER.sub(rf"\1{REDACTED}", text)
-    text = _FLAG_PASSWORD.sub(rf"\1{REDACTED}", text)
+    text = _FLAG_PASSWORD.sub(lambda m: f"{m[1] or m[2] or m[3]}{REDACTED}", text)
     return _SCHEME_TOKEN.sub(rf"\1{REDACTED}", text)
 
 

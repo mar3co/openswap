@@ -725,9 +725,10 @@ exactly these fields, and optionally `session_id` and `detail`:
   values of `Authorization` and `Cookie` headers (a quoted name or value, as in
   JSON, and a prefixed name such as `HTTP_AUTHORIZATION` too, a quoted value up
   to its closing quote, and quoted parts after `=` in an unquoted value), the
-  password after a login flag such as `curl -u user:` and a word of 20 or more
-  token characters with a digit after `Bearer` or `Basic` masked as
-  `[REDACTED]`, never cut through) and
+  password after a login flag such as `curl -u user:` (to the quote that
+  opened before the user, or to the end of its word) and a word of 20 or more
+  token characters after `Bearer` or `Basic` masked as `[REDACTED]`, never cut
+  through) and
   `questions` (1–4 closed objects, each with
   `question` (1–1,000), an optional `header` (1–100) and `options`, 0–4
   option labels of 1–100 characters; every character outside ASCII but
@@ -1852,22 +1853,21 @@ questions (details off, or the detail cut for size):
   anywhere in its input, keys included (API keys and tokens, a private key's
   BEGIN or END line, a URL's password, a URL's user of 20 or more token
   characters, `user:password` after `-u`, `-U`, `-a`, `--user`, `--proxy-user`
-  or `--auth`, attached, after `=` or after any whitespace, but not a
-  `uid:gid`, a format such as `date -u +%H:%M`, a substitution, another flag,
-  or a URL or path after the colon), a secret-sounding
+  or `--auth`, attached, after `=` or after any whitespace), a secret-sounding
   word or name segment
-  (`password`, `passwd`, `pwd` but not the bare `PWD`, `OLDPWD`,
+  (`password`, `passwd`, `pass`, `pwd` but not the bare `PWD`, `OLDPWD`,
   `SSH_AUTH_SOCK` or `$(pwd)`, `secret`, `credential(s)`, `token` or a word ending in it such as
   `accesstoken`, `apikey`, `api_key`,
   `access_key`, `private_key`, `authorization`, `bearer`, `cookie`, split on
   `_ - . /`, spaces, `=`, `:` and camelCase; `password`, `passwd`,
   `passphrase`, `secret` and `credential` count anywhere in a name, as in
   `PGPASSWORD`; in an upper-case name (an environment variable, or a constant
-  in code such as `STORAGE_KEY`), a flag or a header-style name before its
-  colon, also `auth`, `pw`, `pass` and a last segment `key` after another, as in
-  `HTTP_AUTH`, `DB_PW`, `DB_PASS`, `--auth`, `OPENAI_KEY`, `--signing-key` and
-  `X-Auth-Key:`, but not in other code, prose or paths, so `useAuth`,
-  `auth/views.py`, `primary_key`, `ForeignKey` and Python's `pass` keep Allow),
+  in code such as `STORAGE_KEY`), a flag or a header's name before its colon
+  and value (`X-…` or Title-Case, such as `X-Auth-Key:` and
+  `Ocp-Apim-Subscription-Key:`), also `auth`, `pw` and a last segment `key`
+  after another, as in `HTTP_AUTH`, `DB_PW`, `--auth`, `OPENAI_KEY` and
+  `--signing-key`, but not in other code, YAML keys or paths,
+  so `useAuth`, `auth/views.py`, `primary_key` and `ForeignKey` keep Allow),
   or more than 262,144 characters of text (each entry of an object or list
   counting one more);
   its item shows "Preview withheld: it may contain a credential." and takes

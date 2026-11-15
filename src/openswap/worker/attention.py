@@ -1414,7 +1414,7 @@ class AttentionStore:
                 if not self._shown(item):
                     changed = self._close([item], "answered_on_mac") or changed
                 elif item.id not in self._due:
-                    self._due[item.id] = max(self._due.get(item.id, 0.0), now + SESSION_END_GRACE_SECONDS)
+                    self._due[item.id] = now + SESSION_END_GRACE_SECONDS
                     self._due_exit[item.id] = exit_at
             for item in ended:
                 key = (item.session, item.pid)
