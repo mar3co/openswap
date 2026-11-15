@@ -185,3 +185,16 @@ ruling. Amendments:
 
 Fix round 2 implementer: fresh Opus agent. The round 1 agent is over the 400k
 line.
+
+### Task 1 fix round 2 (dd2bce4, 1834993)
+
+- dd2bce4: G1–G4 and the Minors, by a fresh Opus implementer (suite 7533
+  passed). `redact.py` is now a credential check plus prose masking.
+- Controller rulings on its report:
+  - **Scope note** (the withheld line also replaces Claude's description on
+    notice-only items): accepted, the safer direction.
+  - **Suggestion** (match `password`, `passwd`, `secret` and `credential`
+    anywhere in a name, so `PGPASSWORD` is caught): adopted. A false positive
+    costs only Allow; a miss sends a password off the Mac. Made inline
+    (1834993); suite 7536 passed.
+- Review round 3 dispatched on 5828809..1834993: the same four Opus seats.
