@@ -150,38 +150,78 @@ def channel_preview(tool_input: object) -> str | None:
     return preview if len(preview) <= PREVIEW_TOTAL_LIMIT else None
 
 
-def input_preview(tool_input: object) -> str:
+# A call's preview masks at most this many characters of it (about a tenth of
+# a second); a field past that is left out, so no input can stall the hook.
+PREVIEW_MASK_BUDGET = 256 * 1024
+# Each field a preview shows keeps at least this many characters, more than
+# its cut marker, so a cut field always shows one.
+PREVIEW_FIELD_MIN = 60
+_SPACE_RUN = re.compile(" {4,}")
+
+
+def input_preview(tool_input: object) -> tuple[str, bool]:
     """The call the permission hook waits for, as the phone and watch show it
-    before Allow (plan 028, R1a): Claude Code's channel form ``{ "key": value, … }``
-    with every recognizable credential masked, each field cut in the middle to
-    its share of ``DETAIL_CAPS["input_preview"]``. Empty for an input that is
-    not an object."""
-    from openswap.redact import mask_value
-    from openswap.worker.attention import clean_text
+    before Allow (plan 028, R1a), and whether it shows the call exactly.
+
+    The form is Claude Code's channel form, ``{ "key": value, … }`` with each
+    value as JSON. It is exact when nothing in it differs from the call but
+    JSON's own escapes; anything else is visible in it and makes it inexact:
+    recognizable credentials masked; a field cut in its middle or left out,
+    with a marker; format, bidi and zero-width characters, line and paragraph
+    separators, DEL and C1 controls and lone surrogates written as their JSON
+    escapes; a run of four or more spaces, which could push the rest of a
+    command out of sight, as a marker. ("", False) for an input that is not an
+    object, or is empty."""
+    from openswap.redact import mask_secrets, mask_value
+    from openswap.worker.attention import escape_hidden
     from openswap.worker.protocol import DETAIL_CAPS
 
     if not isinstance(tool_input, dict) or not tool_input:
-        return ""
+        return "", False
     cap = DETAIL_CAPS["input_preview"]
-    share = max(40, (cap - 4 - 2 * (len(tool_input) - 1)) // len(tool_input))
-    fields = []
-    for key, value in mask_value(tool_input).items():
-        try:
-            value = json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
-        except (ValueError, RecursionError):
-            value = "(value unserializable)"
-        fields.append(_middle_cut(f"{json.dumps(str(key), ensure_ascii=False)}: {value}", share))
-    return clean_text(_middle_cut("{ " + ", ".join(fields) + " }", cap), cap, multiline=True)
+    fields = list(tool_input.items())
+    room = (cap - 4) // (PREVIEW_FIELD_MIN + 2)
+    entries = fields
+    if len(fields) > room:
+        # The first and last fields, and a marker for those left out between them.
+        shown = room - 1
+        entries = [*fields[:shown // 2], None, *fields[len(fields) - (shown - shown // 2):]]
+    share = (cap - 4 - 2 * (len(entries) - 1)) // len(entries)
+    budget, exact, parts = PREVIEW_MASK_BUDGET, entries is fields, []
+    for entry in entries:
+        if entry is None:
+            text = f"⋯ {len(fields) - len(entries) + 1} fields left out ⋯"
+        else:
+            key, value = entry
+            name = mask_secrets(key) if len(key) <= PREVIEW_FIELD_MIN else "⋯"
+            try:
+                raw = json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+            except (TypeError, ValueError, RecursionError):
+                raw = None
+            if raw is None or len(key) + len(raw) > budget:
+                text = (f"{json.dumps(name, ensure_ascii=False)}: "
+                        + ("(value unserializable)" if raw is None else f"⋯ {len(raw)} characters left out ⋯"))
+                exact = False
+            else:
+                budget -= len(key) + len(raw)
+                masked = mask_value({key: value})[key]
+                exact = exact and name == key and masked == value
+                text = f"{json.dumps(name, ensure_ascii=False)}: " + (
+                    raw if masked == value else json.dumps(masked, ensure_ascii=False, separators=(",", ":")))
+        shown = _middle_cut(_SPACE_RUN.sub(lambda m: f" ⋯ {len(m[0])} spaces ⋯ ", escape_hidden(text)), share)
+        exact = exact and shown == text
+        parts.append(shown)
+    return "{ " + ", ".join(parts) + " }", exact
 
 
 def _middle_cut(text: str, limit: int) -> str:
-    """``text`` within ``limit`` characters, its middle left out when longer (its
-    start and end both show)."""
+    """``text`` within ``limit`` characters, its middle left out when longer,
+    and a marker where it was: its start and end both show."""
     if len(text) <= limit:
         return text
     marker = f" ⋯ {len(text)} characters, the middle left out ⋯ "
-    keep = max(0, limit - len(marker))
-    return text[:keep - keep // 2] + marker + text[len(text) - keep // 2:] if keep else text[:limit]
+    keep = limit - len(marker)
+    return text[:keep - keep // 2] + marker + text[len(text) - keep // 2:]
 
 
 def tool_key(tool_input: object) -> str:
@@ -205,7 +245,7 @@ def _agent(data: dict) -> str:
 
 def _hook_notice(event: str, raw: bytes) -> dict | None:
     """The notice for one Claude Code hook input, or None when it is not one."""
-    from openswap.worker.attention import clean_questions, clean_text
+    from openswap.worker.attention import clean_text
     from openswap.worker.protocol import DETAIL_CAPS
 
     try:
@@ -250,18 +290,14 @@ def _hook_notice(event: str, raw: bytes) -> dict | None:
                 notice["answers"] = positions
         if event == "PermissionRequest" and isinstance(tool_input, dict):
             if tool_name == "AskUserQuestion":
-                from openswap.worker.attention import questions_whole
+                from openswap.worker.attention import shown_questions
 
-                raw, questions = tool_input.get("questions"), clean_questions(tool_input.get("questions"))
-                # Shown only with every question; answerable only with every option whole too.
-                if isinstance(raw, list) and len(questions) == len(raw):
+                questions = shown_questions(tool_input.get("questions"))
+                if questions:
                     notice["questions"] = questions
-                    if questions_whole(raw):
-                        notice["answerable"] = True
             elif tool_name == "Bash":
                 # The model's own words for the command, never the raw command.
-                description = clean_text(tool_input.get("description"), DETAIL_CAPS["description"],
-                                         multiline=True)
+                description = _masked_text(tool_input.get("description"), DETAIL_CAPS["description"])
                 if description:
                     notice["description"] = description
     elif event == "Notification":
@@ -279,10 +315,24 @@ def _hook_notice(event: str, raw: bytes) -> dict | None:
         elif prompt.strip().split(" ", 1)[0] in SESSION_COMMANDS:
             notice["prompt_kind"] = "end"
     elif event == "Stop":
-        message = clean_text(data.get("last_assistant_message"), DETAIL_CAPS["last_message"], multiline=True)
+        message = _masked_text(data.get("last_assistant_message"), DETAIL_CAPS["last_message"])
         if message:
             notice["last_message"] = message
     return notice
+
+
+# Characters past a text's cap still masked, so a credential the cap cuts through is caught whole.
+MASK_MARGIN = 1000
+
+
+def _masked_text(value: object, limit: int) -> str:
+    """``clean_text`` of Claude's own words (a Bash description, its last
+    message), which leave the Mac while details are on, with every credential
+    recognizable by its shape masked."""
+    from openswap.redact import mask_shapes
+    from openswap.worker.attention import clean_text
+
+    return clean_text(mask_shapes(clean_text(value, limit + MASK_MARGIN, multiline=True)), limit, multiline=True)
 
 
 _SHELLS = frozenset({"sh", "bash", "zsh", "dash", "fish", "ksh", "mksh", "tcsh", "csh"})
@@ -347,14 +397,13 @@ def _codex_notice(event: str, raw: bytes) -> dict | None:
         if isinstance(tool_input, dict):
             notice["tool_key"] = tool_key({k: v for k, v in tool_input.items() if k != "description"})
             if event == "PermissionRequest":
-                description = clean_text(tool_input.get("description"), DETAIL_CAPS["description"],
-                                         multiline=True)
+                description = _masked_text(tool_input.get("description"), DETAIL_CAPS["description"])
                 if description:
                     notice["description"] = description
         else:
             notice["tool_key"] = tool_key(tool_input)
     elif event == "Stop":
-        message = clean_text(data.get("last_assistant_message"), DETAIL_CAPS["last_message"], multiline=True)
+        message = _masked_text(data.get("last_assistant_message"), DETAIL_CAPS["last_message"])
         if message:
             notice["last_message"] = message
     return notice
@@ -397,10 +446,11 @@ def question_main(*, backup_root: Path | None = None) -> int:
     """``openswap attention question``: the synchronous ``PermissionRequest`` hook
     on ``AskUserQuestion``, installed only while replies are on.
 
-    It waits for the owner's answer from the phone or watch and gives it to
-    Claude Code; it prints nothing (leaving the dialog to the owner) when the
-    worker serves no reply there, the question closes, the wait passes 10
-    minutes or the worker is gone. Never raises."""
+    It sends the worker its questions as the phone and watch show them, and
+    whether they are whole, then waits for the owner's answer from the phone
+    or watch and gives it to Claude Code; it prints nothing (leaving the dialog
+    to the owner) when the worker serves no reply there, the question closes,
+    the wait passes 10 minutes or the worker is gone. Never raises."""
     try:
         data = json.loads(_read_stdin())
         if not isinstance(data, dict) or data.get("tool_name") != "AskUserQuestion":
@@ -408,9 +458,17 @@ def question_main(*, backup_root: Path | None = None) -> int:
         session, tool_input = data.get("session_id"), data.get("tool_input")
         if not isinstance(session, str) or not isinstance(tool_input, dict):
             return 0
+        from openswap.worker.attention import questions_whole, shown_questions
+
         request = {"command": QUESTION_EVENT, "session_id": session, "tool_key": question_key(tool_input)}
         if _agent(data):
             request["agent_id"] = _agent(data)
+        # The questions as the phone and watch show them: the item must show these very ones.
+        questions = shown_questions(tool_input.get("questions"))
+        if questions:
+            request["questions"] = questions
+            if questions_whole(tool_input.get("questions")):
+                request["answerable"] = True
         positions = _wait_for_worker(request, "answers", backup_root)
         answers = _answers(tool_input.get("questions"), positions)
         if answers:
@@ -430,7 +488,8 @@ def permission_main(*, backup_root: Path | None = None) -> int:
     In a session without OpenSwap's channel it waits for the owner's Allow or
     Deny from the phone or watch and gives it to Claude Code. It sends the
     worker its own call's preview, credentials masked, which is what the phone
-    and watch show before Allow. It prints nothing (leaving the dialog to the
+    and watch show before Allow, and whether that shows the call exactly (only
+    then can Allow come). It prints nothing (leaving the dialog to the
     owner) when the session has a channel or the worker serves no reply there,
     the prompt closes, the wait passes 10 minutes or the worker is gone. Never
     raises."""
@@ -449,9 +508,11 @@ def permission_main(*, backup_root: Path | None = None) -> int:
                    "tool_name": tool_name}
         if _agent(data):
             request["agent_id"] = _agent(data)
-        preview = input_preview(tool_input)
+        preview, exact = input_preview(tool_input)
         if preview:
             request["preview"] = preview
+            if exact:
+                request["exact"] = True
         behavior = _wait_for_worker(request, "behavior", backup_root)
         if behavior in ("allow", "deny"):
             decision = {"behavior": behavior, **({"message": DENY_MESSAGE} if behavior == "deny" else {})}
@@ -466,12 +527,16 @@ def permission_main(*, backup_root: Path | None = None) -> int:
 def _wait_for_worker(request: dict, field: str, backup_root: Path | None) -> object:
     """Send a waiting hook's ``request`` to the worker and wait for its one
     reply; the reply's ``field``, or None when there is no worker, it went
-    away, Claude Code gave up on the hook or the hook's own timeout nears."""
+    away, Claude Code gave up on the hook, the hook's own timeout nears, or the
+    request is past what the worker reads (then it is never sent)."""
     from openswap import paths
-    from openswap.worker.ipc import IPC_VERSION, socket_path
+    from openswap.worker.ipc import IPC_VERSION, MAX_REQUEST_BYTES, socket_path
 
     import time
 
+    encoded = json.dumps({"version": IPC_VERSION, **request}, ensure_ascii=False).encode()
+    if len(encoded) > MAX_REQUEST_BYTES:
+        return None
     path = socket_path(backup_root or paths.get_backup_root())
     parent, deadline = os.getppid(), time.monotonic() + REPLY_HOOK_TIMEOUT_SECONDS - 5
     line = b""
@@ -479,7 +544,7 @@ def _wait_for_worker(request: dict, field: str, backup_root: Path | None) -> obj
         client.settimeout(1.0)
         try:
             client.connect(str(path))
-            client.sendall(json.dumps({"version": IPC_VERSION, **request}).encode() + b"\n")
+            client.sendall(encoded + b"\n")
             while b"\n" not in line and len(line) <= 65536:
                 # Claude Code gave up on the hook (its wrapper was killed): stop waiting
                 # rather than take a reply nobody will read.

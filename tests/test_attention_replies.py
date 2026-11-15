@@ -20,7 +20,10 @@ from openswap import attention, channel
 from openswap.settings import AttentionSettings, configure_worker_service, update_worker_settings, \
     write_attention_settings
 from openswap.worker import channel_link, ipc, peers
-from openswap.worker.attention import SESSION_END_GRACE_SECONDS, AttentionStore, SessionRecord, validate_notice
+from openswap.worker.attention import (
+    HOOK_WAIT_SECONDS, SESSION_END_GRACE_SECONDS, AttentionStore, SessionRecord, questions_whole, shown_questions,
+    validate_notice,
+)
 from openswap.worker.peers import Process
 from openswap.worker.protocol import ProtocolError, attention_reply, attention_report
 from openswap.worker.refserver import ControlStore
@@ -117,11 +120,13 @@ class Env:
         self.clock.now = t + 7
         return next(i for i in self.store._items if i.created_at == t + 0.1)
 
-    def waiter(self, key=None):
-        """The question's synchronous hook, connected when its PermissionRequest ran."""
+    def waiter(self, questions=QUESTIONS):
+        """The question's synchronous hook, connected when its PermissionRequest ran, with
+        its own questions as the hook sends them."""
         now, self.clock.now = self.clock.now, self.asked
         try:
-            return self.store.waiter("question", CLAUDE, SESSION, key or attention.question_key({"questions": QUESTIONS}))
+            return self.store.waiter("question", CLAUDE, SESSION, attention.question_key({"questions": questions}),
+                                     shown=shown_questions(questions), whole=questions_whole(questions))
         finally:
             self.clock.now = now
 
@@ -502,11 +507,11 @@ def test_an_answer_that_does_not_fit_the_question_is_refused(env, answers):
     assert not waiter.done.is_set() and env.outcomes() == {"r1": "refused"}
 
 
-def test_the_question_hook_is_served_only_in_its_own_channel_session(env):
+def test_the_question_hook_is_served_only_in_its_own_session(env):
     key = attention.question_key({"questions": QUESTIONS})
     assert env.store.waiter("question", CLAUDE, OTHER, key) is None  # another session's hook
     stranger = Process(PID + 5, 1, "Fri Nov  6 13:00:00 2026", ("claude",))
-    assert env.store.waiter("question", stranger, SESSION, key) is None  # a Claude Code process with no channel
+    assert env.store.waiter("question", stranger, SESSION, key) is None  # a process with no session file here
     env.switches = AttentionSettings(notices=True, details=True, replies=False)
     assert env.store.waiter("question", CLAUDE, SESSION, key) is None  # replies off
     env.switches = AttentionSettings(notices=True, details=True, replies=True)
@@ -521,10 +526,12 @@ def test_a_waiting_question_hook_ends_when_its_question_closes_or_was_answered(e
     env.store.notice(hook("PostToolUse", tool_name="AskUserQuestion", tool_input={"questions": QUESTIONS})
                      | env.at(1))
     assert item not in env.store._items and env.store.waiter_over(waiter)
-    # Never matched to an item (its notice was lost): it ends once the session stopped waiting.
+    # Never matched to an item (its notice was lost, or not recorded yet): it waits
+    # until its own bound, the session leaving ``waiting`` notwithstanding (fix round F5).
     lone = env.store.waiter("question", CLAUDE, SESSION, "f" * 32)
-    assert not env.store.waiter_over(lone)
     env.status("busy", env.clock.now + 1)
+    assert not env.store.waiter_over(lone)
+    env.clock.now += HOOK_WAIT_SECONDS
     assert env.store.waiter_over(lone)
 
 
@@ -576,7 +583,8 @@ def test_the_question_hook_prints_a_decision_only_for_a_fitting_answer(tmp_path,
     monkeypatch.setattr(sys, "stdout", out)
     assert attention.question_main(backup_root=root) == 0
     assert seen[0] == {"version": 1, "command": "question", "session_id": SESSION,
-                       "tool_key": attention.question_key(tool_input)}
+                       "tool_key": attention.question_key(tool_input), "questions": shown_questions(QUESTIONS),
+                       "answerable": True}
     if printed:
         decision = json.loads(out.getvalue())["hookSpecificOutput"]["decision"]
         assert decision == {"behavior": "allow", "updatedInput": {**tool_input,
@@ -802,7 +810,7 @@ def test_a_hook_connection_never_receives_anything_but_an_acknowledgement(env, m
     monkeypatch.setattr(peers, "hook_claude", lambda pid: Process(4241, 1, "Fri Nov  6 13:00:00 2026", ("claude",)))
     channel_link.serve(env.store, connection, {"version": 1, "command": "question", "session_id": SESSION,
                                                "tool_key": "a" * 32}, threading.Event(), lambda: None)
-    assert json.loads(connection.out) == {"answers": None}  # a Claude Code process without a channel
+    assert json.loads(connection.out) == {"answers": None}  # a process with no session file here
 
 
 # --- the channel server -------------------------------------------------------------------
@@ -1133,8 +1141,8 @@ def test_a_verdict_while_another_prompt_waits_is_never_claimed(env):
 
 def test_an_answer_reaches_only_its_own_agents_question(env):
     key = attention.question_key({"questions": QUESTIONS})
-    first = env.store.waiter("question", CLAUDE, SESSION, key, "a1")
-    second = env.store.waiter("question", CLAUDE, SESSION, key, "a2")
+    first, second = (env.store.waiter("question", CLAUDE, SESSION, key, agent, shown=shown_questions(QUESTIONS),
+                                      whole=True) for agent in ("a1", "a2"))
     t = env.clock.now
     for agent, offset in (("a1", 0.1), ("a2", 0.2)):
         env.store.notice(hook("PermissionRequest", tool_name="AskUserQuestion", tool_input={"questions": QUESTIONS},
@@ -1289,7 +1297,7 @@ def test_q2_a_question_not_sent_whole_takes_no_answer(env, questions):
                      | {"at": t + 0.1})
     env.status("waiting", t + 0.05)
     env.store.notice(hook("Notification", notification_type="permission_prompt") | {"at": t + 6.1})
-    env.waiter(attention.question_key({"questions": questions}))
+    env.waiter(questions)
     [item] = env.store._items
     assert env.actions(item) == []
 

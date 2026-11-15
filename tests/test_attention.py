@@ -733,6 +733,18 @@ def test_open_items_survive_a_restart_and_a_lost_file_reports_no_closes(tmp_path
     assert published(empty) == [] and closes(empty) == []
 
 
+def test_items_saved_by_a_build_whose_questions_said_answerable_still_load(tmp_path):
+    clock = Clock()
+    first = AttentionStore(tmp_path, clock=clock)
+    first.notice(notification("idle_prompt"))
+    [item] = published(first)
+    path = tmp_path / "worker" / "attention.json"
+    saved = json.loads(path.read_text())
+    saved["items"][0]["answerable"] = False
+    path.write_text(json.dumps(saved))
+    assert published(AttentionStore(tmp_path, clock=clock)) == [item]
+
+
 def test_notices_are_dropped_while_switched_off(tmp_path):
     on = [False]
     items = AttentionStore(tmp_path, clock=Clock(), enabled=lambda: on[0])

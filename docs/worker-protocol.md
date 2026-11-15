@@ -717,9 +717,13 @@ exactly these fields, and optionally `session_id` and `detail`:
   OpenSwap's channel or, in a session without the channel, as the prompt's own
   permission hook previews it in the same form with credentials masked; sent
   only for a permission that takes replies), `last_message`
-  (1–1,000, the start of the session's last message) and `questions` (1–4 closed objects, each with
+  (1–1,000, the start of the session's last message; `description` and
+  `last_message` have API keys and tokens recognizable by their shape masked) and
+  `questions` (1–4 closed objects, each with
   `question` (1–1,000), an optional `header` (1–100) and `options`, 0–4
-  option labels of 1–100 characters). `tool_name`, `header` and option labels
+  option labels of 1–100 characters; format, bidi and zero-width characters,
+  line and paragraph separators, DEL, C1 controls and lone surrogates in them
+  are written as their JSON escapes, such as `\u202e`). `tool_name`, `header` and option labels
   contain no Unicode control characters; the other text may contain newline,
   carriage return and tab, and no other control character. A tool's raw input
   is never sent: for `Bash` the worker sends the model's own description of
@@ -1825,28 +1829,54 @@ backend accepted offered for that item, and an item is never offered `allow`
 or `answer` in a report that leaves out the detail showing its call or its
 questions (details off, or the detail cut for size):
 
-- A permission prompt in a session without the channel takes `deny`, and
-  `allow` while details are on and the item shows the call its hook would
-  allow, while exactly one synchronous hook waits for that very prompt (the
-  one Claude Code ran with it: the same process, session, agent, tool and
-  input, within 5 seconds). That hook (`openswap attention permission`, a
-  `PermissionRequest` hook on every tool with a 600-second timeout, which
-  leaves `AskUserQuestion` to the question hook) is installed with the
-  question hook. It sends the worker its own call as Claude Code's channel
-  form previews it, with recognizable credentials masked (API keys and tokens
-  by their shape, private-key blocks, `Authorization:` headers, a URL's user
-  and password, the value of anything named like a password, secret, token or
-  key) and each field cut in the middle to fit the cap, and that preview is the
-  item's `input_preview`. A second hook for the same prompt takes every reply
-  away while it waits, and one with another preview takes them away for good,
-  so a command the session runs can block replies but never approve a call. It
-  gives Claude Code `allow`, or `deny` with the message "The owner denied this
-  from their phone or watch.", or nothing when the prompt closes (an answer at
-  the Mac, the session ending), the Claude Code process ends, replies are
-  turned off, the wait passes about 10 minutes or the worker is gone; in a
-  session with the channel it exits at once. A hook's deny lets Claude go on,
-  as its allow does, so either counts as `applied` when the session leaves
-  `waiting` for `busy` within 2 seconds of the hook taking it.
+- A permission prompt in a session without the channel takes `deny` while
+  exactly one synchronous hook waits for that very prompt (the one Claude Code
+  ran with it: the same process, session, agent, tool and input, within 5
+  seconds), and `allow` too while details are on and the item shows that
+  hook's own preview of the call, exact. That hook (`openswap attention
+  permission`, a `PermissionRequest` hook on every tool with a 600-second
+  timeout, which leaves `AskUserQuestion` to the question hook) is installed
+  with the question hook. It sends the worker its own call as Claude Code's
+  channel form previews it, `{ "key": value, … }` with each value as JSON, and
+  that preview is the item's `input_preview`. Everything in it that differs
+  from the call shows and makes it inexact, and then the item takes `deny`
+  only: credentials masked (API keys and tokens by their shape, private-key
+  blocks, `Bearer` tokens, `Authorization:` and `Cookie:` headers, a URL's user
+  and password, `-u user:password`, mysql's `-pPASSWORD`, a registry's
+  `login -p PASSWORD`, and the value of anything whose name has a password,
+  secret, token, key, credential, auth or cookie segment, quoted values whole
+  and unquoted ones up to the shell's next `; & | < > )`, while a value that is
+  only `$(…)`, a backtick command, `<(…)` or a variable stays readable); a field
+  cut in its middle or left out, with a marker (also a field too large to mask
+  quickly); format, bidi and zero-width characters, line and paragraph
+  separators, DEL, C1 controls and lone surrogates written as their JSON
+  escapes; and a run of four or more spaces, which could push the rest of a
+  command out of sight, shown as a marker. JSON's own escapes (`\n`, `\"`) keep
+  it exact. The worker cleans the preview once more and keeps the hook's word
+  that it is exact only if that changes nothing. A second hook for the same
+  prompt takes every reply away while it waits, and one with another preview
+  takes them away for good, so a command the session runs can block replies
+  but never approve a call. It gives Claude Code `allow`, or `deny` with the
+  message "The owner denied this from their phone or watch.", or nothing when
+  the prompt closes (an answer at the Mac; one while another prompt of the
+  same Claude Code process waits beside it keeps the hook waiting until its own
+  prompt closes, since which one was answered shows only on its own signal),
+  the session ends, the Claude Code process ends, replies or notices are
+  turned off (settings that cannot be read are not off: the hook keeps
+  waiting, and replies are refused until they read again), the wait passes
+  about 10 minutes or the worker is gone; in a session with the channel it
+  exits at once. A channel registration for an earlier Claude Code process with
+  the same PID (its start time differs from the hook's own Claude Code
+  process) is gone with that process. An allow counts as `applied` when the
+  session leaves `waiting` for `busy` within 2 seconds of the hook taking it.
+  Claude goes on after a hook's deny as after a Yes or a No at the Mac, so a
+  deny counts only once the turn's next signal shows the call did not run: the
+  main thread's `Stop` (for a subagent's prompt, that subagent's `SubagentStop`
+  or next `PermissionRequest`) with no `PostToolUse` or `PostToolUseFailure`
+  for that call within 1.5 seconds after it. The call's own `PostToolUse`
+  means the Mac's Yes won (`answered_on_mac`); another call's signal decides
+  nothing. A No at the Mac within 2 seconds of the watch's Deny looks the same
+  and is credited to the watch; the call is denied either way.
 - A permission prompt in a session with the channel takes `deny`, and `allow`
   while details are on (the phone then shows the call as Claude Code previews
   it to the channel). It takes either only when the channel's request is
@@ -1857,13 +1887,19 @@ questions (details off, or the detail cut for size):
   the same preview. Anything else stays a notice, so Allow never approves a
   call other than the one shown.
 - A question takes `answer` while exactly one synchronous hook waits for that
-  very question (the one Claude Code ran with it), and only when every
-  question and option is sent whole (none past the caps, cut or cleaned to
-  nothing) while details are on. Any command a session runs can connect as a
-  question hook; it gains nothing (a second one only keeps the question from
-  taking an answer), and at most 4 wait per Claude Code process, so such
-  commands can also keep that process's questions from taking answers until
-  they leave. That hook
+  very question (the one Claude Code ran with it), details are on, the item
+  shows the questions that hook sent, and the hook says they are whole (none
+  past the caps, cut, cleaned to nothing, or with a character written as its
+  escape); a notice's own word never makes a question answerable. A notice
+  whose questions differ from its hook's, or two hooks with different
+  questions, leave the question without an answer for good, so a forged
+  notice can never relabel the options the hook answers by position. Any
+  command a session runs can connect as a question hook; it gains nothing (a
+  second one only keeps the question from taking an answer), and at most 4
+  wait per Claude Code process, so such commands can also keep that process's
+  questions from taking answers until they leave. A hook whose request would
+  not fit what the worker reads (64 KiB) sends nothing and leaves the dialog to
+  the owner. That hook
   (`openswap attention question`, a `PermissionRequest` hook on
   `AskUserQuestion` with a 600-second timeout) is installed in every managed
   config home only while replies are on. It is served only where its Claude

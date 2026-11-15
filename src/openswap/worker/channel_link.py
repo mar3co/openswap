@@ -25,11 +25,14 @@ from openswap.worker import peers
 
 LINE_LIMIT = 65536
 POLL_SECONDS = 0.5
-# Each waiting hook's request fields (required, optional) and the field its reply goes in.
+# Each waiting hook's request fields (required, optional), the field its reply
+# goes in, and the fields carrying its own prompt as shown and its word that
+# this is the prompt exactly or whole.
 WAITERS = {
-    "question": ({"version", "command", "session_id", "tool_key"}, {"agent_id"}, "answers"),
-    "permission": ({"version", "command", "session_id", "tool_key", "tool_name"}, {"agent_id", "preview"},
-                   "behavior"),
+    "question": ({"version", "command", "session_id", "tool_key"}, {"agent_id", "questions", "answerable"},
+                 "answers", "questions", "answerable"),
+    "permission": ({"version", "command", "session_id", "tool_key", "tool_name"}, {"agent_id", "preview", "exact"},
+                   "behavior", "preview", "exact"),
 }
 
 
@@ -131,12 +134,12 @@ def _serve_channel(store, connection, stop_event, release) -> None:
 def _serve_waiter(store, connection, request, kind, stop_event, release) -> None:
     pid = peers.peer_pid(connection)
     hook = peers.process(pid)
-    field = WAITERS[kind][2]
+    _, _, field, shown, whole = WAITERS[kind]
     # The session's own synchronous hook: OpenSwap's command for ``kind``, under Claude Code.
     claude = peers.hook_claude(pid) if hook is not None and hook.args[-2:] == ("attention", kind) else None
-    extra = {"tool_name": request["tool_name"], "preview": request.get("preview", "")} if kind == "permission" else {}
+    extra = {"tool_name": request["tool_name"]} if kind == "permission" else {}
     waiter = store.waiter(kind, claude, request["session_id"], request["tool_key"], request.get("agent_id", ""),
-                          **extra) if claude else None
+                          shown=request.get(shown), whole=request.get(whole) is True, **extra) if claude else None
     if waiter is None:
         _reply(connection, {field: None})
         return

@@ -167,6 +167,16 @@ def clean_text(value: object, limit: int, *, multiline: bool = False) -> str:
 
 
 _SURROGATE = re.compile("[\ud800-\udfff]")
+_NOT_ASCII = re.compile(r"[^\x00-\x7e]")
+
+
+def escape_hidden(text: str) -> str:
+    """``text`` with every character that can hide or reorder what is shown
+    written as its visible JSON escape (``\\u202e``): format characters (bidi
+    controls, zero-width characters), line and paragraph separators, DEL and
+    C1 controls, and lone surrogates."""
+    return _NOT_ASCII.sub(lambda m: json.dumps(m[0])[1:-1] if unicodedata.category(m[0]) in (
+        "Cf", "Zl", "Zp", "Cc", "Cs") else m[0], text)
 
 
 def scrub(value):
@@ -181,25 +191,31 @@ def scrub(value):
     return value
 
 
+def _shown_text(value: object, limit: int, *, multiline: bool = False) -> str:
+    """``clean_text`` of ``value`` with ``escape_hidden`` first: question text."""
+    return clean_text(escape_hidden(value) if isinstance(value, str) else value, limit, multiline=multiline)
+
+
 def question_entries(value: object) -> list[tuple[dict, str, list[str]]]:
     """``AskUserQuestion``'s questions as the report shows them (the question,
-    its header and its option labels, cut to the report's caps), each with the
-    raw question text and raw option labels at the same positions."""
+    its header and its option labels, cut to the report's caps, hidden
+    characters escaped), each with the raw question text and raw option labels
+    at the same positions."""
     if not isinstance(value, list):
         return []
     out = []
     for entry in value[:MAX_QUESTIONS]:
         if not isinstance(entry, dict):
             continue
-        question = clean_text(entry.get("question"), MAX_QUESTION, multiline=True)
+        question = _shown_text(entry.get("question"), MAX_QUESTION, multiline=True)
         if not question:
             continue
         options = entry.get("options") if isinstance(entry.get("options"), list) else []
         raw = [o.get("label") if isinstance(o, dict) else o for o in options]
-        kept = [(clean_text(r, MAX_OPTION), r) for r in raw]
+        kept = [(_shown_text(r, MAX_OPTION), r) for r in raw]
         kept = [(label, r) for label, r in kept if label][:MAX_OPTIONS]
         cleaned = {"question": question, "options": [label for label, _ in kept]}
-        header = clean_text(entry.get("header"), MAX_QUESTION_HEADER)
+        header = _shown_text(entry.get("header"), MAX_QUESTION_HEADER)
         if header:
             cleaned["header"] = header
         out.append((cleaned, entry.get("question"), [r for _, r in kept]))
@@ -209,21 +225,32 @@ def question_entries(value: object) -> list[tuple[dict, str, list[str]]]:
 def questions_whole(value: object) -> bool:
     """Whether the report can show every question and every option of
     ``AskUserQuestion``'s ``questions`` whole: none dropped (past the caps, or a
-    label that cleans to nothing) and none cut. Only such a question takes an answer."""
+    label that cleans to nothing), none cut and no character in them escaped.
+    Only such a question takes an answer."""
     if not isinstance(value, list) or not 1 <= len(value) <= MAX_QUESTIONS:
         return False
     for entry in value:
         question = entry.get("question") if isinstance(entry, dict) else None
         options = entry.get("options") if isinstance(entry, dict) else None
+        header = entry.get("header", "") if isinstance(entry, dict) else ""
         if (not isinstance(question, str) or not clean_text(question, MAX_QUESTION, multiline=True)
                 or len(question.strip()) > MAX_QUESTION or not isinstance(options, list)
-                or len(options) > MAX_OPTIONS):
+                or len(options) > MAX_OPTIONS or escape_hidden(question) != question
+                or (isinstance(header, str) and escape_hidden(header) != header)):
             return False
         for option in options:
             label = option.get("label") if isinstance(option, dict) else option
-            if not isinstance(label, str) or not clean_text(label, MAX_OPTION) or len(label.strip()) > MAX_OPTION:
+            if (not isinstance(label, str) or not clean_text(label, MAX_OPTION) or len(label.strip()) > MAX_OPTION
+                    or escape_hidden(label) != label):
                 return False
     return True
+
+
+def shown_questions(value: object) -> list[dict] | None:
+    """``clean_questions`` of ``AskUserQuestion``'s questions, or None when any
+    of them would be left out: questions are shown all or none."""
+    questions = clean_questions(value)
+    return questions if questions and isinstance(value, list) and len(questions) == len(value) else None
 
 
 def clean_questions(value: object) -> list[dict]:
@@ -272,7 +299,7 @@ def _optional_text(data: dict, name: str, limit: int, *, multiline: bool = False
 
 _CLAUDE_FIELDS = {"provider", "event", "session_id", "cwd", "at", "pid", "entrypoint", "agent_id", "tool_name",
                   "tool_key", "description", "questions", "notification_type", "last_message", "prompt_kind",
-                  "preview_key", "answers", "reply", "answerable"}
+                  "preview_key", "answers", "reply"}
 _CODEX_FIELDS = {"provider", "event", "session_id", "cwd", "at", "pid", "agent_id", "tool_name", "tool_key",
                  "description", "last_message"}
 PROMPT_KINDS = frozenset({"channel", "task", "end"})
@@ -322,8 +349,6 @@ def validate_notice(value: object) -> dict:
         raise NoticeError("invalid_notice")
     if "at" in value and (type(value["at"]) not in (int, float) or not math.isfinite(value["at"])):
         raise NoticeError("invalid_notice")
-    if "answerable" in value and value["answerable"] is not True:
-        raise NoticeError("invalid_notice")
     if "prompt_kind" in value and value["prompt_kind"] not in PROMPT_KINDS:
         raise NoticeError("invalid_notice")
     if "agent_id" in value and not (isinstance(value["agent_id"], str) and 0 < len(value["agent_id"]) <= 64
@@ -349,12 +374,13 @@ class Item:
     agent: str = ""  # the subagent whose call it is (Codex: its own thread ID); "" for the main thread
     preview_key: str = ""  # digest of the call as a channel would preview it; "" when that is not exact
     started: str = ""  # when ``pid``'s process began (``ps`` lstart): a reused PID differs; "" when unknown
-    answerable: bool = False  # a question whose every question and option the report shows whole
 
     @classmethod
     def from_dict(cls, data: object) -> Item:
         if isinstance(data, dict):
-            data = {"preview_key": "", "started": "", "answerable": False, **data}  # saved by an earlier build
+            # Saved by an earlier build: without the newer fields, or with ``answerable``
+            # (a question's wholeness now comes from its waiting hook alone).
+            data = {"preview_key": "", "started": "", **{k: v for k, v in data.items() if k != "answerable"}}
         if not isinstance(data, dict) or set(data) != {f for f in cls.__dataclass_fields__}:
             raise ValueError("invalid item")
         item = cls(**data)
@@ -365,7 +391,7 @@ class Item:
                 or not isinstance(item.tool_key, str) or not isinstance(item.detail, dict)
                 or type(item.pid) is not int or not isinstance(item.entrypoint, str)
                 or not isinstance(item.agent, str) or not isinstance(item.preview_key, str)
-                or not isinstance(item.started, str) or type(item.answerable) is not bool):
+                or not isinstance(item.started, str)):
             raise ValueError("invalid item")
         return item
 
@@ -496,7 +522,8 @@ class ChannelRequest:
     channel: tuple = ()  # (pid, start) of the channel process that relayed it
 
 
-WAITER_KINDS = frozenset({"question", "permission"})
+# What a waiting hook sends of its own prompt, by kind: the item detail it is shown as.
+SHOWN_DETAIL = {"question": "questions", "permission": "input_preview"}
 
 
 @dataclass
@@ -511,7 +538,12 @@ class Waiter:
     at: float
     home: str  # the config home whose sessions/{claude_pid}.json names the session
     tool_name: str = QUESTION_TOOL
-    preview: str = ""  # a permission's own call as the phone and watch show it (plan 028, R1a)
+    # Its own prompt as the phone and watch show it: a permission's call (plan 028,
+    # R1a), a question's questions; empty when it sent none.
+    shown: object = ""
+    # It says ``shown`` is its prompt exactly (a call) or whole (questions), and
+    # the worker's own cleaning changed nothing in it: only then Allow or an answer.
+    whole: bool = False
     done: threading.Event = field(default_factory=threading.Event)
     result: object = None  # the answer's positions, or ``allow`` or ``deny``, once given
     item_id: str = ""  # the item it waits for, once seen
@@ -531,6 +563,7 @@ class Sent:
     # cannot tell which of them closed, so the Mac never knows this one won.
     shared: bool = False
     hook: bool = False  # a verdict handed to the prompt's own waiting hook, not a channel
+    won_when_due: bool = False  # a hook's deny whose turn ended without the call: the watch's once due
 
 
 def _all_off():
@@ -840,7 +873,7 @@ class AttentionStore:
                                 tool_name, tool_key, {k: v for k, v in (detail or {}).items() if v},
                                 pid, notice.get("entrypoint", ""), notice.get("agent_id", ""),
                                 notice.get("preview_key", "") if kind == "permission" else "",
-                                self._starts.get(pid, ""), kind == "question" and notice.get("answerable") is True))
+                                self._starts.get(pid, "")))
 
     # --- processes ---------------------------------------------------------------
 
@@ -949,7 +982,8 @@ class AttentionStore:
         record = self._record_for(session, pid)
         if event == "PermissionRequest":
             # A subagent asking again has moved past a prompt the watch denied.
-            moved_on = self._agent_moved_on(prompts, notice.get("agent_id", ""), at, notice.get("tool_key", ""))
+            moved_on = self._agent_moved_on(prompts, notice.get("agent_id", ""), at, notice.get("tool_key", ""),
+                                            asks=True)
             if at < self._left_since(session, pid):
                 return moved_on  # its prompt was already answered (a decline faster than this hook)
             if tool_name == QUESTION_TOOL:
@@ -960,7 +994,7 @@ class AttentionStore:
                            tool_key=notice.get("tool_key", ""),
                            detail={"tool_name": tool_name, "description": notice.get("description", "")})
                 self._pair(session)
-                self._take_preview(self._items[-1])
+            self._take_shown(self._items[-1])
             return True
         if event == "Notification":
             kind = notice.get("notification_type")
@@ -1035,14 +1069,14 @@ class AttentionStore:
             # The main thread's turn ended: its own prompts were answered. A
             # background subagent's prompt may still wait, and a late Stop of an
             # earlier turn says nothing about this turn's prompts.
-            ended = self._await_allowed([i for i in prompts if not i.agent and i.created_at <= at])
+            ended = self._await_call([i for i in prompts if not i.agent and i.created_at <= at], at)
             # A Stop follows a channel deny (a "No" at the Mac fires none).
             return self._close(ended, "answered_on_mac", won=self._won(ended, at, "deny")) or changed
         if event == "SubagentStop":
             # That subagent ended (a "No" or Esc on its prompt ends it too): its
             # prompts are gone. Another subagent's, or the main thread's, may still wait.
             agent = notice.get("agent_id", "")
-            ended = self._await_allowed([i for i in prompts if agent and i.agent == agent and i.created_at <= at])
+            ended = self._await_call([i for i in prompts if agent and i.agent == agent and i.created_at <= at], at)
             return self._close(ended, "answered_on_mac", won=self._won(ended, at, "deny"))
         if event == "UserPromptSubmit":
             prompt = notice.get("prompt_kind")
@@ -1089,17 +1123,29 @@ class AttentionStore:
         # failing call was still allowed).
         return self._close(match, "answered_on_mac", won=self._won(match, at, "allow")) or moved_on
 
-    def _await_allowed(self, ended: list[Item]) -> list[Item]:
-        """``ended`` (prompts whose turn or subagent ended) without those the
-        watch allowed: the call's PostToolUse may still be on its way, so they
-        close ``SESSION_END_GRACE_SECONDS`` after this event unless it comes,
-        whether or not an answer was already due. The session waiting again
-        meanwhile is another dialog: it never keeps them open."""
-        waiting = [i for i in ended if self._sent_action(i) == "allow"]
-        for item in waiting:
-            self._due[item.id] = self.clock() + SESSION_END_GRACE_SECONDS
-            self._due_exit[item.id] = math.inf
-        return [i for i in ended if i not in waiting]
+    def _await_call(self, ended: list[Item], at: float) -> list[Item]:
+        """``ended`` (prompts whose turn or subagent ended, at ``at``) without
+        those whose outcome waits on the call's own PostToolUse, which may still
+        be on its way: one the watch allowed, and one whose waiting hook took the
+        watch's deny (Claude goes on after a Yes at the Mac too, so only that
+        signal shows the Mac won). They close ``SESSION_END_GRACE_SECONDS`` after
+        this event unless it comes, whether or not an answer was already due:
+        the allowed ones as answered at the Mac, the denied ones as the watch's.
+        The session waiting again meanwhile is another dialog: it never keeps
+        them open."""
+        rest = []
+        for item in ended:
+            sent = self._sent.get(item.id)
+            if sent is not None and sent.won_when_due:
+                continue  # already waits for its call's signal
+            if sent is not None and (sent.action == "allow" or (sent.hook and sent.action == "deny"
+                                                                and self._won([item], at, "deny"))):
+                self._due[item.id] = self.clock() + SESSION_END_GRACE_SECONDS
+                self._due_exit[item.id] = math.inf
+                sent.won_when_due = sent.action == "deny"
+            else:
+                rest.append(item)
+        return rest
 
     def _idle_again(self, idle: Item, notice: dict, last: str) -> bool:
         """The session is idle after another turn: the item the owner saw closes
@@ -1303,11 +1349,14 @@ class AttentionStore:
                 if sent is not None and record is not None:
                     if sent.exit_at is None:
                         sent.exit_at = record.status_at
-                    # The dialog closed: approved (busy) or declined (idle). A hook's deny
-                    # lets Claude go on (busy), as its allow does; a No at the Mac ends the turn.
-                    busy = record.status == "busy"
-                    effect = (sent.action if busy else "") if sent.hook else "allow" if busy else "deny"
-                    if self._won([item], record.status_at, effect):
+                    if sent.hook and sent.action == "deny":
+                        # Claude goes on after a hook's deny as after a Yes or a No at the
+                        # Mac: the turn's next signal decides (``_await_call``).
+                        if self._won([item], record.status_at, "deny"):
+                            continue
+                    # The dialog closed: approved (busy) or declined (idle; a channel's deny).
+                    elif self._won([item], record.status_at, "allow" if record.status == "busy"
+                                   else "" if sent.hook else "deny"):
                         won.append(item)
                         continue
                 if not self._shown(item):
@@ -1330,12 +1379,14 @@ class AttentionStore:
     def tick(self) -> None:
         """Close the answers whose grace has passed; end the Codex items whose
         process ended, expire old ones and publish those still open after
-        their wait. Replies turned off release every waiting hook, without a reply."""
+        their wait. Replies or notices turned off release every waiting hook,
+        without a reply."""
         with self._lock:
             waiting = [w for w in self._waiters if not w.done.is_set()]
         if waiting:
             switches = self.switches()
-            if not (switches.notices and switches.replies):
+            # Unreadable is not off: the hooks wait, and the gate refuses replies meanwhile.
+            if switches.readable and not (switches.notices and switches.replies):
                 for waiter in waiting:
                     waiter.done.set()
         with self._lock:
@@ -1347,7 +1398,8 @@ class AttentionStore:
                     due.remove(item)
                     del self._due[item.id]
                     self._due_exit.pop(item.id, None)
-            changed = self._close(due, "answered_on_mac")
+            changed = self._close(due, "answered_on_mac", won=[i for i in due if i.id in self._sent
+                                                                and self._sent[i.id].won_when_due])
             codex = [i for i in self._items if i.provider == "codex"]
             ended = [i for i in codex if i.pid and not self._alive(i.pid, i.started)]
             changed = self._close(ended, "session_ended") or changed
@@ -1437,13 +1489,17 @@ class AttentionStore:
                 won.append(item)
         return won
 
-    def _agent_moved_on(self, prompts: list[Item], agent: str, at: float, key: str) -> bool:
-        """A subagent's next call shows its earlier prompt is gone: one the watch
-        denied closes now (a subagent's prompt has no Stop of its own)."""
+    def _agent_moved_on(self, prompts: list[Item], agent: str, at: float, key: str, *, asks: bool = False) -> bool:
+        """A subagent's next call shows its earlier prompt is gone (a subagent's
+        prompt has no Stop of its own): one the watch denied through its channel
+        closes now; one denied through its waiting hook only once the subagent
+        asks again (``asks``: a parallel call finishing says nothing), after
+        ``_await_call``'s grace."""
         if not agent:
             return False
-        gone = [i for i in prompts if i.agent == agent and i.tool_key != key and self._sent_action(i) == "deny"
-                and i.created_at < at]
+        gone = self._await_call([i for i in prompts if i.agent == agent and i.tool_key != key
+                                 and self._sent_action(i) == "deny" and i.created_at < at
+                                 and (asks or not self._sent[i.id].hook)], at)
         return self._close(gone, "answered_on_mac", won=self._won(gone, at, "deny"))
 
     def _pair(self, session: str) -> bool:
@@ -1641,7 +1697,7 @@ class AttentionStore:
                    if at >= item.created_at)
 
     def waiter(self, kind: str, claude, session: str, tool_key: str, agent: str = "", *,
-               tool_name: str = QUESTION_TOOL, preview: str = "") -> Waiter | None:
+               tool_name: str = QUESTION_TOOL, shown: object = None, whole: bool = False) -> Waiter | None:
         """A waiter for the synchronous ``kind`` hook (``question`` or
         ``permission``) of ``session`` running under Claude Code process
         ``claude`` (a ``peers.Process``), or None (the hook then leaves the dialog
@@ -1654,28 +1710,49 @@ class AttentionStore:
           connected and uncontested;
         - no channel: a surface outside ``HOOK_REPLY_SURFACES``.
 
+        ``shown`` is the hook's own prompt as the phone and watch would show it
+        (a call's preview, a question's questions), and ``whole`` the hook's
+        word that it is that prompt exactly or whole. Unreadable settings are
+        not "off": such a hook waits, and replies are refused until they read
+        again. A registration for an earlier Claude Code process with the same
+        PID (its start time differs from the hook's own) is gone with it.
+
         Any command the session runs can connect as such a hook too. It gains
         nothing: a reply reaches a waiter only while exactly one waits for that
-        prompt, and a permission prompt waited for with two previews takes no
-        reply at all, so an extra one only keeps the prompt from taking a reply.
-        Allow reaches only the hook whose preview the watch showed, and a hook
-        that is not the prompt's own approves nothing. Such commands can also
-        take all ``MAX_WAITERS_PER_PROCESS`` places, and that process's prompts
-        then take no reply until they leave."""
+        prompt, and a prompt waited for with two previews or two sets of
+        questions takes no reply at all, so an extra one only keeps the prompt
+        from taking a reply. Allow and an answer reach only the hook whose own
+        preview or questions the watch showed, and a hook that is not the
+        prompt's own approves nothing. Such commands can also take all
+        ``MAX_WAITERS_PER_PROCESS`` places, and that process's prompts then take
+        no reply until they leave."""
         from openswap.worker.protocol import DETAIL_CAPS as caps
 
         switches = self.switches()
-        if (not self._ensure_ready() or not (switches.notices and switches.replies) or kind not in WAITER_KINDS
-                or not all(isinstance(v, str) for v in (session, tool_key, agent, tool_name, preview))
-                or (tool_name == QUESTION_TOOL) != (kind == "question")
-                or clean_text(tool_name, caps["tool_name"]) != tool_name or len(preview) > caps["input_preview"]):
+        if (not self._ensure_ready() or (switches.readable and not (switches.notices and switches.replies))
+                or kind not in SHOWN_DETAIL
+                or not all(isinstance(v, str) for v in (session, tool_key, agent, tool_name))
+                or not tool_key or (tool_name == QUESTION_TOOL) != (kind == "question")
+                or not tool_name or clean_text(tool_name, caps["tool_name"]) != tool_name
+                or not isinstance(shown, (type(None), list if kind == "question" else str))
+                or (kind == "permission" and shown is not None and len(shown) > caps["input_preview"])):
             return None
+        if kind == "question":
+            cleaned = clean_questions(shown)
+        else:
+            cleaned = clean_text(escape_hidden(shown or ""), caps["input_preview"], multiline=True)
+        stale = None
         with self._lock:
             held = self._channels.get(claude.pid)
-            if held is not None and (kind != "question" or held.claude_started != claude.started
-                                     or held.link is None or held.contested):
+            if held is not None and held.claude_started != claude.started:
+                stale, held = self._channels.pop(claude.pid), None
+                self._note_contested()
+                self._commit()
+            if held is not None and (kind != "question" or held.link is None or held.contested):
                 return None
             home = held.home if held is not None else None
+        if stale is not None and stale.link is not None:
+            stale.link.close()
         home = home if home is not None else self.session_home(claude.pid)
         record = read_session(home, claude.pid) if home is not None else None
         if record is None or record.session_id != session:
@@ -1687,30 +1764,32 @@ class AttentionStore:
             if (len(self._waiters) >= MAX_WAITERS
                     or sum(w.claude_pid == claude.pid for w in self._waiters) >= MAX_WAITERS_PER_PROCESS):
                 return None
-            waiter = Waiter(kind, session, tool_key, agent, claude.pid, self.clock(), home, tool_name,
-                            clean_text(preview, caps["input_preview"], multiline=True))
+            waiter = Waiter(kind, session, tool_key, agent, claude.pid, self.clock(), home, tool_name, cleaned,
+                            whole is True and bool(cleaned) and cleaned == shown)
             self._waiters.append(waiter)
             for item in [i for i in self._items if self._waits_for(waiter, i)]:
                 waiter.item_id = item.id
-                self._take_preview(item)
+                self._take_shown(item)
             self.changed.set()
         return waiter
 
     def waiter_over(self, waiter: Waiter) -> bool:
         """Whether a waiting hook should stop: its reply came (or replies were
-        turned off), its prompt closed or was answered at the Mac (or, never
-        seen, its session stopped waiting), its Claude Code process ended, or
-        the wait passed HOOK_WAIT_SECONDS."""
+        turned off), its prompt closed, or was answered at the Mac while no other
+        prompt of its process waited beside it (queued dialogs: which of them was
+        answered shows only on its own signal), its Claude Code process ended,
+        or the wait passed HOOK_WAIT_SECONDS. A hook whose prompt is not
+        recorded yet waits for it."""
         with self._lock:
             if waiter.done.is_set():
                 return True
             if self.clock() - waiter.at >= HOOK_WAIT_SECONDS or not self._alive(waiter.claude_pid):
                 return True
             item = self._waited(waiter)
-            if item is not None:
-                waiter.item_id = item.id
-                return item.id in self._due
-            return bool(waiter.item_id) or self._left_since(waiter.session, waiter.claude_pid) > waiter.at
+            if item is None:
+                return bool(waiter.item_id)
+            waiter.item_id = item.id
+            return item.id in self._due and not self._queued_with(item, self._due_exit.get(item.id, 0.0))
 
     def _waited(self, waiter: Waiter) -> Item | None:
         return next((i for i in self._items if self._waits_for(waiter, i)), None)
@@ -1735,26 +1814,32 @@ class AttentionStore:
         surface in ``HOOK_REPLY_SURFACES`` gets such hooks (``waiter``)."""
         return item.pid not in self._channels and self._record_for(item.session, item.pid) is not None
 
-    def _take_preview(self, item: Item) -> None:
-        """Show a hook-answered permission prompt the call its own waiting hook
-        sent (R1a), so Allow names exactly the call that receives it. The first
-        preview stays: a hook with another one cannot be told from the real one,
-        so the prompt then takes no reply for good."""
-        if item.kind != "permission" or item.pid in self._channels:
+    def _take_shown(self, item: Item) -> None:
+        """Show a hook-answered prompt what its own waiting hook sent of it (a
+        permission's call, R1a; a question's questions), so a reply names
+        exactly what receives it. What is shown first stays: a hook that sent
+        something else, or a notice whose questions differ from the hook's,
+        cannot be told from the real one, so the prompt then takes no reply for
+        good."""
+        detail = SHOWN_DETAIL.get(item.kind)
+        if detail is None or (item.kind == "permission" and item.pid in self._channels):
             return
-        previews = {w.preview for w in self._waiters_for(item)}
-        shown = item.detail.get("input_preview")
-        if len(previews) > 1 or (shown and previews - {shown}):
+        sent = []
+        for waiter in self._waiters_for(item):
+            if waiter.shown not in sent:
+                sent.append(waiter.shown)
+        shown = item.detail.get(detail)
+        if len(sent) > 1 or (shown and any(s != shown for s in sent)):
             self._tainted.add(item.id)
-        elif len(previews) == 1 and not shown:
-            (preview,) = previews
-            if preview:
-                item.detail["input_preview"] = preview
+        elif sent and sent[0] and not shown:
+            item.detail[detail] = sent[0]
 
     def _shows(self, item: Item, waiter: Waiter) -> bool:
-        """Whether the item shows exactly the call ``waiter`` would allow."""
-        return (item.id not in self._tainted and bool(waiter.preview)
-                and item.detail.get("input_preview") == waiter.preview)
+        """Whether the item shows exactly what ``waiter`` sent of its prompt, and
+        the hook says that is its call exactly or its questions whole: only then
+        can Allow or an answer reach it."""
+        return (item.id not in self._tainted and waiter.whole and bool(waiter.shown)
+                and item.detail.get(SHOWN_DETAIL[item.kind]) == waiter.shown)
 
     def end_waiter(self, waiter: Waiter, *, handed: bool = False) -> None:
         """A waiting hook's connection ended. A reply set for it that never
@@ -1807,8 +1892,8 @@ class AttentionStore:
                 return []
             return ["allow", "deny"] if switches.details else ["deny"]
         if item.kind == "question":
-            whole = switches.details and item.answerable and item.detail.get("questions")
-            return ["answer"] if whole and len(self._waiters_for(item)) == 1 else []
+            waiters = self._waiters_for(item)
+            return ["answer"] if switches.details and len(waiters) == 1 and self._shows(item, waiters[0]) else []
         return ["message"] if item.kind == "idle" and channel is not None else []
 
     def queue_replies(self, replies: object, source: object = None) -> None:
@@ -1982,7 +2067,7 @@ class AttentionStore:
             message = None
             if action == "answer":
                 sent.answers = sorted([a["question"], a["option"]] for a in reply["answers"])
-                if len(waiters) != 1:
+                if len(waiters) != 1 or not self._shows(item, waiters[0]):
                     return "refused"
                 result = sent.answers
             elif hook:
