@@ -526,3 +526,11 @@ as much as each by construction (60b38b7, suite 7784 passed). The timing test
 now times `holds_credential` and `mask_shapes` separately (0.5 s each). In
 production `mask_shapes` only sees prose cut to its cap plus a 1000-character
 margin. Doc wording fixed. One scoped cold seat on 60b38b7.
+
+Scoped seat on 60b38b7: no Critical or Important (fuzzed 200,000 inputs, the
+union verified, linear time). Minors:
+- the docs understate the prose login-password extent: fixed;
+- adding `"-u=" * 87_000` to the hostile timing list: **ruled not added**. It
+  already takes 0.27–0.34 s against the 0.5 s budget, so it would make the test
+  flaky on slower CI runners, and production prose is capped at its limit plus
+  1000 characters.

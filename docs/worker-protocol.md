@@ -725,8 +725,9 @@ exactly these fields, and optionally `session_id` and `detail`:
   values of `Authorization` and `Cookie` headers (a quoted name or value, as in
   JSON, and a prefixed name such as `HTTP_AUTHORIZATION` too, a quoted value up
   to its closing quote, and quoted parts after `=` in an unquoted value), the
-  password after a login flag such as `curl -u user:` (to the quote that
-  opened before the user, or to the end of its word) and a word of 20 or more
+  password after a login flag such as `curl -u user:` (as far as any reading
+  of its quotes and backslashes takes it, the shell's or a writer's, and never
+  past the end of its line) and a word of 20 or more
   token characters after `Bearer` or `Basic` masked as `[REDACTED]`, never cut
   through) and
   `questions` (1–4 closed objects, each with
