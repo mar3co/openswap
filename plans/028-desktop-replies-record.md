@@ -472,3 +472,20 @@ CHANGELOG), by a fresh Opus implementer; suite 7776 passed. Its three
 prose-masking decisions are accepted (each masks the same or more of the
 password itself). One cold seat follows; per the budget, every non-Critical
 finding becomes a tracked issue.
+
+### Final cold seat (74f327f..7998766): a Critical reopens the loop once
+
+- **Critical (data):** prose masking showed part of a single-quoted login
+  password the parent masked (`-u admin:'p\'q'r st'uv`). The shell reads no
+  escapes inside single quotes. It also fixes a pre-existing leak of the
+  `'it'\''s secret'` idiom.
+- **Important, a regression:** B2 let a session's background shell vouch for
+  itself with its own forged `Stop`, widening the mar3co/openswap#181 class
+  from "started in the last 2 s" to "any background command".
+- The owner was told before the loop reopened (relay, 2026-11-15).
+- Fix made inline by the controller, f3e2808 (38+/8−, TDD, suite 7780 passed):
+  - the shell's quoting rules in prose;
+  - a Stop hook's launch vouches only for a `Stop` reported within
+    `STOP_START_SECONDS` (5 s) of it, otherwise today's 2 s rule;
+  - the docs updated.
+- One scoped cold seat on f3e2808.
