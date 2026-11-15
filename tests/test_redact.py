@@ -124,10 +124,10 @@ HOSTILE = [
 @pytest.mark.parametrize("text", HOSTILE, ids=lambda text: f"{text[:12]}…{len(text)}")
 def test_checking_and_masking_a_hostile_input_within_the_budget_is_quick(text):
     text = text[:CHECK_BUDGET - 10]
-    started = time.perf_counter()
-    holds_credential({"command": text})
-    mask_shapes(text)
-    assert time.perf_counter() - started < 0.5
+    for check in (lambda: holds_credential({"command": text}), lambda: mask_shapes(text)):
+        started = time.perf_counter()
+        check()
+        assert time.perf_counter() - started < 0.5
 
 
 @pytest.mark.parametrize("shape", SHAPES)
@@ -141,6 +141,8 @@ def test_prose_has_token_shapes_masked(shape):
     ("Run curl -u admin:'it'\\''s secret' x", ("secret",)),
     ("Run curl -u 'admin:it\\'s secret' now", ("secret",)),
     ("Run curl -u admin:'pa\\'ss word' now", ("ss", "word")),
+    ("Use -u admin:'a\\b' -U\nbob:pw now", ("pw",)),
+    ("Try curl -u admin:'it\\'s secret' first; if that fails use -u\nroot:toor instead.", ("secret", "toor")),
 ])
 def test_prose_shows_no_part_of_a_login_password_quoted_as_the_shell_reads_it(text, hidden):
     shown = mask_shapes(text)

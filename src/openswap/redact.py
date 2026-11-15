@@ -60,16 +60,27 @@ _CREDENTIAL = re.compile("|".join([*_TOKENS, rf"-----(?:BEGIN|END){_KEY_LABEL}",
 _SHAPES = re.compile("|".join([rf"-----BEGIN{_KEY_LABEL}.*?(?:-----END{_KEY_LABEL}|\Z)", *_TOKENS]), re.DOTALL)
 # A literal U+3000 inside a URL's password in prose then shows: accepted, for readable CJK prose.
 _URL_PASSWORD = re.compile(_userinfo(_PROSE_SPACE))
-# The password after a login flag in prose: to the quote that opened before the user and on to the
-# end of the word, or to the end of the word, quoted parts included, read as the shell reads them:
-# a backslash escapes the next character outside quotes and inside double quotes. Inside single
-# quotes the shell reads none, but a writer may have meant one (``'it\'s secret'``), so a
-# backslash there masks the rest of the line: more than either reading.
-_DQ_BODY, _SQ_BODY = r"(?:[^\r\n\"\\]|\\[^\r\n]?)*+", r"[^\r\n'\\]*+(?:\\[^\r\n]*+)?"
-_PROSE_WORD = rf"(?:[^{_PROSE_SPACE}\"'\\]|\\[^\r\n]?|\"{_DQ_BODY}\"?|'{_SQ_BODY}'?)++"
-_FLAG_PASSWORD = re.compile(rf"({_FLAG}\"{_LOGIN_USER}){_DQ_BODY}(?:\"{_PROSE_WORD})?"
-                            rf"|({_FLAG}'{_LOGIN_USER}){_SQ_BODY}(?:'{_PROSE_WORD})?"
-                            rf"|({_FLAG}{_LOGIN_USER}){_PROSE_WORD}")
+# The password after a login flag in prose. Where a password ends depends on how its quotes and
+# backslashes are read (as the shell reads them, or as a writer may have meant them), so it is
+# masked as far as any of these readings takes it: the union of their spans.
+_DQ_BODY = r"(?:[^\r\n\"\\]|\\[^\r\n]?)*+"
+
+
+def _flag_password(sq_body: str) -> re.Pattern:
+    """To the quote that opened before the user and on to the end of the word, or to the end of the
+    word, quoted parts included; single-quoted parts read by ``sq_body``."""
+    word = rf"(?:[^{_PROSE_SPACE}\"'\\]|\\[^\r\n]?|\"{_DQ_BODY}\"?|'{sq_body}'?)++"
+    return re.compile(rf"({_FLAG}\"{_LOGIN_USER}){_DQ_BODY}(?:\"{word})?|({_FLAG}'{_LOGIN_USER}){sq_body}(?:'{word})?"
+                      rf"|({_FLAG}{_LOGIN_USER}){word}")
+
+
+_FLAG_PASSWORDS = (
+    _flag_password(r"[^\r\n']*+"),  # the shell's reading: no escapes in single quotes
+    _flag_password(r"(?:[^\r\n'\\]|\\[^\r\n]?)*+"),  # a writer's: ``'it\'s'``
+    _flag_password(r"[^\r\n'\\]*+(?:\\[^\r\n]*+)?"),  # a backslash in single quotes: the rest of the line
+    re.compile(rf"({_FLAG}\"{_LOGIN_USER})[^\r\n\"]++|({_FLAG}'{_LOGIN_USER})[^\r\n']++"  # quotes alone
+               rf"|({_FLAG}{_LOGIN_USER})(?:[^\s\"'`]|\"[^\r\n\"]*+\"?|'[^\r\n']*+'?)++"),
+)
 # An ``Authorization`` or ``Cookie`` header (``HTTP_AUTHORIZATION`` too, and a quoted name, as in
 # JSON): a quoted value up to its closing quote, or an unquoted one up to the line's end or a
 # quote, quoted parts after ``=`` included (``sessionid="…"``, ``Digest response="…"``).
@@ -140,8 +151,25 @@ def mask_shapes(text: str) -> str:
     text = _SHAPES.sub(REDACTED, text)
     text = _URL_PASSWORD.sub(rf"\1{REDACTED}@", text)
     text = _HEADER.sub(rf"\1{REDACTED}", text)
-    text = _FLAG_PASSWORD.sub(lambda m: f"{m[1] or m[2] or m[3]}{REDACTED}", text)
+    text = _mask_flag_passwords(text)
     return _SCHEME_TOKEN.sub(rf"\1{REDACTED}", text)
+
+
+def _mask_flag_passwords(text: str) -> str:
+    """``text`` with every span any of ``_FLAG_PASSWORDS`` takes for a password replaced."""
+    spans = sorted((m.end(m.lastindex), m.end()) for pattern in _FLAG_PASSWORDS for m in pattern.finditer(text)
+                   if m.end() > m.end(m.lastindex))
+    merged: list[list[int]] = []
+    for start, end in spans:
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    pieces, at = [], 0
+    for start, end in merged:
+        pieces += [text[at:start], REDACTED]
+        at = end
+    return "".join(pieces) + text[at:]
 
 
 def _strings(value: object) -> list[str] | None:

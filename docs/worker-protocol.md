@@ -1992,9 +1992,11 @@ questions (details off, or the detail cut for size):
   background task's shell, started during the turn) never pairs, unless a
   forged `Stop` notice is used, dated near the command's own start, and no real
   `Stop` comes later (the real one is suppressed, or the turn ended by Esc,
-  which runs no `Stop`); both need a hostile local process. A `Stop` hook that
-  takes more than 5 seconds to start (a cold start under memory pressure)
-  leaves that turn without a typed-reply box. When two hooks qualify, neither pairs and the item
+  which runs no `Stop`); the forged notice, and any suppression, need a
+  hostile local process. These bounds hold when the `Stop` hook starts
+  promptly; one that takes about 4 to 5 seconds or more to start (counted in
+  whole seconds; a cold start under memory pressure) leaves that turn without
+  a typed-reply box. When two hooks qualify, neither pairs and the item
   takes no `message`. A `Stop` older than the one recorded pairs nothing and
   releases nothing. A newer `Stop` releases the hooks that can no longer pair;
   the owner typing releases every hook of that process except one paired with
