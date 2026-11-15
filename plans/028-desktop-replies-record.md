@@ -6,6 +6,10 @@ results, review dispositions, hand-overs. Newest last within each section.
 ## Status
 
 - 2026-11-15: plan written, R1–R4 ruled, plan and copy approved. Task 1 next.
+- 2026-11-15: Task 1 implemented (Opus), commit 983c44b, suite 7305 passed.
+  Review seats dispatched: cold (worker side), cold (hook side and masker),
+  silent-failure, API surface; all on Opus, run in parallel because the diff
+  is over 550 lines across two areas.
 
 ## Rulings
 
@@ -59,3 +63,17 @@ scratchpad (not kept).
   covers it on a real session.
 
 ## Review dispositions
+
+### Task 1 implementer departures (ruled by the controller, 2026-11-15)
+
+- The permission hook's matcher is `""` and the hook exits at once for
+  `AskUserQuestion`, instead of a matcher regex excluding it. Same behavior, and
+  it doesn't depend on how Claude Code reads a regex. **Accepted.**
+- A watch Deny handed to the hook while the owner presses Yes at the Mac within
+  `CONFIRM_SECONDS`: both make the session `busy`, so the Deny is reported
+  `applied` and the item closes `answered_from_watch` though the tool ran.
+  Reporting only; no call is approved wrongly; it needs two answers within 2 s.
+  This is a gap against plan 025 row 12 (never claim a win that isn't known).
+  **Accepted as a known imprecision, pending the review seats.**
+- Two parallel subagents running the identical call take no hook replies (the
+  `_pair` taint marker is reused). Fails safe. **Accepted.**
