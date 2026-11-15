@@ -77,3 +77,28 @@ scratchpad (not kept).
   **Accepted as a known imprecision, pending the review seats.**
 - Two parallel subagents running the identical call take no hook replies (the
   `_pair` taint marker is reused). Fails safe. **Accepted.**
+
+### Task 1 review round 1 (983c44b; four Opus seats, 2026-11-15)
+
+Mapped to Critical / Important / Minor by the controller. Fix notes (required
+outcomes per state): planning session scratchpad `028-task1-fix-notes.md`,
+items F1–F8.
+
+| Finding | Seat(s) | Severity | Disposition |
+|---|---|---|---|
+| Masking a "credential" slot hides executable text that Allow runs (`--token $(…)`) | hook, API | Critical | F1: Allow only for an exact preview; deny only once anything is masked, cut or escaped. Revisit flag on R1 sent to the owner |
+| Middle cut, bidi or zero-width characters still offered Allow | API, hook | Important | F1 |
+| Masker misses `*_KEY`, quoted values, `Authorization`/`Cookie` JSON keys, space-separated names, `npm_`/`glpat-`/`hf_`/SendGrid, `-u user:pass`, `-pX` | hook | Important | F2 |
+| Masker over-masks (`max_tokens`, empty values, `sed` expressions) and is quadratic on crafted input | hook | Important | F2 |
+| A field shorter than the marker is cut silently | hook, silent | Important | F3 |
+| Forged notice relabels a question's options while the real hook answers by position | API | Important | F4: item shows the hook's own questions; mismatch taints |
+| `waiter_over` releases a queued prompt's hook on a due mark that is later lifted (regression for channel questions) | silent, worker | Important | F5 |
+| `tick` releases hooks when settings are merely unreadable | worker | Important | F6 |
+| A stale channel registration for a reused PID blocks hook replies | worker | Important | F7 |
+| A hook Deny counted as won when the Mac said Yes within 2 s | silent (ledgered departure) | Important | F8: credited only if the call's `PostToolUse` never arrives |
+| Permission waiter with empty `tool_name`/`tool_key` | API | Minor | rides along |
+| Test `forged_first` doesn't change order; uncovered `_take_preview` branch; stale test name | worker | Minor | rides along |
+| CHANGELOG and Settings hint promise typed replies that Task 1 doesn't deliver | hook | Rejected | Task 2 ships them in the same PR |
+
+Implementer for the fix round: a fresh Opus agent. The Task 1 implementer
+measured 371k of context, and a round this size would pass the 400k line.
