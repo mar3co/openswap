@@ -451,6 +451,15 @@ def test_f5_a_hook_whose_prompt_is_not_recorded_yet_waits_until_its_own_bound(de
     assert desktop.store.waiter_over(waiter)
 
 
+def test_a_hook_whose_prompt_was_never_recorded_is_released_once_the_session_is_idle_after_it(desktop):
+    tool_input = bash("npm test")
+    waiter = desktop.store.waiter("permission", CLAUDE, SESSION, attention.tool_key(tool_input), tool_name="Bash")
+    desktop.status("idle", desktop.clock.now + 1)  # its notice could still arrive, dated within PAIR_SECONDS
+    assert not desktop.store.waiter_over(waiter)
+    desktop.clock.now += store_module.PAIR_SECONDS + 1
+    assert desktop.store.waiter_over(waiter)
+
+
 # --- F6 and F7: unreadable settings, a stale channel registration ---------------------------
 
 
@@ -767,6 +776,7 @@ def test_the_preview_shows_the_call_in_claude_codes_channel_form():
 @pytest.mark.parametrize("tool_input", [
     bash("npm test"), bash("cat <<EOF\nline one\n\tline two\nEOF"), {"command": 'echo "quoted \\ back"'},
     {"file_path": "/repo/app.py", "content": "def f():\n\treturn 1\n"}, {"command": "echo café ✓ 漢字"},
+    {"content": "def f():\n    if x:\n        return 1\n"}, {"command": "echo a" + " " * 16 + "b"},
 ])
 def test_a_preview_with_only_jsons_own_escapes_is_exact(tool_input):
     preview, exact = attention.input_preview(tool_input)
@@ -783,14 +793,14 @@ def test_a_preview_with_only_jsons_own_escapes_is_exact(tool_input):
     ({"command": "echo a\x85b"}, "\\u0085"), ({"command": "echo a\ud800b"}, "\\ud800"),
     ({"command": "echo \U000e0041"}, "\\udb40\\udc41"),
     ({"command": "echo ok" + " " * 40 + "&& rm -rf ~"}, "40 spaces"),
-    ({"content": "def f():\n    return 1\n"}, "4 spaces"),
+    ({"content": "def f():\n" + " " * 17 + "return 1\n"}, "17 spaces"),
     ({"value": float("nan")}, "unserializable"),
 ])
 def test_a_preview_that_changes_anything_is_not_exact_and_shows_the_change(tool_input, shown):
     preview, exact = attention.input_preview(tool_input)
     assert not exact and shown in preview
     assert not any(c in preview for c in "\u202e\u200b\u2028\x7f\x85\ud800\U000e0041")
-    assert " " * 4 not in preview
+    assert " " * 17 not in preview
 
 
 def test_a_field_cut_to_the_smallest_share_still_shows_its_marker():

@@ -1850,8 +1850,8 @@ questions (details off, or the detail cut for size):
   cut in its middle or left out, with a marker (also a field too large to mask
   quickly); format, bidi and zero-width characters, line and paragraph
   separators, DEL, C1 controls and lone surrogates written as their JSON
-  escapes; and a run of four or more spaces, which could push the rest of a
-  command out of sight, shown as a marker. JSON's own escapes (`\n`, `\"`) keep
+  escapes; and a run of more than 16 spaces, which could push the rest of a
+  command out of sight, shown as a marker (indentation stays exact). JSON's own escapes (`\n`, `\"`) keep
   it exact. The worker cleans the preview once more and keeps the hook's word
   that it is exact only if that changes nothing. A second hook for the same
   prompt takes every reply away while it waits, and one with another preview

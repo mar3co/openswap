@@ -1779,7 +1779,8 @@ class AttentionStore:
         prompt of its process waited beside it (queued dialogs: which of them was
         answered shows only on its own signal), its Claude Code process ended,
         or the wait passed HOOK_WAIT_SECONDS. A hook whose prompt is not
-        recorded yet waits for it."""
+        recorded yet waits for it until its session is idle past PAIR_SECONDS
+        (that prompt was answered before its notice came)."""
         with self._lock:
             if waiter.done.is_set():
                 return True
@@ -1787,7 +1788,11 @@ class AttentionStore:
                 return True
             item = self._waited(waiter)
             if item is None:
-                return bool(waiter.item_id)
+                if waiter.item_id:
+                    return True
+                record = self._record_for(waiter.session, waiter.claude_pid)
+                return (self.clock() - waiter.at > PAIR_SECONDS and record is not None and record.status == "idle"
+                        and record.status_at > waiter.at)
             waiter.item_id = item.id
             return item.id in self._due and not self._queued_with(item, self._due_exit.get(item.id, 0.0))
 

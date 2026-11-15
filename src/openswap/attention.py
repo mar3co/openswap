@@ -156,7 +156,9 @@ PREVIEW_MASK_BUDGET = 256 * 1024
 # Each field a preview shows keeps at least this many characters, more than
 # its cut marker, so a cut field always shows one.
 PREVIEW_FIELD_MIN = 60
-_SPACE_RUN = re.compile(" {4,}")
+# Indentation stays exact; a longer run of spaces could push the rest of a
+# command out of sight on the watch.
+_SPACE_RUN = re.compile(" {17,}")
 
 
 def input_preview(tool_input: object) -> tuple[str, bool]:
