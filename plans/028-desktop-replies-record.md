@@ -489,3 +489,18 @@ finding becomes a tracked issue.
     `STOP_START_SECONDS` (5 s) of it, otherwise today's 2 s rule;
   - the docs updated.
 - One scoped cold seat on f3e2808.
+
+Scoped seat on f3e2808: the shell reading verified (no shell-password
+character newly shown in about 3M fuzzed inputs), linear time, and the real
+hook pairs for `Stop` hooks starting up to 4 s late. Its findings:
+- **A backdated forged `Stop` after an Esc-ended turn** (no real `Stop`) lets a
+  session's own background shell pair. Not a regression; the #181 class,
+  adjudicated Important. The docs limit is corrected and noted on
+  mar3co/openswap#181.
+- **A `Stop` hook taking over 5 s to start** drops that turn's reply box.
+  Fails safe. Filed mar3co/openswap#217 and added to the docs.
+- **Non-shell quoting in prose** (`'admin:it\'s secret'`) showed `secret`,
+  which the parent masked. Critical by effect, so the loop reopened once more
+  (the owner was told). Fix b866021: a backslash inside a single-quoted value
+  masks the rest of the line, more than either reading (suite 7782 passed).
+  One scoped cold seat on b866021.
