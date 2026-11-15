@@ -355,3 +355,16 @@ decisions, all accepted:
 
 Review: the full set (first review, 941+/63−): cold worker, cold hook,
 silent-failure, API surface; all Opus.
+
+### Task 2 review round 1 (746043c; four Opus seats)
+
+| Finding | Seat(s) | Severity | Disposition |
+|---|---|---|---|
+| A command the session runs pairs as the wake hook (a forged `Stop`, or winning the race with the real `Stop`), takes the owner's text, and can forge the woken prompt so the reply reads `applied` | API (rated Critical), worker, silent | Important. By effect, the text was bound for the same session, which a same-user process can already read; nothing is approved and no one acts as another. Same class as plan 025's accepted channel limit (mar3co/openswap#181) | K1: pair only the newest hook around the latest `Stop`; never a hook whose process under Claude Code started before the turn; residual noted on #181 |
+| An unpaired hook (a prompt queued at `Stop`, or the hook/notice race) blocks later turns' hooks for up to an hour | worker, hook | Important | K1 |
+| An out-of-order older `Stop` overwrites the latest | worker | Important (low reach) | K1 |
+| No staleness check on the hook path: text can land after a turn the owner didn't see | API, hook, silent, worker | Important | K2 |
+| A held item never settles if the woken prompt never matches (format drift, a whitespace-only text, a failed write) | hook, silent, worker | Important | K3 + K5 |
+| Desktop: a woken turn whose prompt notice arrives after its `Stop` leaves no idle item | hook, silent, worker | Important | K4 |
+| A lone-surrogate text makes the hook fail after taking it | silent | Important | K5 |
+| Forged notices block typed replies | API | Important; denial of service only | K6: accepted and documented |
