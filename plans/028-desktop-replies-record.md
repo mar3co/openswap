@@ -260,3 +260,33 @@ false positive under a conservative condition or closes a gap:
 Not changed: an early close by a hostile sole waiter (mar3co/openswap#212).
 
 Review: one cold seat (112 changed lines).
+
+### Round 4 follow-up: d715367 partly reverted (073ecdc)
+
+The cold seat on d715367 found that its narrowing of false positives opened
+real leaks (rated Critical by effect):
+- `curl -u "$JIRA_EMAIL:hunter2"`, `curl -u 4021:5839`;
+- a `pass` key, `db_pass=…`;
+- a quoted prose password cut through;
+- `Bearer <token without a digit>`.
+
+It also found header-name false positives on YAML and CSS. All of these were
+in code the controller had just added, so by the convergence rule the
+narrowing was reverted to 073f429's broad rules rather than patched again.
+Kept, because each can only reduce leaks:
+- URL userinfo excludes only ASCII whitespace;
+- quoted parts after `=` in a header value;
+- a prose login password masked to its opening quote or the end of its word;
+- the `SSH_AUTH_SOCK` exemption;
+- header names before a colon and value, limited to `X-…` and Title-Case;
+- the safe `.get` in `observe`, and the `max()` test.
+
+The remaining false positives, and the leak cases a future narrowing must not
+reopen, are tracked in mar3co/openswap#213. Suite 7625 passed. One cold seat
+on 073f429..073ecdc.
+
+**Task 2 pre-dispatch ruling check** (Opus, one pass): wrong states in T1, T3,
+T4, T5, T7, T8, T9, T10, T11 and T12. The notes are being amended after
+measuring the woken turn's `UserPromptSubmit` and the terminal wake.
+Headless 2.1.325: the woken turn's prompt is
+`<task-notification>…Stop hook feedback…</task-notification><system-reminder>Stop hook blocking error from command "Stop": <stderr></system-reminder>`.
