@@ -456,3 +456,19 @@ Final single fix dispatch notes: planning session scratchpad
 
 After it: ONE cold seat, the gates, then the PR. Every non-Critical finding
 from that seat becomes a tracked issue.
+
+Final pre-dispatch ruling check (Opus, one pass), with amendments:
+- A2 keeps a header's trailing `key` withheld, except a short non-secret list
+  (Idempotency, Cache, Partition, Sort, Primary, Foreign, Sec-WebSocket).
+- A4 ends the prose password at ASCII whitespace or U+3000, U+2028, U+2029.
+- A5 applies to prose only, so the call check is unchanged.
+- B2 stores the Stop hook's launch separately, uses it only in the three launch
+  comparisons, compares strictly (`stop_launch - launched <= 1`), and falls back
+  to the notice's `at`.
+- B4: "held" means already in `_sent`.
+
+Final fix dispatch: c7bac8e (redact) and 7998766 (worker, ipc, docs,
+CHANGELOG), by a fresh Opus implementer; suite 7776 passed. Its three
+prose-masking decisions are accepted (each masks the same or more of the
+password itself). One cold seat follows; per the budget, every non-Critical
+finding becomes a tracked issue.
