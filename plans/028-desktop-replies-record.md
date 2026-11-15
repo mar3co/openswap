@@ -384,3 +384,20 @@ Task 2 fix round 1, pre-dispatch ruling check (Opus, one pass). Amendments:
 
 Implementer: a fresh Opus agent. The Task 2 implementer is not reused, to stay
 under the context line.
+
+### Task 2 fix round 1 (d50057e)
+
+K1–K6 done by a fresh Opus implementer; suite 7728 passed. 31 new tests fail on
+746043c. Pairing is now computed from the latest `Stop` and the hook's launch
+time (`peers.hook_launch`). All six of its judgment calls are accepted:
+- K5's gate applies to the hook path only;
+- K2 counts a status by its own `status_at` (assumes Claude Code doesn't
+  rewrite `statusUpdatedAt` while busy; unverified);
+- T6's `refused` is kept for a fresh non-idle read;
+- a mismatch must be dated at or after the hand-over, and a match settles
+  whenever the item is open;
+- registration is refused when the launch time is unknown or the hook can never
+  pair;
+- two qualifying hooks are kept waiting, unpaired.
+
+Review: cold, silent-failure, API surface (701 lines), all Opus.
