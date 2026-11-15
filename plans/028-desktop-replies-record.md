@@ -316,3 +316,25 @@ Notes amended after the ruling check:
   turn; a reply handed over just before a restart stays `sent`.
 
 Implementer: a fresh Opus agent.
+
+### Cold seat on 073f429..073ecdc: no Critical; Task 1's per-task loop stops
+
+Nothing caught at 073f429 is missed now; every pattern stays linear. By the
+convergence rule (the findings are in code the last round added, or predate
+it), these go to the whole-branch final review's single fix dispatch instead
+of another per-task round:
+- **I-a:** a quoted password right after a login flag's colon
+  (`curl -u admin:'p@ss!'`). Predates; the fix only catches more:
+  `["']?` after the user.
+- **I-b:** prose over-masks `-u 1000:1000`, `rsync -a deploy@host:/srv`,
+  `grep -a foo:bar`. Prose only, nothing leaks.
+- **I-c:** header names ending in `Key` (`Idempotency-Key`, `X-Cache-Key`) are
+  withheld. A false positive; candidate: count only `auth`/`pw` for header names.
+- **I-d:** header-name check misses `X-Auth-Key:0123` (no space) and the quoted
+  JSON key form.
+- **I-e:** prose cut-throughs: escaped quote, text after a closing quote,
+  backtick, Unicode space in branch 3.
+- **I-f:** `_USERINFO` matches across U+3000 (CJK prose).
+- **Minors:** revert the defensive `.get`; the `SSH_AUTH_SOCK` docs placement;
+  `holds_credential`/`mask_shapes` docstrings; the comment at redact.py:40; a
+  backtick-exclusion test.
