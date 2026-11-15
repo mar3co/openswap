@@ -52,5 +52,10 @@ scratchpad (not kept).
   that turn; it started its own turn right after (24.7 s → 26.4 s). So a reply
   handed over just before the owner types runs after the owner's turn, never
   inside it.
+- **Wake-hook timeout (Task 2 step 0).** Desktop's 2.1.325 headless: a `Stop`
+  hook with `asyncRewake: true` and `timeout: 900` woke at 660 s, past the
+  600 s default, and the turn ran (665.8 s). A configured timeout above the
+  default is honored. The full hour (R3) was not waited out; Task 2's exit run
+  covers it on a real session.
 
 ## Review dispositions
