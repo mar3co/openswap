@@ -583,3 +583,7 @@ union verified, linear time). Minors:
     new in this PR, so a credential-check miss counts.
   
   The PR body says so.
+- **Cold check of bd0856e:** `holds_credential` no findings; linear time.
+  Prose-masking interplay (one pattern's mask hiding another credential's
+  start, partly predating it): tracked as mar3co/openswap#220 under the
+  masking-scope ruling.
