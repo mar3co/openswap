@@ -29,6 +29,14 @@ results, review dispositions, hand-overs. Newest last within each section.
   not to be downloaded. Tracked in mar3co/openswap#210 (the live check and the
   one-entry change). Makes the approved copy name VS Code wrongly: amended copy
   sent to the owner for approval, pending.
+- **2026-11-15, revised copy after the VS Code ruling (owner, relayed, quoting
+  their pick "Use both (Recommended)").** The Settings hint ("Replies work in
+  Claude Desktop and terminal sessions started after you turn this on; VS Code
+  sessions show notices only for now. …") and the CHANGELOG New line ("Claude
+  Desktop sessions, and terminal sessions started without `openswap claude`, …")
+  are approved as proposed. The later CHANGELOG additions from the final review
+  (the Improved line on withholding and masking, and the restart sentence) are
+  still pending the owner's answer.
 - **2026-11-15, merge and release.** Not this session's: the managing session
   gets the owner's approval for both.
 
