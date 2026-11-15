@@ -36,11 +36,13 @@ NOTE = "Reply from the owner's phone or watch:"
 def stop(env, offset=0.0, **fields):
     """The turn's ``Stop`` notice, dated ``offset`` from now."""
     entry = {"entrypoint": env.entrypoint} if getattr(env, "entrypoint", "") else {}
-    env.store.notice(hook("Stop", last_assistant_message="Done.", **fields) | entry | env.at(offset))
+    env.store.notice(hook("Stop", **{"last_assistant_message": "Done.", **fields}) | entry | env.at(offset))
 
 
-def wake(env, claude=CLAUDE, session=SESSION):
-    return env.store.wake_waiter(claude, session)
+def wake(env, claude=CLAUDE, session=SESSION, launched=None):
+    """A wake hook registering now, whose process under Claude Code started at
+    ``launched`` (by default now: Claude Code started it for this ``Stop``)."""
+    return env.store.wake_waiter(claude, session, env.clock.now if launched is None else launched)
 
 
 def finished(env, *, slack=0.0):
@@ -174,8 +176,9 @@ def test_t3_the_next_stops_wake_hook_releases_the_older_one(desktop):
 
 def test_t3_a_wake_hook_that_pairs_with_no_stop_never_replaces_one(desktop):
     item, waker = finished(desktop)
-    assert wake(desktop) is None
+    assert wake(desktop) is not None
     assert not waker.done.is_set() and desktop.actions(item) == ["message"]
+    sent(desktop, item, waker)
 
 
 def test_t3_a_stop_from_before_the_latest_prompt_does_not_pair(desktop):
@@ -560,9 +563,9 @@ def _serve(store, request):
 
 def test_only_openswaps_wake_command_under_claude_code_is_served(desktop, monkeypatch):
     desktop.status("idle", desktop.clock.now)
-    stranger = Process(PID + 7, PID, "Fri Nov  6 14:00:02 2026", ("python3", "attention", "permission"))
+    stranger = Process(PID + 7, PID, "Fri Jan 15 08:00:00 2027", ("python3", "attention", "permission"))
     monkeypatch.setattr(peers, "peer_pid", lambda _c: stranger.pid)
-    monkeypatch.setattr(peers, "hook_claude", lambda pid: CLAUDE)
+    monkeypatch.setattr(peers, "hook_launch", lambda pid: (CLAUDE, stranger))
     _running(monkeypatch, stranger)
     a, b = socket.socketpair()
     with a, b:
@@ -572,10 +575,15 @@ def test_only_openswaps_wake_command_under_claude_code_is_served(desktop, monkey
     assert desktop.store._wakers == []
 
 
-def test_a_wake_hook_takes_the_message_over_its_connection(desktop, monkeypatch):
-    process = Process(PID + 9, PID, "Fri Nov  6 14:00:03 2026", ("openswap", "attention", "wake"))
+@pytest.mark.parametrize(("launched", "takes"), [("Fri Jan 15 07:59:59 2027", True),
+                                                 ("Fri Jan 15 07:59:57 2027", False)],
+                         ids=["started for this Stop", "started during the turn"])
+def test_a_wake_hook_takes_the_message_over_its_connection(desktop, monkeypatch, launched, takes):
+    assert desktop.clock.now == 1_800_000_000  # Fri Jan 15 08:00:00 2027 UTC
+    process = Process(PID + 9, PID + 8, "Fri Jan 15 08:00:00 2027", ("openswap", "attention", "wake"))
+    shell = Process(PID + 8, PID, launched, ("/bin/sh", "-c", "..."))  # what Claude Code started
     monkeypatch.setattr(peers, "peer_pid", lambda _c: process.pid)
-    monkeypatch.setattr(peers, "hook_claude", lambda pid: CLAUDE)
+    monkeypatch.setattr(peers, "hook_launch", lambda pid: (CLAUDE, shell) if pid == process.pid else None)
     _running(monkeypatch, process)
     t = desktop.clock.now
     desktop.status("idle", t)
@@ -583,11 +591,15 @@ def test_a_wake_hook_takes_the_message_over_its_connection(desktop, monkeypatch)
     a, b, serving, stop_serving = _serve(desktop.store, {"version": 1, "command": "wake", "session_id": SESSION})
     with a, b:
         deadline = time.monotonic() + 5
-        while not desktop.store._wakers and time.monotonic() < deadline:
+        while not desktop.store._wakers and serving.is_alive() and time.monotonic() < deadline:
             time.sleep(0.01)
         desktop.clock.now = t + 61
         desktop.store.tick()
         [item] = desktop.store._items
+        if not takes:
+            serving.join(5)
+            assert json.loads(b.recv(4096)) == {"message": None} and desktop.actions(item) == []
+            return
         desktop.reply(item.id, "message", text="Run the tests")
         assert json.loads(b.makefile("rb").readline()) == {"message": "Run the tests"}
         serving.join(5)
@@ -609,3 +621,256 @@ def test_row11_the_woken_turns_stop_brings_a_new_hook_and_a_second_reply_works(d
     desktop.reply(second.id, "message", reply_id="r2", text="Now the linter")
     assert again.result == "Now the linter"
 
+
+
+# --- K1: pairing never lets a stale or self-started hook hold the place ----------------------
+
+
+def test_k1_an_unpaired_hook_never_blocks_the_next_turns_own_hook(desktop):
+    t = desktop.clock.now
+    desktop.status("idle", t)
+    stop(desktop)  # turn 1 ends
+    desktop.store.notice(hook("UserPromptSubmit", prompt="queued while it worked") | desktop.at(0.3))
+    desktop.status("busy", t + 0.3)
+    desktop.clock.now = t + 0.6
+    first = wake(desktop)  # turn 1's own hook, after the queued prompt: it pairs with nothing
+    desktop.clock.now = t + 30
+    desktop.status("idle", desktop.clock.now)
+    second = wake(desktop)  # the queued turn's hook, before its Stop notice
+    stop(desktop, offset=0.3)
+    assert first.done.is_set() and first.result is None and not second.done.is_set()
+    desktop.clock.now += 61
+    desktop.store.tick()
+    [item] = [i for i in desktop.store._items if i.kind == "idle"]
+    assert desktop.actions(item) == ["message"]
+    sent(desktop, item, second)
+
+
+@pytest.mark.parametrize("stop_first", [True, False], ids=["Stop first", "hooks first"])
+def test_k1_two_hooks_around_one_stop_pair_neither(desktop, stop_first):
+    t = desktop.clock.now
+    desktop.status("idle", t)
+    if stop_first:
+        stop(desktop)
+    hooks = [wake(desktop), wake(desktop, launched=t - 1)]
+    if not stop_first:
+        stop(desktop, offset=0.5)
+    desktop.clock.now = t + 61
+    desktop.store.tick()
+    [item] = desktop.store._items
+    assert desktop.actions(item) == []
+    desktop.accepted()
+    desktop.reply(item.id, "message", text="x", offered=False)
+    assert desktop.outcomes() == {"r1": "refused"} and not any(h.done.is_set() for h in hooks)
+
+
+@pytest.mark.parametrize(("started", "pairs"), [(-1.9, True), (-2.1, False), (-30, False)])
+def test_k1_a_hook_whose_process_under_claude_code_started_during_the_turn_never_pairs(desktop, started, pairs):
+    t = desktop.clock.now
+    desktop.status("idle", t)
+    waker = wake(desktop, launched=t + started)  # a background task's shell, say, before the Stop
+    stop(desktop)
+    desktop.clock.now = t + 61
+    desktop.store.tick()
+    [item] = desktop.store._items
+    assert desktop.actions(item) == (["message"] if pairs else [])
+    assert waker.done.is_set() is not pairs  # one that can never pair is let go at the Stop
+    # After the Stop, such a hook is not even taken.
+    assert (wake(desktop, launched=t + started) is None) is not pairs
+
+
+def test_k1_a_stop_older_than_the_one_recorded_pairs_and_releases_nothing(desktop):
+    item, waker = finished(desktop)
+    stop(desktop, offset=-61 - 10)  # an earlier turn's Stop, arriving late
+    assert not waker.done.is_set() and desktop.actions(item) == ["message"]
+    assert wake(desktop, launched=desktop.clock.now - 71) is None  # a hook around that older Stop
+
+
+@pytest.mark.parametrize(("dated", "paired_stays"), [(1, False), (-62, True)],
+                         ids=["typed after the Stop", "its notice late, typed before the Stop"])
+def test_k1_a_typed_prompt_releases_unpaired_hooks_and_those_paired_before_it(desktop, dated, paired_stays):
+    _, waker = finished(desktop)
+    other = wake(desktop)  # registered with no Stop of its own
+    desktop.store.notice(hook("UserPromptSubmit", prompt="hello") | desktop.at(dated))
+    assert other.done.is_set() and other.result is None
+    assert waker.done.is_set() is not paired_stays
+
+
+def test_k1_a_process_keeps_at_most_one_paired_and_two_unpaired_hooks(desktop):
+    item, waker = finished(desktop)
+    extra = [wake(desktop) for _ in range(3)]
+    assert extra[0].done.is_set() and not extra[1].done.is_set() and not extra[2].done.is_set()
+    assert not waker.done.is_set() and desktop.actions(item) == ["message"]
+    waiting = [w for w in desktop.store._wakers if not w.done.is_set()]
+    assert len(waiting) == 3 and len(waiting) < store_module.MAX_WAKERS
+
+
+# --- K2: no text after a turn the owner did not see ---------------------------------------------
+
+
+@pytest.mark.parametrize("turn", ["task prompt", "busy", "waiting"])
+def test_k2_a_turn_seen_after_the_items_stop_closes_it_to_messages(desktop, turn):
+    item, waker = finished(desktop)
+    desktop.accepted()  # the phone shows the item with its message action
+    if turn == "task prompt":
+        desktop.store.notice(hook("UserPromptSubmit", prompt="<task-notification>\nx\n</task-notification>")
+                             | desktop.at(0))
+    else:
+        desktop.status(turn, desktop.clock.now)
+    desktop.clock.now += 10
+    desktop.status("idle", desktop.clock.now)  # that turn ended; its Stop notice is still on its way
+    assert desktop.actions(item) == []
+    desktop.reply(item.id, "message", text="Run the tests", offered=False)
+    assert desktop.outcomes() == {"r1": "item_closed"} and not waker.done.is_set()
+
+
+def test_k2_the_turns_own_busy_and_a_late_idle_are_not_a_newer_turn(desktop):
+    t = desktop.clock.now
+    desktop.status("busy", t - 30)
+    stop(desktop)
+    waker = wake(desktop)
+    desktop.status("busy", t - 30)  # read after the Stop, set before it
+    desktop.clock.now = t + 30
+    desktop.status("idle", t + 30)  # the owner's own Stop hooks took half a minute
+    desktop.clock.now = t + 61
+    desktop.store.tick()
+    [item] = desktop.store._items
+    sent(desktop, item, waker)
+
+
+# --- K3: a handed-over item is held only until its own turn shows ------------------------------
+
+
+def test_k3_a_mismatched_woken_prompt_ends_the_hold_at_its_turns_stop(desktop, caplog, monkeypatch):
+    monkeypatch.setattr(store_module, "_logged", {})
+    item, waker = finished(desktop)
+    sent(desktop, item, waker)
+    desktop.store.notice(hook("UserPromptSubmit", prompt=woken("Run the other tests")) | desktop.at(0.2))
+    assert item in desktop.store._items and desktop.closes() == {}
+    assert "did not name" in caplog.text
+    desktop.clock.now += 3
+    desktop.status("idle", desktop.clock.now)
+    stop(desktop)
+    newer = wake(desktop)
+    assert desktop.closes() == {item.id: "superseded"} and desktop.outcomes() == {}
+    [current] = desktop.store._items
+    desktop.clock.now += 61
+    desktop.store.tick()
+    assert desktop.actions(current) == ["message"]
+    desktop.reply(current.id, "message", reply_id="r2", text="Again")
+    assert newer.result == "Again"
+
+
+def test_k3_a_mismatch_after_its_turns_stop_ends_the_hold_at_once(desktop):
+    item, waker = finished(desktop)
+    sent(desktop, item, waker)
+    desktop.clock.now += 3
+    desktop.status("idle", desktop.clock.now)
+    stop(desktop)
+    newer = wake(desktop)
+    assert [i.id for i in desktop.store._items] == [item.id]
+    desktop.store.notice(hook("UserPromptSubmit", prompt=woken("Run the other tests")) | desktop.at(-2.8))
+    assert desktop.closes() == {item.id: "superseded"} and desktop.outcomes() == {}
+    [current] = desktop.store._items
+    assert current.detail == {"last_message": "Done."}
+    desktop.clock.now += 61
+    desktop.store.tick()
+    assert desktop.actions(current) == ["message"] and not newer.done.is_set()
+
+
+def test_k3_a_woken_prompt_from_before_the_hand_over_decides_nothing(desktop):
+    item, waker = finished(desktop)
+    sent(desktop, item, waker)
+    desktop.store.notice(hook("UserPromptSubmit", prompt=woken("An earlier text")) | desktop.at(-1))
+    stop(desktop, offset=3)
+    assert [i.id for i in desktop.store._items] == [item.id]
+    desktop.store.notice(hook("UserPromptSubmit", prompt=woken("Run the tests")) | desktop.at(0.2))
+    assert desktop.outcomes() == {"r1": "applied"}
+
+
+@pytest.mark.parametrize("its_stop", [True, False], ids=["its turn's Stop seen", "no Stop either"])
+def test_k3_no_matching_prompt_within_the_hour_ends_the_hold(desktop, its_stop):
+    item, waker = finished(desktop)
+    sent(desktop, item, waker)
+    if its_stop:
+        stop(desktop, offset=3)
+    desktop.clock.now += store_module.WAKE_SECONDS - 1
+    desktop.store.tick()
+    assert [i.id for i in desktop.store._items] == [item.id]
+    desktop.clock.now += 1
+    desktop.store.tick()
+    if not its_stop:
+        assert [i.id for i in desktop.store._items] == [item.id]
+        stop(desktop)  # the next turn's Stop supersedes it as usual
+    assert desktop.closes() == {item.id: "superseded"} and desktop.outcomes() == {}
+    assert [i.id for i in desktop.store._items] != [item.id]
+
+
+# --- K4: Desktop keeps an idle item after a woken turn ------------------------------------------
+
+
+def test_k4_a_woken_prompt_after_its_turns_stop_opens_that_stops_idle_item(surface):
+    item, waker = finished(surface)
+    sent(surface, item, waker)
+    surface.status("busy", surface.clock.now + 0.1)
+    surface.clock.now += 3
+    surface.status("idle", surface.clock.now)
+    stop(surface, last_assistant_message="All green.")  # the woken turn's Stop comes first
+    newer = wake(surface)
+    surface.store.notice(hook("UserPromptSubmit", prompt=woken("Run the tests")) | surface.at(-2.8))
+    assert surface.closes() == {item.id: "answered_from_watch"} and surface.outcomes() == {"r1": "applied"}
+    if surface.entrypoint == "cli":
+        surface.store.notice(hook("Notification", notification_type="idle_prompt") | surface.at(63))
+    else:
+        [current] = surface.store._items
+        assert not current.published  # Desktop: shown once it has stayed idle
+    surface.clock.now += 64
+    surface.store.tick()
+    [current] = surface.store._items
+    assert current.kind == "idle" and current.detail == {"last_message": "All green."}
+    assert surface.actions(current) == ["message"]
+    surface.reply(current.id, "message", reply_id="r2", text="Now the linter")
+    assert newer.result == "Now the linter"
+
+
+# --- K5: text the hook can always deliver and match --------------------------------------------
+
+
+@pytest.mark.parametrize("text", [" ", " \t\r\n ", "﻿", " ﻿\n", "a\ud800b", "x</system-reminder>y"],
+                         ids=["space", "whitespace", "BOM", "BOM and whitespace", "lone surrogate", "closing tag"])
+def test_k5_a_text_the_hook_cannot_deliver_or_match_is_refused(desktop, text):
+    item, waker = finished(desktop)
+    desktop.reply(item.id, "message", text=text)
+    assert desktop.outcomes() == {"r1": "refused"} and not waker.done.is_set()
+    assert desktop.actions(item) == ["message"]
+
+
+@pytest.mark.parametrize("given", [" Run the tests", "Run the tests \n", "﻿Run the tests", "\n Run the tests﻿"])
+def test_k5_the_digest_trims_both_ends_on_both_sides(given):
+    assert store_module.reply_key(given) == store_module.reply_key("Run the tests")
+    assert hook("UserPromptSubmit", prompt=woken(given))["reply"] == store_module.reply_key("Run the tests")
+
+
+def test_k5_the_woken_text_ends_at_the_first_closing_tag_after_the_note():
+    prompt = woken("Run the tests") + "\n<system-reminder>\nToday's date is 2026-11-15.\n</system-reminder>"
+    assert hook("UserPromptSubmit", prompt=prompt)["reply"] == store_module.reply_key("Run the tests")
+
+
+# --- the process Claude Code started for a hook ------------------------------------------------
+
+
+def test_hook_launch_names_claude_code_and_the_process_it_started(monkeypatch):
+    chain = [Process(40, 30, "Fri Jan 15 08:00:01 2027", ("openswap", "attention", "wake")),
+             Process(30, 20, "Fri Jan 15 08:00:00 2027", ("/bin/sh", "-c", "x")),
+             Process(20, 10, "Fri Jan 15 07:00:00 2027", ("claude",))]
+    _running(monkeypatch, *chain)
+    assert peers.hook_launch(40) == (chain[2], chain[1]) and peers.hook_claude(40) == chain[2]
+    _running(monkeypatch, Process(41, 20, "Fri Jan 15 08:00:02 2027", ("openswap", "attention", "wake")), chain[2])
+    assert peers.hook_launch(41)[1].pid == 41  # run by Claude Code itself
+
+
+@pytest.mark.parametrize(("started", "at"), [("Fri Jan 15 08:00:00 2027", 1_800_000_000.0),
+                                             ("Sat Feb 6 14:03:45 2027", 1_801_922_625.0),
+                                             ("Sam Fév 6 14:03:45 2027", None), ("", None)])
+def test_a_process_start_reads_as_seconds_since_the_epoch(started, at):
+    assert peers.started_at(Process(5, 1, started, ())) == at

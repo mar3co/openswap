@@ -71,8 +71,6 @@ WAKE_NOTE = "Reply from the owner's phone or watch:"
 # an older or broken program's exit 2 and usage text never do.
 WAKE_FD = 3
 WAKE_STATUS = 90
-# How Claude Code closes the woken turn's prompt after the hook's stderr (measured on 2.1.325).
-WOKEN_END = "\n</system-reminder>"
 CHANNEL_COMMAND = "channel"
 
 
@@ -322,10 +320,10 @@ def _hook_notice(event: str, raw: bytes) -> dict | None:
                 notice["reply"] = token.group(1)
         elif prompt.startswith(TASK_TAG):
             notice["prompt_kind"] = "task"
-            text = _woken_text(prompt)
-            if text is not None:
-                from openswap.worker.attention import reply_key
+            from openswap.worker.attention import WOKEN_TAG, reply_key
 
+            text = _woken_text(prompt, "\n" + WOKEN_TAG)
+            if text is not None:
                 notice["reply"] = reply_key(text)  # names the text, never carries it
         elif prompt.strip().split(" ", 1)[0] in SESSION_COMMANDS:
             notice["prompt_kind"] = "end"
@@ -336,13 +334,15 @@ def _hook_notice(event: str, raw: bytes) -> dict | None:
     return notice
 
 
-def _woken_text(prompt: str) -> str | None:
+def _woken_text(prompt: str, end: str) -> str | None:
     """The text a wake hook gave Claude Code, in the prompt of the turn it
-    started; None for a prompt without the note."""
+    started: after the note, up to the first ``end`` (how Claude Code closes
+    the hook's output there); None for a prompt without the note."""
     start = prompt.find(WAKE_NOTE + "\n")
     if start < 0:
         return None
-    return prompt[start + len(WAKE_NOTE) + 1:].removesuffix(WOKEN_END)
+    text = prompt[start + len(WAKE_NOTE) + 1:]
+    return text.split(end, 1)[0]
 
 
 _SHELLS = frozenset({"sh", "bash", "zsh", "dash", "fish", "ksh", "mksh", "tcsh", "csh"})

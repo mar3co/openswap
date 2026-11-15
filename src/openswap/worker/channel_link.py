@@ -141,15 +141,20 @@ def _serve_waiter(store, connection, request, kind, stop_event, release) -> None
     hook = peers.process(pid)
     _, _, field, shown, whole = WAITERS[kind]
     # The session's own synchronous hook: OpenSwap's command for ``kind``, under Claude Code.
-    claude = peers.hook_claude(pid) if hook is not None and hook.args[-2:] == ("attention", kind) else None
-    if claude is None:
-        waiter = None
-    elif kind == "wake":
-        waiter = store.wake_waiter(claude, request["session_id"])
-    else:
+    ours = hook is not None and hook.args[-2:] == ("attention", kind)
+    waiter = None
+    if ours and kind == "wake":
+        # Paired only when Claude Code started its line for the turn's own Stop.
+        launch = peers.hook_launch(pid)
+        if launch is not None:
+            waiter = store.wake_waiter(launch[0], request["session_id"], peers.started_at(launch[1]))
+    elif ours:
+        claude = peers.hook_claude(pid)
         extra = {"tool_name": request["tool_name"]} if kind == "permission" else {}
-        waiter = store.waiter(kind, claude, request["session_id"], request["tool_key"], request.get("agent_id", ""),
-                              shown=request.get(shown), whole=request.get(whole) is True, **extra)
+        if claude is not None:
+            waiter = store.waiter(kind, claude, request["session_id"], request["tool_key"],
+                                  request.get("agent_id", ""), shown=request.get(shown),
+                                  whole=request.get(whole) is True, **extra)
     if waiter is None:
         _reply(connection, {field: None})
         return
