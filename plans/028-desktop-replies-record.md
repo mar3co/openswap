@@ -218,3 +218,23 @@ line.
 
 Round 3 fix notes: planning session scratchpad `028-task1-fix3-notes.md`
 (H1–H8). Ruling check: one Opus pass.
+
+Round 3 ruling check (Opus, one pass), with amendments before dispatch:
+- H1 is "deny only when the call pairs exactly" (unpaired calls take no reply);
+  plan row 1 is amended (785c48e).
+- H2's `auth`, `pw` and trailing-`key` rules apply only to UPPER_SNAKE env names
+  and dash flags, so code edits (`ForeignKey`, `useAuth`, `auth/` paths) keep
+  Allow, as R1(a) intends.
+- H4 uses ASCII-only boundaries in the token and header patterns.
+- H6 covers YAML-style quoted values and `Bearer <long token>` in prose.
+- H8's third test pins the real lost-hand-over outcome.
+- The partial-mask fix keeps masking before the cut.
+
+### Task 1 fix round 3 (6925c6b)
+
+- H1–H8 and the Minors, by a fresh Opus implementer; suite 7608 passed. It also
+  fixed `_strings` reading lists in reverse, so a Codex command list now
+  matches the flag rule (accepted). Uppercase env names such as `SSH_AUTH_SOCK`
+  and `SORT_KEY` now lose Allow (accepted false positive).
+- Review round 4: 275+/85− lines, below the 400 line, so one cold seat and the
+  silent-failure seat, both Opus.
