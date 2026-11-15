@@ -534,3 +534,11 @@ union verified, linear time). Minors:
   already takes 0.27–0.34 s against the 0.5 s budget, so it would make the test
   flaky on slower CI runners, and production prose is capped at its limit plus
   1000 characters.
+
+### PR
+
+- 2026-11-15: the owner chose "Create PR" in this session (auto mode had refused
+  `gh pr create` on the managing session's relay alone). Opened
+  mar3co/openswap#218 from claude/charming-montalcini-f4134e (base main).
+  Auto-fix is on. Requested a Codex review. Merge and release stay with the
+  owner, through the managing session.
