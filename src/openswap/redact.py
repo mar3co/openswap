@@ -36,23 +36,37 @@ _TOKENS = [rf"{_START}(?:{token})" for token in (
     r"SG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}",
 )]
 _KEY_LABEL = r"[A-Z0-9 ]{0,40}PRIVATE KEY(?: BLOCK)?-----"
-# A URL's ``user:password@``, or a user alone as long as a token (``https://<token>@github.com``).
-# ASCII whitespace only: a password may hold a space outside ASCII, shown escaped.
-_USERINFO = (r"(?i:(?<![a-z0-9+.-])([a-z][a-z0-9+.-]*+://)"
-             r"(?:[^/ \t\r\n\f\v@:\"'<>]*+:[^/ \t\r\n\f\v@\"'<>]++|[A-Za-z0-9_-]{20,}+)@)")
+_ASCII_SPACE = r" \t\r\n\f\v"
+# Where a word ends in prose: also the ideographic space (CJK text) and the line and paragraph separators.
+_PROSE_SPACE = _ASCII_SPACE + r"\u3000\u2028\u2029"
+
+
+def _userinfo(space: str) -> str:
+    """A URL's ``user:password@``, or a user alone as long as a token
+    (``https://<token>@github.com``), ending at a character of ``space``."""
+    return (rf"(?i:(?<![a-z0-9+.-])([a-z][a-z0-9+.-]*+://)"
+            rf"(?:[^/{space}@:\"'<>]*+:[^/{space}@\"'<>]++|[A-Za-z0-9_-]{{20,}}+)@)")
+
+
+# In a call only ASCII whitespace ends one: a password may hold any other space.
+_USERINFO = _userinfo(_ASCII_SPACE)
 # ``user:password`` given to a login flag (``curl -u``, ``psql -U``, ``http --auth``); the user is
 # bounded so that flags packed into one long word stay linear.
 _FLAG = r"(?<![A-Za-z0-9_-])(?:-[uUa]|--(?:(?:proxy-)?user|auth)(?=[=\s]))(?:=|\s*+)"
 _LOGIN_USER = r"[^\s:\"']{0,128}+:"
 _CREDENTIAL = re.compile("|".join([*_TOKENS, rf"-----(?:BEGIN|END){_KEY_LABEL}", _USERINFO,
-                                   rf"{_FLAG}[\"']?{_LOGIN_USER}[^\s\"']"]))
+                                   rf"{_FLAG}[\"']?{_LOGIN_USER}[\"']?[^\s\"']"]))
 
 _SHAPES = re.compile("|".join([rf"-----BEGIN{_KEY_LABEL}.*?(?:-----END{_KEY_LABEL}|\Z)", *_TOKENS]), re.DOTALL)
-_URL_PASSWORD = re.compile(_USERINFO)
-# The password after a login flag in prose: to the quote that opened before the user, or to the
-# end of the word, quoted parts included.
-_FLAG_PASSWORD = re.compile(rf"({_FLAG}\"{_LOGIN_USER})[^\r\n\"]++|({_FLAG}'{_LOGIN_USER})[^\r\n']++"
-                            rf"|({_FLAG}{_LOGIN_USER})(?:[^\s\"'`]|\"[^\r\n\"]*+\"?|'[^\r\n']*+'?)++")
+# A literal U+3000 inside a URL's password in prose then shows: accepted, for readable CJK prose.
+_URL_PASSWORD = re.compile(_userinfo(_PROSE_SPACE))
+# The password after a login flag in prose: to the quote that opened before the user and on to the
+# end of the word, or to the end of the word, quoted parts included. An escaped quote ends nothing.
+_DQ_BODY, _SQ_BODY = r"(?:[^\r\n\"\\]|\\[^\r\n]?)*+", r"(?:[^\r\n'\\]|\\[^\r\n]?)*+"
+_PROSE_WORD = rf"(?:[^{_PROSE_SPACE}\"']|\"{_DQ_BODY}\"?|'{_SQ_BODY}'?)++"
+_FLAG_PASSWORD = re.compile(rf"({_FLAG}\"{_LOGIN_USER}){_DQ_BODY}(?:\"{_PROSE_WORD})?"
+                            rf"|({_FLAG}'{_LOGIN_USER}){_SQ_BODY}(?:'{_PROSE_WORD})?"
+                            rf"|({_FLAG}{_LOGIN_USER}){_PROSE_WORD}")
 # An ``Authorization`` or ``Cookie`` header (``HTTP_AUTHORIZATION`` too, and a quoted name, as in
 # JSON): a quoted value up to its closing quote, or an unquoted one up to the line's end or a
 # quote, quoted parts after ``=`` included (``sessionid="…"``, ``Digest response="…"``).
@@ -61,10 +75,11 @@ _HEADER = re.compile(r"(?i)(?<![A-Za-z0-9_])((?:[A-Za-z0-9]++_)*+(?:(?:proxy-)?a
                      r"|(?:[^\r\n\"']|(?<==)\"[^\r\n\"]*+\"?|(?<==)'[^\r\n']*+'?)++)")
 # A scheme's word before a token-long word, as a header value is written.
 _SCHEME_TOKEN = re.compile(rf"(?i){_START}((?:bearer|basic)[ \t]++)[A-Za-z0-9_.~+/=-]{{20,}}+")
-# A header's name before its colon and value (``X-Auth-Key: …``, ``Ocp-Apim-Subscription-Key: …``):
-# read like a flag. Not a YAML key or CSS selector (``auth-service:``, ``.auth-form:hover``).
+# A header's name before its colon and value (``X-Auth-Key: …``, ``X-Auth-Key:…``, or a quoted
+# key, as in JSON: ``"X-Auth-Key": …``): read like a flag (``_secret_name``). Not a YAML key or CSS
+# selector (``auth-service:``, ``.auth-form:hover``).
 _HEADER_NAME = re.compile(r"[Xx]-[A-Za-z0-9-]+|[A-Z][a-z0-9]*+(?:-[A-Z][a-z0-9]*+)++")
-_HEADER_COLON = re.compile(r"[ \t]*+:[ \t]++\S")
+_HEADER_COLON = re.compile(r"[\"']?[ \t]*+:[ \t]*+\S")
 # A name (``DB_PASSWORD``, ``--api-key``, ``apiKey``) that may hold a secret
 # word; whether it does is decided by its segments (``_secret_name``).
 _NAMED = re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]*?(?i:pass|pw|secret|credential|token|key|auth|bearer"
@@ -83,6 +98,10 @@ _SECRET_WORDS = ("password", "passwd", "passphrase", "secret", "credential")
 # ``X-Auth-Key:``): in code and paths they are ordinary (``useAuth``,
 # ``auth/views.py``).
 _FLAG_SEGMENTS = frozenset({"auth", "pw"})
+# Header names whose last segment ``key`` names no secret (``Idempotency-Key``, ``X-Cache-Key``),
+# by the segment before it, and one by its whole name.
+_PLAIN_KEY_SEGMENTS = frozenset({"idempotency", "cache", "partition", "sort", "primary", "foreign"})
+_PLAIN_KEY_HEADERS = frozenset({"sec-websocket-key"})
 
 
 def holds_credential(value: object) -> bool:
@@ -92,9 +111,11 @@ def holds_credential(value: object) -> bool:
     token-long user, ``user:password`` after a login flag such as ``curl -u``)
     or a secret-sounding name (``password``, ``pwd``, ``secret``, ``token``,
     ``api_key``, ``authorization``, ``bearer``, ``cookie``, ...) as a word or a
-    name's segment; in an environment variable's name or a flag also ``auth``,
-    ``pw`` or a last segment ``key`` (``HTTP_AUTH``, ``OPENAI_KEY``,
-    ``--signing-key``). A value past ``CHECK_BUDGET`` is taken to hold one."""
+    name's segment; in an environment variable's name, a flag or a header's
+    name before its colon also ``auth``, ``pw`` or a last segment ``key``
+    (``HTTP_AUTH``, ``OPENAI_KEY``, ``--signing-key``, ``X-Master-Key:``; not
+    a header's non-secret key, such as ``Idempotency-Key:``). A value past
+    ``CHECK_BUDGET`` is taken to hold one."""
     strings = _strings(value)
     if strings is None:
         return True
@@ -109,8 +130,9 @@ def mask_shapes(text: str) -> str:
     """Prose (Claude's own words, a question) with every credential
     recognizable by its shape (API keys and tokens, private-key blocks, a
     URL's user and password or token-long user), every ``Authorization`` or
-    ``Cookie`` header's value, and a token-long word after ``Bearer`` or
-    ``Basic`` replaced by ``[REDACTED]``. A name before a word says nothing
+    ``Cookie`` header's value, the password after a login flag's user
+    (``curl -u admin:…``) and a token-long word after ``Bearer`` or ``Basic``
+    replaced by ``[REDACTED]``. A name before a word says nothing
     about it in prose, so names alone mask nothing."""
     text = _SHAPES.sub(REDACTED, text)
     text = _URL_PASSWORD.sub(rf"\1{REDACTED}@", text)
@@ -141,8 +163,9 @@ def _secret_name(name: str, *, header: bool = False) -> bool:
     anywhere in it, a secret segment (``DB_TOKEN``, ``apiKey``,
     ``--api-key``) or one ending in ``token`` (``accesstoken``), or, in an
     environment variable's name, a flag or a ``header`` name, one of
-    ``_FLAG_SEGMENTS`` or a last segment ``key``; never a shorter word inside
-    one (``bypass``, ``max_tokens``, ``monkey``)."""
+    ``_FLAG_SEGMENTS`` or a last segment ``key``, except in a header name a
+    key ``_PLAIN_KEY_SEGMENTS`` or ``_PLAIN_KEY_HEADERS`` names; never a
+    shorter word inside one (``bypass``, ``max_tokens``, ``monkey``)."""
     lowered = name.lower()
     if lowered in _PLAIN_NAMES:
         return False
@@ -152,5 +175,10 @@ def _secret_name(name: str, *, header: bool = False) -> bool:
     if (any(s in _SECRET_SEGMENTS or s.endswith("token") for s in segments)
             or any(p in _SECRET_PAIRS for p in zip(segments, segments[1:]))):
         return True
-    return (header or name.startswith("-") or name.isupper()) and (
-        any(s in _FLAG_SEGMENTS for s in segments) or (len(segments) > 1 and segments[-1] == "key"))
+    flag = name.startswith("-") or name.isupper()
+    if not (header or flag):
+        return False
+    if any(s in _FLAG_SEGMENTS for s in segments):
+        return True
+    return len(segments) > 1 and segments[-1] == "key" and (
+        flag or not (segments[-2] in _PLAIN_KEY_SEGMENTS or lowered in _PLAIN_KEY_HEADERS))

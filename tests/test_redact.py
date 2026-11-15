@@ -44,6 +44,7 @@ def test_a_key_block_line_or_a_url_password_holds_a_credential(text):
     "MASTER_KEY=x", "RAILS_MASTER_KEY=x", "JWT_SIGNING_KEY=x", "cosign --signing-key x", "accesstoken=x",
     "githubtoken x", "ACCESSTOKEN=x",
     'curl -H "X-Auth-Key: 0123abc" x.test', "Ocp-Apim-Subscription-Key: 0123", "x-functions-key: 0123",
+    "X-Api-Key: 0123", "X-Master-Key: 0123", "X-CACHE-KEY: 0123",
 ])
 def test_a_secret_sounding_name_holds_a_credential(text):
     assert holds_credential({"command": text})
@@ -62,16 +63,37 @@ def test_a_secret_sounding_key_at_any_depth_holds_a_credential(value):
     "ForeignKey(User)", "cache_key=x", "encryption_key=x", "useAuth()", "cat auth/views.py", "KEY=x", "--key x",
     "npm config set _auth x", "git commit -a -m 'fix: x'", "sort -u a.txt", "git log --author=ann:x",
     "echo $SSH_AUTH_SOCK", "auth-service:\n  image: x", "auth-test:\n\tpytest", ".auth-form:hover { color: red }",
-    "bypass-auth: true",
+    "bypass-auth: true", 'git commit -a -m "fix: x"', "sort -u -t: -k2 f",
 ])
 def test_ordinary_calls_hold_no_credential(text):
     assert not holds_credential({"command": text, "description": "Run it"})
 
 
 @pytest.mark.parametrize("text", [
+    "curl -H 'Idempotency-Key: 123' x.test", "X-Cache-Key: abc", "Partition-Key: pk", "Sort-Key: sk",
+    "Primary-Key: id", "Foreign-Key: id", "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==",
+])
+def test_a_header_name_ending_in_a_non_secret_key_holds_no_credential(text):
+    assert not holds_credential({"command": text})
+
+
+@pytest.mark.parametrize("text", [
+    "X-Auth-Key:0123abc", "X-Master-Key:0123", 'curl -d \'{"X-Auth-Key": "0123abc"}\' x.test',
+    "{'X-Master-Key': '0123'}",
+])
+def test_a_header_name_with_no_space_after_its_colon_or_quoted_as_a_json_key_holds_a_credential(text):
+    assert holds_credential({"command": text})
+
+
+def test_a_url_password_holding_a_space_outside_ascii_holds_a_credential():
+    assert holds_credential({"command": "curl https://user:pa\u3000ss@x.test"})
+
+
+@pytest.mark.parametrize("text", [
     "curl -u admin:hunter2 x.test", "curl -uadmin:hunter2 x.test", "curl --user=admin:hunter2 x.test",
     "curl\n-u\nadmin:hunter2", "psql -U 'admin:hunter2'", "x -a admin:hunter2", "curl --proxy-user a:b x.test",
     "http --auth alice:pw x.test", f"git clone https://{'0123456789abcdef' * 2}@github.com/o/r.git",
+    "curl -u admin:'p@ss!' x", 'curl -u admin:"hunter2" x', 'curl -u admin:"pw"tail y',
 ])
 def test_a_user_and_password_after_a_flag_or_a_long_url_user_holds_a_credential(text):
     assert holds_credential({"command": text}) and holds_credential({"command": text.split()})
@@ -94,7 +116,8 @@ HOSTILE = [
     "x" * 260_000, "a-" * 130_000, "s/" * 130_000, "eyJ" + "a" * 260_000, "eyJ-" * 65_000, "a://" + "x" * 260_000,
     "-----BEGIN PRIVATE KEY-----" * 9_000, "AAAAAAAa" * 32_000, "Cookie: " * 32_000, '"' + "\\" * 260_000,
     "monkey " * 37_000, "-u." * 87_000, "-ua" * 87_000, "x_" * 130_000, "Bearer " * 37_000,
-    "https://" + "a" * 260_000, "'Cookie': '" * 23_000,
+    "https://" + "a" * 260_000, "'Cookie': '" * 23_000, '-u a:"\\' * 87_000, "-u a:'x'" * 32_000,
+    '-u "a:x"' * 32_000, 'X-Auth-Key"' * 23_000,
 ]
 
 
@@ -135,6 +158,12 @@ def test_prose_has_token_shapes_masked(shape):
     ('Run curl -u admin:"correct horse battery" x', "Run curl -u admin:[REDACTED] x"),
     ('Run curl -u "$JIRA_EMAIL:hunter2" x', 'Run curl -u "$JIRA_EMAIL:[REDACTED]" x'),
     ("Clone https://bob:pa\u00a0ssw0rd@example.com/r", "Clone https://[REDACTED]@example.com/r"),
+    ('Run curl -u "admin:pa\\"ss" x', 'Run curl -u "admin:[REDACTED]" x'),
+    ('Run curl -u "admin:x"tail y', 'Run curl -u "admin:[REDACTED] y'),
+    ("Run curl -u 'admin:x'tail y", "Run curl -u 'admin:[REDACTED] y"),
+    ("Run ``curl -u admin:pa`ss`` now", "Run ``curl -u admin:[REDACTED] now"),
+    ("Run curl -u admin:p@ss\u00a0word now", "Run curl -u admin:[REDACTED] now"),
+    ("Run curl -u admin:pw\u3000then", "Run curl -u admin:[REDACTED]\u3000then"),
 ])
 def test_prose_has_key_blocks_url_passwords_and_header_values_masked(text, masked):
     assert mask_shapes(text) == masked
@@ -144,6 +173,8 @@ def test_prose_has_key_blocks_url_passwords_and_header_values_masked(text, maske
     "Uses Bearer authentication.", "Set PASSWORD=hunter2 and the token Zq9.", "See https://ann@x.test/a@b.",
     "The Authorization header is missing.", "Masked: [REDACTED] and Authorization: [REDACTED]",
     "Bearer authentication works.", "Use Basic auth here.",
+    "\u670d\u52a1 http://localhost:8080\u3000\u8fde\u63a5\u3000admin@example.com",
+    "http://localhost:8080\u2028admin@example.com", "http://localhost:8080\u2029admin@example.com",
 ])
 def test_prose_keeps_names_and_already_masked_text_readable(text):
     assert mask_shapes(text) == text
