@@ -596,3 +596,11 @@ union verified, linear time). Minors:
   with its example, not fixed in this PR. The managing session will put the
   trade-off to the owner first: ship with a known denylist gap, or withhold
   Desktop call previews by default.
+- **Codex on d60af95:** another call-preview miss (a quoted username before a
+  login password). Added to mar3co/openswap#221 per the final-round ruling;
+  thread resolved. The double-quote URL-password miss is the same issue.
+- **Cold check of d60af95:** `holds_credential` misses nothing the parent
+  caught. The prose interplay with apostrophes in URL users was added to
+  mar3co/openswap#220. Minors accepted: a `pwd` object key withholds (an MCP
+  tool with a `pwd` working-directory parameter loses Allow), and so does a
+  compact quoted literal.
