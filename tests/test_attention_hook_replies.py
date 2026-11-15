@@ -1100,11 +1100,13 @@ def test_leading_blanks_never_move_the_cut_into_what_is_shown(blanks):
     assert shown["options"] == ["Yes"]
 
 
-def test_questions_as_long_as_the_margin_and_full_of_escapes_are_shown_quickly():
+def test_only_what_can_be_shown_of_a_question_is_escaped(monkeypatch):
+    escaped = []
+    real = store_module.escape_hidden
+    monkeypatch.setattr(store_module, "escape_hidden", lambda text: escaped.append(len(text)) or real(text))
     field = "\U0001f600\u200b" * 33_000  # each character escapes to many
-    started = time.perf_counter()
-    shown_questions([{"question": field, "header": field[:200], "options": [field] * 4}] * 4)
-    assert time.perf_counter() - started < 0.5
+    shown_questions([{"question": field, "options": [field]}])
+    assert escaped and max(escaped) <= store_module.MAX_QUESTION + len(REDACTED)
 
 
 def test_g2_the_worker_takes_no_exact_or_whole_claim_for_text_that_reads_right_to_left(desktop):
