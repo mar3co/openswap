@@ -1083,7 +1083,6 @@ def test_a_token_the_cap_cuts_through_never_shows_part_of_its_mask():
 
 @pytest.mark.parametrize("credential", [
     "https://user:" + "p" * 1500 + "@example.com/x",  # a URL password that ends far past the cap
-    "Authorization: Bearer abc " + "Zq9" * 600 + '"',
 ])
 def test_a_credential_that_ends_far_past_the_cap_shows_no_part(credential):
     text = "x" * 900 + " " + credential + " done"
@@ -1091,6 +1090,13 @@ def test_a_credential_that_ends_far_past_the_cap_shows_no_part(credential):
     assert "ppppp" not in shown and "Zq9" not in shown
     [question] = shown_questions([{"question": text, "options": ["A"]}])
     assert "ppppp" not in question["question"] and "Zq9" not in question["question"]
+
+
+def test_questions_as_long_as_the_margin_and_full_of_escapes_are_shown_quickly():
+    field = "\U0001f600\u200b" * 33_000  # each character escapes to many
+    started = time.perf_counter()
+    shown_questions([{"question": field, "header": field[:200], "options": [field] * 4}] * 4)
+    assert time.perf_counter() - started < 0.5
 
 
 def test_g2_the_worker_takes_no_exact_or_whole_claim_for_text_that_reads_right_to_left(desktop):

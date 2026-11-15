@@ -18,7 +18,7 @@ PREVIEW_WITHHELD = "Preview withheld: it may contain a credential."
 CHECK_BUDGET = 256 * 1024
 # Characters past a text's cap still masked, so a credential the cap cuts through is caught whole,
 # even one whose end a pattern needs (a URL password's ``@``) lies far past the cap. Masking is
-# linear, so this stays well within a hook's time.
+# linear; only the part that can be shown is escaped and cleaned afterwards.
 MASK_MARGIN = 64 * 1024
 
 # ASCII word edges: ``\b`` would see none between a token and a letter outside ASCII (``密钥ghp_…``).

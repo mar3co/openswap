@@ -258,8 +258,10 @@ def _shown_text(value: object, limit: int, *, multiline: bool = False) -> str:
     ``escape_hidden``, then ``clean_text``."""
     if not isinstance(value, str):
         return ""
-    shown = escape_hidden(mask_shapes(value[:limit + MASK_MARGIN]))
-    return _masked_cut(clean_text(shown, limit + MASK_MARGIN, multiline=multiline), limit)
+    # Only what can be shown is escaped (an escape can be 12 times its character): masking alone
+    # needs the margin.
+    shown = escape_hidden(mask_shapes(value[:limit + MASK_MARGIN])[:2 * limit + len(REDACTED)])
+    return _masked_cut(clean_text(shown, 2 * limit + len(REDACTED), multiline=multiline), limit)
 
 
 def question_entries(value: object) -> list[tuple[dict, str, list[str]]]:
