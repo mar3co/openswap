@@ -338,3 +338,20 @@ of another per-task round:
 - **Minors:** revert the defensive `.get`; the `SSH_AUTH_SOCK` docs placement;
   `holds_credential`/`mask_shapes` docstrings; the comment at redact.py:40; a
   backtick-exclusion test.
+
+### Task 2 implemented (746043c)
+
+Fresh Opus implementer; suite 7690 passed. Controller rulings on its four
+decisions, all accepted:
+- **Pairing first.** A wake hook takes `message` only after pairing with its
+  own `Stop`, so a command posing as a hook never gets the text. Cost: a lost
+  `Stop` notice means no reply box that turn.
+- **One per process.** Strictly one wake hook per process; a paired newcomer
+  releases the older one.
+- **Wrapper exit codes.** The wrapper maps only exit 90 to 2, and the text goes
+  out on fd 3, so a broken or older program can never start a turn.
+- **Digest match.** The woken prompt is matched by a digest that ignores
+  trailing whitespace.
+
+Review: the full set (first review, 941+/63−): cold worker, cold hook,
+silent-failure, API surface; all Opus.
