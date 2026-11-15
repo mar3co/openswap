@@ -5,6 +5,8 @@
 launcher script at a fixed path). Both hand a *notice* to the local worker
 and exit within a second whatever happens, printing nothing: a hook's output
 could be read as a decision. Without a running worker the notice is dropped.
+The reply hooks (``question``, ``permission`` and ``wake``) wait for the
+owner's reply from the phone or watch instead, and give only that.
 
 The Claude Code hooks go into the ``settings.json`` of every config home
 OpenSwap manages (``~/.claude``, account session profiles and Claude Desktop
@@ -57,6 +59,20 @@ QUESTION_EVENT = "question"
 PERMISSION_EVENT = "permission"
 REPLY_HOOK_TIMEOUT_SECONDS = 600
 DENY_MESSAGE = "The owner denied this from their phone or watch."
+# The Stop hook that starts a turn with a typed reply (asyncRewake), installed
+# with them. It waits R3's hour by the wall clock; Claude Code's timeout leaves a margin.
+WAKE_EVENT = "wake"
+WAKE_WAIT_SECONDS = 3600
+WAKE_HOOK_TIMEOUT_SECONDS = 3660
+WAKE_NOTE = "Reply from the owner's phone or watch:"
+# The wake hook's wrapper sends the program's own stderr to /dev/null and keeps
+# Claude Code's on this descriptor, so only the note and the text reach Claude.
+# It turns WAKE_STATUS, and nothing else, into the exit 2 that starts the turn:
+# an older or broken program's exit 2 and usage text never do.
+WAKE_FD = 3
+WAKE_STATUS = 90
+# How Claude Code closes the woken turn's prompt after the hook's stderr (measured on 2.1.325).
+WOKEN_END = "\n</system-reminder>"
 CHANNEL_COMMAND = "channel"
 
 
@@ -75,8 +91,9 @@ def main(argv: list[str]) -> int:
     """``openswap attention <event>``: never raises, never prints, exits 0.
 
     ``openswap attention channel`` is OpenSwap's channel (see ``openswap.channel``),
-    and ``openswap attention question`` and ``openswap attention permission``
-    the synchronous hooks, which print a decision when they have one."""
+    ``openswap attention question`` and ``openswap attention permission``
+    the synchronous hooks, which print a decision when they have one, and
+    ``openswap attention wake`` the hook that starts a turn with a typed reply."""
     if argv == [CHANNEL_COMMAND]:
         from openswap.channel import main as channel_main
 
@@ -85,6 +102,8 @@ def main(argv: list[str]) -> int:
         return question_main()
     if argv == [PERMISSION_EVENT]:
         return permission_main()
+    if argv == [WAKE_EVENT]:
+        return wake_main()
     import signal
     import time
 
@@ -303,6 +322,11 @@ def _hook_notice(event: str, raw: bytes) -> dict | None:
                 notice["reply"] = token.group(1)
         elif prompt.startswith(TASK_TAG):
             notice["prompt_kind"] = "task"
+            text = _woken_text(prompt)
+            if text is not None:
+                from openswap.worker.attention import reply_key
+
+                notice["reply"] = reply_key(text)  # names the text, never carries it
         elif prompt.strip().split(" ", 1)[0] in SESSION_COMMANDS:
             notice["prompt_kind"] = "end"
     elif event == "Stop":
@@ -310,6 +334,15 @@ def _hook_notice(event: str, raw: bytes) -> dict | None:
         if message:
             notice["last_message"] = message
     return notice
+
+
+def _woken_text(prompt: str) -> str | None:
+    """The text a wake hook gave Claude Code, in the prompt of the turn it
+    started; None for a prompt without the note."""
+    start = prompt.find(WAKE_NOTE + "\n")
+    if start < 0:
+        return None
+    return prompt[start + len(WAKE_NOTE) + 1:].removesuffix(WOKEN_END)
 
 
 _SHELLS = frozenset({"sh", "bash", "zsh", "dash", "fish", "ksh", "mksh", "tcsh", "csh"})
@@ -503,11 +536,41 @@ def permission_main(*, backup_root: Path | None = None) -> int:
     return 0
 
 
-def _wait_for_worker(request: dict, field: str, backup_root: Path | None) -> object:
+def wake_main(*, backup_root: Path | None = None) -> int:
+    """``openswap attention wake``: the ``Stop`` hook with ``asyncRewake``,
+    installed only while replies are on (plan 028).
+
+    At every ``Stop`` (the woken turn's own too) it waits for a typed reply to
+    the session from the phone or watch. Given one, it writes the note line, a
+    newline and the text to ``WAKE_FD`` and exits ``WAKE_STATUS``: the wrapper
+    turns that into the exit 2 that starts a turn with it. It exits 0 printing
+    nothing when the worker serves no reply there or releases it (the owner
+    typed, the session ended, replies turned off, a newer turn's hook took
+    over), the worker is gone, or the hour passes. Never raises."""
+    try:
+        data = json.loads(_read_stdin())
+        session = data.get("session_id") if isinstance(data, dict) else None
+        if not isinstance(session, str) or not session:
+            return 0
+        text = _wait_for_worker({"command": WAKE_EVENT, "session_id": session[:200]}, "message", backup_root,
+                                seconds=WAKE_WAIT_SECONDS, wall=True)
+        if not isinstance(text, str) or not text:
+            return 0
+        out = f"{WAKE_NOTE}\n{text}".encode()
+        while out:
+            out = out[os.write(WAKE_FD, out):]
+        return WAKE_STATUS
+    except BaseException:  # noqa: BLE001 - a hook must never fail loudly
+        return 0
+
+
+def _wait_for_worker(request: dict, field: str, backup_root: Path | None, *,
+                     seconds: float = REPLY_HOOK_TIMEOUT_SECONDS - 5, wall: bool = False) -> object:
     """Send a waiting hook's ``request`` to the worker and wait for its one
     reply; the reply's ``field``, or None when there is no worker, it went
-    away, Claude Code gave up on the hook, the hook's own timeout nears, or the
-    request is past what the worker reads (then it is never sent)."""
+    away, Claude Code gave up on the hook, ``seconds`` passed (by the wall
+    clock with ``wall``, which a Mac's sleep does not stop), or the request is
+    past what the worker reads (then it is never sent)."""
     from openswap import paths
     from openswap.worker.ipc import IPC_VERSION, MAX_REQUEST_BYTES, socket_path
 
@@ -517,7 +580,8 @@ def _wait_for_worker(request: dict, field: str, backup_root: Path | None) -> obj
     if len(encoded) > MAX_REQUEST_BYTES:
         return None
     path = socket_path(backup_root or paths.get_backup_root())
-    parent, deadline = os.getppid(), time.monotonic() + REPLY_HOOK_TIMEOUT_SECONDS - 5
+    clock = time.time if wall else time.monotonic
+    parent, deadline = os.getppid(), clock() + seconds
     line = b""
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
         client.settimeout(1.0)
@@ -527,7 +591,7 @@ def _wait_for_worker(request: dict, field: str, backup_root: Path | None) -> obj
             while b"\n" not in line and len(line) <= 65536:
                 # Claude Code gave up on the hook (its wrapper was killed): stop waiting
                 # rather than take a reply nobody will read.
-                if os.getppid() != parent or time.monotonic() > deadline:
+                if os.getppid() != parent or clock() > deadline:
                     return None
                 try:
                     chunk = client.recv(65536)
@@ -632,14 +696,16 @@ def claude_launcher() -> str:
 # nothing, so no Claude Code or Codex event ever fails or is blocked over it.
 HOOK_SHELL = "/bin/sh"
 HOOK_SCRIPT = 'command -v "$0" >/dev/null 2>&1 || exit 0; "$0" "$@" 2>/dev/null || exit 0'
+WAKE_SCRIPT = (f'command -v "$0" >/dev/null 2>&1 || exit 0; "$0" "$@" {WAKE_FD}>&2 2>/dev/null; '
+               f'[ $? -eq {WAKE_STATUS} ] && exit 2; exit 0')
 
 
-def _wrapped(*words: str) -> str:
-    return " ".join([HOOK_SHELL, "-c", shlex.quote(HOOK_SCRIPT), *(shlex.quote(w) for w in words)])
+def _wrapped(*words: str, script: str = HOOK_SCRIPT) -> str:
+    return " ".join([HOOK_SHELL, "-c", shlex.quote(script), *(shlex.quote(w) for w in words)])
 
 
 def hook_command(event: str, executable: str) -> str:
-    return _wrapped(executable, "attention", event)
+    return _wrapped(executable, "attention", event, script=WAKE_SCRIPT if event == WAKE_EVENT else HOOK_SCRIPT)
 
 
 def _hook_words(command: object) -> list[str]:
@@ -951,8 +1017,8 @@ def _settings_without_ours(settings: dict) -> dict:
 
 def _with_hooks(settings: dict, executable: str, *, replies: bool = False) -> dict:
     """``settings`` with OpenSwap's hooks for ``executable``, and with
-    ``replies`` the synchronous question and permission hooks too. Every other
-    hook is kept as written. Raises ConfigError for a ``hooks`` value this would
+    ``replies`` the synchronous question and permission hooks and the wake
+    hook too. Every other hook is kept as written. Raises ConfigError for a ``hooks`` value this would
     have to overwrite."""
     hooks = settings.get("hooks", {})
     if not isinstance(hooks, dict) or any(not isinstance(hooks.get(e, []), list) for e in HOOK_EVENTS):
@@ -974,6 +1040,11 @@ def _with_hooks(settings: dict, executable: str, *, replies: bool = False) -> di
                 "type": "command", "command": hook_command(PERMISSION_EVENT, executable),
                 "timeout": REPLY_HOOK_TIMEOUT_SECONDS,
             }]})
+        if replies and event == "Stop":
+            groups.append({"matcher": "", "hooks": [{
+                "type": "command", "command": hook_command(WAKE_EVENT, executable),
+                "asyncRewake": True, "timeout": WAKE_HOOK_TIMEOUT_SECONDS,
+            }]})
         hooks[event] = groups
     return {**settings, "hooks": hooks}
 
@@ -981,7 +1052,7 @@ def _with_hooks(settings: dict, executable: str, *, replies: bool = False) -> di
 def set_hooks(config_home: Path, executable: str | None, *, replies: bool = False,
               backup_root: Path | None = None) -> bool:
     """Install OpenSwap's hooks for ``executable`` in one config home (with
-    ``replies``, the question and permission hooks too), recorded under ``backup_root``; or,
+    ``replies``, the question, permission and wake hooks too), recorded under ``backup_root``; or,
     with None, take them out of it (never deleting the file). Reads before
     writing: a settings file that cannot be read is left alone (ConfigError).
     Returns whether the file changed."""

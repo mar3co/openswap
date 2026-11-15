@@ -1970,6 +1970,54 @@ questions (details off, or the detail cut for size):
   runs or a dialog waits). A turn that ends while the session stays idle (a
   background task's result) closes the item as `superseded` and opens a new
   one, which takes messages; a reply to the old one gets `item_closed`.
+- An idle session without the channel, in Claude Desktop or a terminal, takes
+  `message` while the session file says `idle` and exactly one wake hook
+  waits for that Claude Code process, the one that ran with the turn's own
+  `Stop`. That hook (`openswap attention wake`, a `Stop` hook with
+  `asyncRewake` and a 3,660-second timeout, matcher `""`) is installed with
+  the question and permission hooks. At every `Stop`, the woken turn's own
+  included, it registers with the worker and waits. It is served under the
+  same checks as the other hooks (its command line ends `attention wake`, it
+  runs under a Claude Code process whose session file names its session, on a
+  surface that takes hook replies, with no channel registered for that
+  process). It pairs with its turn's `Stop` notice when the two are within 5
+  seconds of each other and that `Stop` is dated after the latest prompt; a
+  hook that pairs replaces the one already waiting for that process, which
+  exits. One that pairs with no `Stop` never replaces one and never takes a
+  message (a command the session runs can connect as such a hook: it can keep
+  that process's next hook out until a `Stop` is seen first, never take the
+  text). At most one waits per Claude Code process and 32 in all, apart from
+  the question and permission hooks' places; past that a hook exits at once
+  and the item takes no `message`. Given a message, the hook writes "Reply
+  from the owner's phone or watch:", a newline and the text, exactly, to
+  Claude Code's stderr and exits 2, which starts a turn with it in a task
+  notification (Claude Code shows it as "Stop hook feedback"). Its wrapper
+  sends the program's own stderr to `/dev/null` and turns only the program's
+  own exit status 90 into that exit 2, so an older or broken program never
+  starts a turn. The hook exits 0 and prints nothing otherwise: when the owner
+  types at the Mac (a slash command that starts no turn too; the idle item
+  then closes as `answered_on_mac`), the session ends, `/clear`s or its
+  session file goes away, its Claude Code process ends, a newer turn's hook
+  takes over, replies or notices are turned off (unreadable settings keep it
+  waiting and refuse messages), the worker is gone (a worker restart ends
+  every wake hook, and the item takes no `message` until the next turn's
+  hook), or an hour passes on the wall clock (a Mac's sleep counts); never
+  because no idle item is recorded yet, since a terminal's comes a minute
+  after its `Stop`. The worker stops offering and handing over messages a
+  minute before that hour, and the item then stays open with no `message`. A
+  `message`
+  handed to the hook is `sent`, and settles on the first decisive signal: the
+  woken turn's `UserPromptSubmit`, a `<task-notification>` prompt holding that
+  note line followed by the text sent (trailing whitespace aside; the hook
+  sends the worker a digest of it, never the text), makes it `applied` and
+  closes the item as `answered_from_watch`; a prompt the owner typed first
+  closes it as `answered_on_mac` and the reply stays `sent` (a text already
+  handed over then runs after the owner's turn); the session ending or
+  `/clear` first closes it as `session_ended`. The session going `busy`,
+  another background turn's prompt and another turn's `Stop` decide nothing:
+  the item is never `superseded` while its message waits for its own turn.
+  After a worker restart between the hand-over and the woken turn the reply
+  stays `sent`; it is never handed over twice.
 
 Before handing a verdict or an answer over, the worker reads the session file:
 a prompt that is no longer waiting was answered at the Mac (`item_closed`).
@@ -1991,8 +2039,9 @@ item closes 1.5 seconds later as `answered_on_mac`), the `Stop` that
 follows a channel deny (a "No" at the Mac fires none), a subagent's next call
 after a channel deny of its prompt, the end of a waiting hook's deny's grace
 without that call's own signal (above), a `PostToolUse` carrying the chosen
-options, or
-the channel turn carrying the message's own token. Otherwise the item closes
+options, the
+channel turn carrying the message's own token, or the woken turn's prompt
+carrying a wake hook's note and text (above). Otherwise the item closes
 with its usual reason and the reply stays `sent`.
 
 Always sent: the kind, the provider, a session label, the time and an opaque

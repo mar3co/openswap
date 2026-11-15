@@ -170,7 +170,7 @@ def _dispatch_control(request: dict, command: object, control: WorkerControl) ->
 
 
 # Connections that stay open and receive something back (plan 025 S2).
-LINKED_COMMANDS = frozenset({"channel", "question", "permission"})
+LINKED_COMMANDS = frozenset({"channel", "question", "permission", "wake"})
 
 
 def _handle_connection(

@@ -12,6 +12,9 @@ is served only after the peer's place in the process tree is checked:
   the watch's reply to its own prompt (plan 028: in a session without a
   channel, a permission's verdict too). It gets one reply (a question's option
   positions, or ``allow`` or ``deny``), or none, and ends.
+- ``wake``: a session's wake hook, waiting since its turn's ``Stop`` for a
+  typed message to that session (plan 028, in a session without a channel).
+  It gets the message's text, or none, and ends.
 """
 
 from __future__ import annotations
@@ -34,6 +37,7 @@ WAITERS = {
                  "answers", "questions", "whole"),
     "permission": ({"version", "command", "session_id", "tool_key", "tool_name"}, {"agent_id", "preview", "exact"},
                    "behavior", "preview", "exact"),
+    "wake": ({"version", "command", "session_id"}, set(), "message", None, None),
 }
 
 
@@ -74,8 +78,8 @@ def _reply(connection: socket.socket, payload: dict) -> bool:
 
 
 def serve(store, connection: socket.socket, request: dict, stop_event: threading.Event, release) -> None:
-    """Serve one ``channel``, ``question`` or ``permission`` connection until it
-    ends. Never raises. ``release()`` frees the caller's short-request slot once
+    """Serve one ``channel``, ``question``, ``permission`` or ``wake`` connection
+    until it ends. Never raises. ``release()`` frees the caller's short-request slot once
     the peer is accepted."""
     try:
         command = request.get("command")
@@ -138,9 +142,14 @@ def _serve_waiter(store, connection, request, kind, stop_event, release) -> None
     _, _, field, shown, whole = WAITERS[kind]
     # The session's own synchronous hook: OpenSwap's command for ``kind``, under Claude Code.
     claude = peers.hook_claude(pid) if hook is not None and hook.args[-2:] == ("attention", kind) else None
-    extra = {"tool_name": request["tool_name"]} if kind == "permission" else {}
-    waiter = store.waiter(kind, claude, request["session_id"], request["tool_key"], request.get("agent_id", ""),
-                          shown=request.get(shown), whole=request.get(whole) is True, **extra) if claude else None
+    if claude is None:
+        waiter = None
+    elif kind == "wake":
+        waiter = store.wake_waiter(claude, request["session_id"])
+    else:
+        extra = {"tool_name": request["tool_name"]} if kind == "permission" else {}
+        waiter = store.waiter(kind, claude, request["session_id"], request["tool_key"], request.get("agent_id", ""),
+                              shown=request.get(shown), whole=request.get(whole) is True, **extra)
     if waiter is None:
         _reply(connection, {field: None})
         return

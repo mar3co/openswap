@@ -133,6 +133,13 @@ MAX_HANDLED = 500
 MAX_CHANNELS = 64
 MAX_WAITERS = 64
 MAX_WAITERS_PER_PROCESS = 4
+# A wake hook (plan 028, R3) waits this long by the wall clock, so a Mac's sleep
+# cannot stretch it. A message is offered and handed over only until a minute
+# before, so the hook never ends with a text in hand. At most one waits per
+# Claude Code process, and these in all, apart from the hooks above.
+WAKE_SECONDS = 3600.0
+WAKE_OFFER_SECONDS = WAKE_SECONDS - 60
+MAX_WAKERS = 32
 # After the service refused a batch of reply outcomes, each is tried alone this much later.
 ACK_RETRY_SECONDS = 60.0
 MAX_REQUESTS = 50
@@ -587,8 +594,9 @@ SHOWN_DETAIL = {"question": "questions", "permission": "input_preview"}
 @dataclass
 class Waiter:
     """A synchronous hook waiting for the watch's reply to its own prompt: a
-    question's answer or a permission's verdict."""
-    kind: str  # question | permission: the kind of item it answers
+    question's answer or a permission's verdict; or a wake hook, waiting since
+    its turn's ``Stop`` for a typed message to its idle session."""
+    kind: str  # question | permission | wake
     session: str
     tool_key: str
     agent: str
@@ -606,6 +614,7 @@ class Waiter:
     result: object = None  # the answer's positions, or ``allow`` or ``deny``, once given
     item_id: str = ""  # the item it waits for, once seen
     reply_id: str = ""  # the reply whose result it holds
+    paired: bool = False  # a wake hook seen to run with its own turn's Stop
 
 
 @dataclass
@@ -631,6 +640,12 @@ def _all_off():
 
 def preview_key(preview: str) -> str:
     return hashlib.sha256(preview.encode("utf-8", "surrogatepass")).hexdigest()[:32]
+
+
+def reply_key(text: str) -> str:
+    """How a woken turn's prompt names the message its wake hook delivered:
+    trailing whitespace aside, which Claude Code may trim from a hook's output."""
+    return hashlib.sha256(text.rstrip().encode("utf-8", "surrogatepass")).hexdigest()[:32]
 
 
 def _withheld(item: Item) -> bool:
@@ -725,7 +740,10 @@ class AttentionStore:
         self._requests: list[ChannelRequest] = []  # channel permission requests not yet paired
         self._attached: dict[str, ChannelRequest] = {}  # item ID -> the one request it answers
         self._tainted: set[str] = set()  # items whose request could not be told apart: never actionable
-        self._waiters: list[Waiter] = []  # question hooks waiting for an answer
+        self._waiters: list[Waiter] = []  # question and permission hooks waiting for a reply
+        self._wakers: list[Waiter] = []  # wake hooks waiting for a message
+        self._stopped: dict[tuple[str, int], float] = {}  # (session, Claude Code PID) -> its latest Stop
+        self._read_at = 0.0  # when the session files were last read whole (0 while the last read was not)
         self._sent: dict[str, Sent] = {}  # item ID -> the reply delivered to it, until the item closes
         self._handled: dict[str, list] = {}  # reply ID -> [outcome, keep until]
         self._acks: dict[str, str] = {}  # reply ID -> outcome not yet acknowledged to the service
@@ -1112,6 +1130,14 @@ class AttentionStore:
             return False
         if event == "Stop":
             changed = False
+            self._stopped.pop(key, None)
+            self._stopped[key] = at
+            for oldest in list(self._stopped)[:-MAX_LAST_MESSAGES]:
+                del self._stopped[oldest]
+            for waker in self._wakers_of(session, pid):
+                if not waker.paired and self._pairs(waker):
+                    waker.paired = True
+                    self.changed.set()
             if at > self._prompted.get(key, 0.0):
                 if notice.get("last_message"):
                     self._last_message.pop(key, None)
@@ -1149,8 +1175,11 @@ class AttentionStore:
                 del self._prompted[oldest]
             if prompt == "task":
                 # A background task's result starting a turn: the owner did
-                # nothing, and a subagent's prompt may still be waiting.
-                return False
+                # nothing, and a subagent's prompt may still be waiting. Or the
+                # turn a wake hook started with the watch's message, which names it.
+                delivered = [i for i in mine if i.kind == "idle" and notice.get("reply")
+                             and self._hook_message(i) and self._sent[i.id].token == notice["reply"]]
+                return self._close(delivered, "answered_from_watch", won=delivered)
             if prompt == "channel":
                 # OpenSwap's own channel turn: the watch's message reached the idle
                 # item it was sent to. It answers no subagent's prompt; a main-thread
@@ -1160,10 +1189,13 @@ class AttentionStore:
                 stale = [i for i in prompts if not i.agent and i.created_at <= at]
                 changed = self._close(delivered, "answered_from_watch", won=delivered)
                 return self._close(stale, "answered_on_mac") or changed
+            # The owner typed (a slash command too): no text from the watch goes into it.
+            self._release([w for w in self._wakers_of(session, pid) if w.at <= at])
             return self._close([i for i in mine if i.created_at <= at], "answered_on_mac")
         if event == "SessionEnd":
-            for table in (self._last_message, self._prompted, self._left_waiting):
+            for table in (self._last_message, self._prompted, self._left_waiting, self._stopped):
                 table.pop(key, None)
+            self._release(self._wakers_of(session, pid))
             return self._close(mine, "session_ended")
         # PostToolUse / PostToolUseFailure: the prompt for that call was answered.
         agent, call = notice.get("agent_id", ""), notice.get("tool_key", "")
@@ -1202,7 +1234,11 @@ class AttentionStore:
     def _idle_again(self, idle: Item, notice: dict, last: str) -> bool:
         """The session is idle after another turn: the item the owner saw closes
         as ``superseded`` and a new one (a new ID) stands for this turn, so a
-        message sent to the old one can never land after a turn it did not see."""
+        message sent to the old one can never land after a turn it did not see.
+        One whose message a wake hook took stays until its own turn's prompt
+        names it (that turn's prompt can come after its ``Stop``)."""
+        if self._hook_message(idle):
+            return False
         held = idle.id in self._held
         self._close([idle], "superseded")
         self._open("idle", "claude", idle.session, {**notice, "cwd": idle.cwd, "pid": idle.pid,
@@ -1336,6 +1372,7 @@ class AttentionStore:
         records = list(records.values()) if isinstance(records, dict) else list(records)
         with self._lock:
             now = self.clock()
+            self._read_at = now if complete else 0.0
             changed = False
             live: dict[str, list[SessionRecord]] = {}
             for record in records:
@@ -1418,7 +1455,7 @@ class AttentionStore:
                     self._due_exit[item.id] = exit_at
             for item in ended:
                 key = (item.session, item.pid)
-                for table in (self._last_message, self._prompted, self._left_waiting):
+                for table in (self._last_message, self._prompted, self._left_waiting, self._stopped):
                     table.pop(key, None)
                 self._known_procs.discard(key)
                 if not live.get(item.session):
@@ -1434,7 +1471,7 @@ class AttentionStore:
         their wait. Replies or notices turned off release every waiting hook,
         without a reply."""
         with self._lock:
-            waiting = [w for w in self._waiters if not w.done.is_set()]
+            waiting = [w for w in self._waiters + self._wakers if not w.done.is_set()]
         if waiting:
             switches = self.switches()
             # Unreadable is not off: the hooks wait, and the gate refuses replies meanwhile.
@@ -1809,24 +1846,11 @@ class AttentionStore:
             cleaned = clean_questions(shown)
         else:
             cleaned = clean_text(escape_hidden(shown or ""), caps["input_preview"], multiline=True)
-        stale = None
-        with self._lock:
-            held = self._channels.get(claude.pid)
-            if held is not None and held.claude_started != claude.started:
-                stale, held = self._channels.pop(claude.pid), None
-                self._note_contested()
-                self._commit()
-            if held is not None and (kind != "question" or held.link is None or held.contested):
-                return None
-            home = held.home if held is not None else None
-        if stale is not None and stale.link is not None:
-            stale.link.close()
-        home = home if home is not None else self.session_home(claude.pid)
-        record = read_session(home, claude.pid) if home is not None else None
-        if record is None or record.session_id != session:
+        held = self._registered(claude)
+        if held is not None and (kind != "question" or held.link is None or held.contested):
             return None
-        if held is None and (record.entrypoint not in HOOK_REPLY_SURFACES or (
-                record.proc_start and record.proc_start != " ".join(claude.started.split()))):
+        home = held.home if held is not None else self.session_home(claude.pid)
+        if not self._serves(home, claude, session, channel=held is not None):
             return None
         with self._lock:
             if (len(self._waiters) >= MAX_WAITERS
@@ -1842,6 +1866,94 @@ class AttentionStore:
             self.changed.set()
         return waiter
 
+    def _registered(self, claude) -> Channel | None:
+        """The channel registered for Claude Code process ``claude``. One for an
+        earlier process with the same PID (its start time differs) is gone with it."""
+        with self._lock:
+            held = self._channels.get(claude.pid)
+            if held is None or held.claude_started == claude.started:
+                return held
+            del self._channels[claude.pid]
+            self._note_contested()
+            self._commit()
+        if held.link is not None:
+            held.link.close()
+        return None
+
+    def _serves(self, home: str | None, claude, session: str, *, channel: bool) -> bool:
+        """Whether a hook of ``session`` under Claude Code process ``claude`` is
+        served: that process's session file in ``home`` names the session and,
+        without a channel, it runs on a surface in ``HOOK_REPLY_SURFACES`` and is
+        that very process."""
+        record = read_session(home, claude.pid) if home is not None else None
+        if record is None or record.session_id != session:
+            return False
+        return channel or (record.entrypoint in HOOK_REPLY_SURFACES and (
+            not record.proc_start or record.proc_start == " ".join(claude.started.split())))
+
+    def wake_waiter(self, claude, session: str) -> Waiter | None:
+        """A waiter for the wake hook of ``session`` under Claude Code process
+        ``claude`` (a ``peers.Process``), run at a turn's ``Stop``, or None (the
+        hook then exits at once): replies off, a channel registered for that
+        process (it takes messages), the session not served there as for the
+        other hooks (``waiter``), or past the cap.
+
+        A wake hook that runs with its own ``Stop`` (``_pairs``) replaces the
+        one already waiting for that process: a newer turn ended. One that pairs
+        with none never does, and is refused while another waits, so at most one
+        waits per process. Any command the session runs can connect as such a
+        hook; one that pairs with no ``Stop`` never takes a message
+        (``_waker``), and one waiting first only keeps the next turn's own hook
+        out until that turn's ``Stop`` is seen before its hook."""
+        switches = self.switches()
+        if (not self._ensure_ready() or (switches.readable and not (switches.notices and switches.replies))
+                or not isinstance(session, str) or self._registered(claude) is not None):
+            return None
+        home = self.session_home(claude.pid)
+        if not self._serves(home, claude, session, channel=False):
+            return None
+        with self._lock:
+            waker = Waiter("wake", session, "", "", claude.pid, self.clock(), home, "")
+            waker.paired = self._pairs(waker)
+            if waker.paired:
+                self._release(self._wakers_of(session, claude.pid))
+            if (any(w.claude_pid == claude.pid for w in self._wakers if not w.done.is_set())
+                    or sum(not w.done.is_set() for w in self._wakers) >= MAX_WAKERS):
+                return None
+            self._wakers.append(waker)
+            self.changed.set()
+        return waker
+
+    def _wakers_of(self, session: str, pid: int) -> list[Waiter]:
+        """The wake hooks still waiting for ``session`` in Claude Code process ``pid``."""
+        return [w for w in self._wakers if not w.done.is_set() and w.session == session and w.claude_pid == pid]
+
+    def _pairs(self, waker: Waiter) -> bool:
+        """Whether the wake hook ran with its process's latest ``Stop``: within
+        PAIR_SECONDS of it, and that ``Stop`` dated after the latest prompt."""
+        key = (waker.session, waker.claude_pid)
+        at = self._stopped.get(key)
+        return at is not None and abs(at - waker.at) <= PAIR_SECONDS and at > self._prompted.get(key, 0.0)
+
+    @staticmethod
+    def _release(wakers: list[Waiter]) -> None:
+        for waker in wakers:
+            waker.done.set()
+
+    def _waker(self, item: Item) -> Waiter | None:
+        """The one wake hook that can take a message to the idle item now: the
+        only one waiting for its process, run with its own ``Stop``, and still
+        within its offer."""
+        wakers = self._wakers_of(item.session, item.pid)
+        if len(wakers) != 1 or not wakers[0].paired or self.clock() - wakers[0].at >= WAKE_OFFER_SECONDS:
+            return None
+        return wakers[0]
+
+    def _hook_message(self, item: Item) -> bool:
+        """Whether a wake hook was given a message to the item."""
+        sent = self._sent.get(item.id)
+        return sent is not None and sent.hook and sent.action == "message"
+
     def waiter_over(self, waiter: Waiter) -> bool:
         """Whether a waiting hook should stop: its reply came (or replies were
         turned off), its prompt closed, or was answered at the Mac while no other
@@ -1853,6 +1965,8 @@ class AttentionStore:
         with self._lock:
             if waiter.done.is_set():
                 return True
+            if waiter.kind == "wake":
+                return self._wake_over(waiter)
             if self.clock() - waiter.at >= HOOK_WAIT_SECONDS or not self._alive(waiter.claude_pid):
                 return True
             item = self._waited(waiter)
@@ -1864,6 +1978,17 @@ class AttentionStore:
                         and record.status_at > waiter.at)
             waiter.item_id = item.id
             return item.id in self._due and not self._queued_with(item, self._due_exit.get(item.id, 0.0))
+
+    def _wake_over(self, waker: Waiter) -> bool:
+        """Whether a wake hook should stop (beyond a release): its hour passed,
+        its Claude Code process ended, or that process's session file names
+        another session (``/clear``) or is gone from a whole read made since it
+        registered. Never because no idle item is recorded for it yet: a
+        terminal's comes a minute after its ``Stop``."""
+        records = [r for rs in self._records.values() for r in rs if r.pid == waker.claude_pid]
+        return (self.clock() - waker.at >= WAKE_SECONDS or not self._alive(waker.claude_pid)
+                or any(r.session_id != waker.session for r in records)
+                or (not records and self._read_at > waker.at))
 
     def _waited(self, waiter: Waiter) -> Item | None:
         return next((i for i in self._items if self._waits_for(waiter, i)), None)
@@ -1919,9 +2044,10 @@ class AttentionStore:
         """A waiting hook's connection ended. A reply set for it that never
         reached the hook settles as not delivered, and its item takes a reply again."""
         with self._lock:
-            if waiter in self._waiters:
-                self._waiters.remove(waiter)
-                self.changed.set()
+            for waiters in (self._waiters, self._wakers):
+                if waiter in waiters:
+                    waiters.remove(waiter)
+                    self.changed.set()
             if waiter.reply_id and not handed:
                 self._not_handed_over(waiter.reply_id)
 
@@ -1949,8 +2075,10 @@ class AttentionStore:
         channel's own request, a question shown whole whose one synchronous hook
         waits for it, an idle session. A session without one, on a surface in
         ``HOOK_REPLY_SURFACES`` (plan 028): a permission prompt or a question
-        shown whole whose one synchronous hook waits for it. Allow only while
-        details are on and show the very call it would allow."""
+        shown whole whose one synchronous hook waits for it, an idle session
+        whose file says ``idle`` while its one wake hook can take a message
+        (``_waker``). Allow only while details are on and show the very call it
+        would allow."""
         if (not (switches.notices and switches.replies) or item.provider != "claude" or not item.published
                 or item.id in self._unknown or not self._alone(item) or self._unsure(item)):
             return []
@@ -1971,7 +2099,13 @@ class AttentionStore:
         if item.kind == "question":
             waiters = self._waiters_for(item)
             return ["answer"] if switches.details and len(waiters) == 1 and self._shows(item, waiters[0]) else []
-        return ["message"] if item.kind == "idle" and channel is not None else []
+        if item.kind != "idle":
+            return []
+        if channel is not None:
+            return ["message"]
+        record = self._record_for(item.session, item.pid)
+        return ["message"] if (record.status == "idle" and item.id not in self._sent
+                               and self._waker(item) is not None) else []
 
     def queue_replies(self, replies: object, source: object = None) -> None:
         """From the heartbeat thread: keep the replies for the attention thread,
@@ -2099,8 +2233,9 @@ class AttentionStore:
         with self._lock:
             hook = self._hook_replies(item)
             if hook:
-                # The prompt's own waiting hook takes it, through that hook's config home.
-                chosen = self._waiters_for(item)
+                # The prompt's own waiting hook takes it (a message: the session's wake
+                # hook), through that hook's config home.
+                chosen = self._wakers_of(item.session, item.pid) if action == "message" else self._waiters_for(item)
                 request, link = None, None
                 home, pid = (chosen[0].home, item.pid) if len(chosen) == 1 else (None, 0)
             else:
@@ -2117,10 +2252,14 @@ class AttentionStore:
                 return "item_closed"
             if item.id in self._sent or item.id in self._unknown or not self._alone(item):
                 return "refused"
-            waiters = self._waiters_for(item) if hook or action == "answer" else []
+            if hook and action == "message":
+                waker = self._waker(item)
+                waiters = [waker] if waker is not None else []
+            else:
+                waiters = self._waiters_for(item) if hook or action == "answer" else []
             if hook:
                 # The hook that would take it changed, or would allow a call not shown.
-                if (action == "message" or len(waiters) != 1 or waiters != chosen
+                if (len(waiters) != 1 or waiters != chosen
                         or (action == "allow" and not self._shows(item, waiters[0]))):
                     return "refused"
             elif link is None or (action in ("allow", "deny") and request is None):
@@ -2131,8 +2270,9 @@ class AttentionStore:
                 if record.status != "idle":
                     return "refused"  # typed into, running a turn, or a dialog waits: never typed into
                 # A turn ended since (a newer item stands for it). The slack: an item
-                # opened at a turn's own Stop may be dated just before its status.
-                if record.status_at > item.created_at + SESSION_END_GRACE_SECONDS:
+                # opened at a turn's own Stop may be dated just before its status. A
+                # wake hook's item is superseded at every later Stop instead.
+                if not hook and record.status_at > item.created_at + SESSION_END_GRACE_SECONDS:
                     return "item_closed"
             elif record.status != "waiting":
                 return "item_closed"  # the prompt was answered at the Mac
@@ -2147,6 +2287,8 @@ class AttentionStore:
                 if len(waiters) != 1 or not self._shows(item, waiters[0]):
                     return "refused"
                 result = sent.answers
+            elif hook and action == "message":
+                sent.token, result = reply_key(reply["text"]), reply["text"]
             elif hook:
                 result = action
             elif action == "message":

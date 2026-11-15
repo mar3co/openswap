@@ -200,10 +200,6 @@ def test_a_hook_of_another_session_or_process_is_not_served(desktop):
     assert desktop.store.waiter("permission", CLAUDE, SESSION, key, tool_name="Bash") is not None
 
 
-def test_an_idle_session_without_a_channel_takes_no_message_yet(desktop):
-    assert desktop.actions(desktop.idle()) == []
-
-
 @pytest.mark.parametrize("entrypoint", ["claude-vscode", "sdk-ts", ""])
 def test_row14_only_terminal_and_desktop_sessions_take_hook_replies(tmp_path, entrypoint):
     other = Desktop(tmp_path, entrypoint)
