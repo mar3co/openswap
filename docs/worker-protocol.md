@@ -716,17 +716,21 @@ exactly these fields, and optionally `session_id` and `detail`:
   `input_preview` (1–4,000; the call as Claude Code itself previews it to
   OpenSwap's channel or, in a session without the channel, as the prompt's own
   permission hook previews it in the same form; never for a call that may hold
-  a credential, whose `description` is then "Preview withheld: it may contain a
-  credential."; sent only for a permission that takes replies), `last_message`
+  a credential, Claude's or Codex's, whose `description` is then "Preview
+  withheld: it may contain a credential.", with or without the channel; sent
+  only for a permission that takes replies), `last_message`
   (1–1,000, the start of the session's last message; `description`,
   `last_message` and `questions` have API keys and tokens recognizable by their
-  shape, private-key blocks, a URL's password and the values of `Authorization`
-  and `Cookie` headers masked as `[REDACTED]`) and
+  shape, private-key blocks, a URL's password or a user as long as a token, the
+  values of `Authorization` and `Cookie` headers (a quoted name or value, as in
+  JSON, and a prefixed name such as `HTTP_AUTHORIZATION` too, a quoted value up
+  to its closing quote) and a word of 20 or more token characters after `Bearer`
+  or `Basic` masked as `[REDACTED]`, never cut through) and
   `questions` (1–4 closed objects, each with
   `question` (1–1,000), an optional `header` (1–100) and `options`, 0–4
   option labels of 1–100 characters; every character outside ASCII but
   letters, numbers, punctuation and symbols, and the ones that look blank, is
-  written as its JSON escape, such as `\u00a0`). `tool_name`, `header` and option labels
+  written as its JSON escape, such as `\u00a0`, after masking). `tool_name`, `header` and option labels
   contain no Unicode control characters; the other text may contain newline,
   carriage return and tab, and no other control character. A tool's raw input
   is never sent: for `Bash` the worker sends the model's own description of
@@ -1844,17 +1848,27 @@ questions (details off, or the detail cut for size):
   that preview is the item's `input_preview`. A call that may hold a
   credential sends no preview at all: one with a recognizable token shape
   anywhere in its input, keys included (API keys and tokens, a private key's
-  BEGIN or END line, a URL's password), a secret-sounding word or name segment
+  BEGIN or END line, a URL's password, a URL's user of 20 or more token
+  characters, `user:password` after `-u`, `-U`, `-a`, `--user`, `--proxy-user`
+  or `--auth`, attached, after `=` or after any whitespace), a secret-sounding
+  word or name segment
   (`password`, `passwd`, `pass`, `pwd` but not the bare `PWD`, `OLDPWD` or
-  `$(pwd)`, `secret`, `credential(s)`, `token`, `apikey`, `api_key`,
+  `$(pwd)`, `secret`, `credential(s)`, `token` or a word ending in it such as
+  `accesstoken`, `apikey`, `api_key`,
   `access_key`, `private_key`, `authorization`, `bearer`, `cookie`, split on
-  `_ - . /`, spaces, `=`, `:` and camelCase; `password`, `passwd`, `secret`
-  and `credential` count anywhere in a name, as in `PGPASSWORD`), or more
-  than 256 KiB of text;
+  `_ - . /`, spaces, `=`, `:` and camelCase; `password`, `passwd`,
+  `passphrase`, `secret` and `credential` count anywhere in a name, as in
+  `PGPASSWORD`; in an environment variable's upper-case name or a flag, also
+  `auth`, `pw` and a last segment `key` after another, as in `HTTP_AUTH`,
+  `DB_PW`, `--auth`, `OPENAI_KEY` and `--signing-key`, but not in code or paths,
+  so `useAuth`, `auth/views.py`, `primary_key` and `ForeignKey` keep Allow),
+  or more than 262,144 characters of text (each entry of an object or list
+  counting one more);
   its item shows "Preview withheld: it may contain a credential." and takes
   `deny` only. A false positive costs only Allow and the preview for that
-  call. Known limit: a password with no recognizable shape and no
-  secret-sounding name next to it (`sshpass -p x`, `mysql -px`) is not
+  call. Known limits: a password with no recognizable shape and no
+  secret-sounding name next to it (`sshpass -p x`, `mysql -px`), and a
+  lower-case secret name in code style (`npm config set _auth x`), are not
   caught.
   Everything else in the preview that differs from the call shows and makes it
   inexact, and then the item takes `deny` only: a field cut in its middle or
@@ -1862,7 +1876,8 @@ questions (details off, or the detail cut for size):
   punctuation and symbols (blanks other than the ASCII space, combining marks,
   format, private-use and unassigned characters, lone surrogates, DEL, C1
   controls, line and paragraph separators), and the letters and symbols that
-  look blank (Hangul fillers, the braille blank, variation selectors), written
+  look blank (Hangul fillers, the braille blank, variation selectors, the
+  musical null notehead), written
   as their JSON escapes; and a run of more than 16 spaces, which could push
   the rest of a command out of sight, shown as a marker (indentation stays
   exact). Text that reads right to left (Hebrew, Arabic, Arabic-Indic digits)
@@ -1886,8 +1901,9 @@ questions (details off, or the detail cut for size):
   process) is gone with that process. An allow counts as `applied` when the
   session leaves `waiting` for `busy` within 2 seconds of the hook taking it.
   Claude goes on after a hook's deny as after a Yes or a No at the Mac, so a
-  deny settles 1.5 seconds after it was handed over, or after the session was
-  first seen leaving `waiting` if that is later: `applied` and
+  deny settles 3.5 seconds after it was handed over (the 2-second window below
+  and a 1.5-second grace), or 1.5 seconds after the session was first seen
+  leaving `waiting` if that is later: `applied` and
   `answered_from_watch` when the session left `waiting` (for `busy` or `idle`)
   within 2 seconds of the hand-over and no `PostToolUse` or
   `PostToolUseFailure` of that call came meanwhile; `answered_on_mac` when that
@@ -1907,13 +1923,16 @@ questions (details off, or the detail cut for size):
   preview format, and only for a preview Claude Code did not cut, mask or
   normalize), within 5 seconds, and no other waiting prompt or request with
   the same preview. Anything else stays a notice, so Allow never approves a
-  call other than the one shown.
+  call other than the one shown. A call that may hold a credential (as above)
+  keeps the withheld line in place of the channel's preview and description,
+  and takes `deny` only.
 - A question takes `answer` while exactly one synchronous hook waits for that
   very question (the one Claude Code ran with it), details are on, the item
   shows the questions that hook sent, and the hook says they are whole (none
   past the caps, cut, changed by cleaning or masking, or with a character
   written as its escape or reading right to left, a run of more than 16
-  spaces, or more than two line breaks in a row in a question's text, with
+  spaces or tabs, mixed or not, or more than two line breaks in a row in a
+  question's text, with
   `\r\n` one break, and breaks with only spaces or tabs between them in a row); a
   notice's own word never makes a question answerable, and neither does an
   older hook's `answerable` (the hook's word is now `whole`). A notice from an

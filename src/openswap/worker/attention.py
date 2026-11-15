@@ -47,7 +47,7 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
-from openswap.redact import MASK_MARGIN, mask_shapes
+from openswap.redact import MASK_MARGIN, PREVIEW_WITHHELD, REDACTED, mask_shapes
 from openswap.worker.protocol import (
     ACK_OUTCOMES, DETAIL_CAPS, MAX_ATTENTION_ACKS, MAX_ATTENTION_CLOSED, MAX_ATTENTION_ITEMS, MAX_BODY,
     MAX_FOLDER_LABEL, MAX_OPTION, MAX_OPTIONS, MAX_QUESTION, MAX_QUESTION_HEADER, MAX_QUESTIONS, MAX_SESSION_LABEL,
@@ -170,12 +170,12 @@ def clean_text(value: object, limit: int, *, multiline: bool = False) -> str:
 _SURROGATE = re.compile("[\ud800-\udfff]")
 _NOT_ASCII = re.compile(r"[^\x00-\x7e]")
 # Letters, numbers, punctuation and symbols that show as nothing or as a blank.
-_BLANK_LOOKING = frozenset("\u115f\u1160\u3164\uffa0\u2800\u034f\u17b4\u17b5") | {
+_BLANK_LOOKING = frozenset("\u115f\u1160\u3164\uffa0\u2800\u034f\u17b4\u17b5\U0001d159") | {
     chr(c) for c in (*range(0x180B, 0x1810), *range(0xFE00, 0xFE10), *range(0xE0100, 0xE01F0))}
 # Bidi classes that read right to left: shown as they are, they can still reorder what follows.
 _RIGHT_TO_LEFT = frozenset({"R", "AL", "AN"})
-# A run of spaces this long could push the rest of a text out of sight on the watch.
-SPACE_RUN = re.compile(" {17,}")
+# A run of spaces or tabs this long could push the rest of a text out of sight on the watch.
+SPACE_RUN = re.compile("[ \t]{17,}")
 # Three line breaks with only spaces or tabs between them (``\r\n`` is one).
 _LINE_BREAKS = re.compile(r"(?:\r\n|\r(?!\n)|\n)(?:[ \t]*+(?:\r\n|\r(?!\n)|\n)){2}")
 
@@ -187,7 +187,7 @@ def escape_hidden(text: str) -> str:
     space, combining marks, format and private-use characters, unassigned code
     points, lone surrogates, DEL and C1 controls, line and paragraph
     separators), and the letters and symbols that look blank (Hangul fillers,
-    the braille blank, variation selectors)."""
+    the braille blank, variation selectors, the musical null notehead)."""
     return _NOT_ASCII.sub(lambda m: _escaped(m[0]), text)
 
 
@@ -200,8 +200,8 @@ def _escaped(char: str) -> str:
 def reads_as_is(text: str) -> bool:
     """Whether the phone and watch show ``text`` as it reads: nothing in it is
     escaped (``escape_hidden``), none of it reads right to left (bidi classes
-    R, AL and AN) and no run of more than 16 spaces could push part of it out
-    of sight."""
+    R, AL and AN) and no run of more than 16 spaces or tabs could push part of
+    it out of sight."""
     return (escape_hidden(text) == text and not SPACE_RUN.search(text)
             and not any(unicodedata.bidirectional(c) in _RIGHT_TO_LEFT for c in _NOT_ASCII.findall(text)))
 
@@ -210,7 +210,14 @@ def masked_text(value: object, limit: int) -> str:
     """``clean_text`` of Claude's own words (a Bash description, its last
     message), which leave the Mac while details are on, with ``mask_shapes``
     applied: past the cap too, so a credential the cap cuts through is caught whole."""
-    return clean_text(mask_shapes(clean_text(value, limit + MASK_MARGIN, multiline=True)), limit, multiline=True)
+    return _masked_cut(mask_shapes(clean_text(value, limit + MASK_MARGIN, multiline=True)), limit)
+
+
+def _masked_cut(text: str, limit: int) -> str:
+    """``text`` cut to ``limit`` code points, before a ``[REDACTED]`` the cut
+    would split, so no part of a mask shows."""
+    at = text.find(REDACTED, max(0, limit - len(REDACTED) + 1), limit + len(REDACTED) - 1)
+    return text[:limit if at == -1 else at].strip()
 
 
 def scrub(value):
@@ -226,11 +233,13 @@ def scrub(value):
 
 
 def _shown_text(value: object, limit: int, *, multiline: bool = False) -> str:
-    """Question text as the phone and watch show it: ``escape_hidden``, then
-    ``mask_shapes``, then ``clean_text``."""
+    """Question text as the phone and watch show it: ``mask_shapes`` (of the
+    text as it is, so an escape never hides a token's edge), then
+    ``escape_hidden``, then ``clean_text``."""
     if not isinstance(value, str):
         return ""
-    return clean_text(mask_shapes(escape_hidden(value[:limit + MASK_MARGIN])), limit, multiline=multiline)
+    shown = escape_hidden(mask_shapes(value[:limit + MASK_MARGIN]))
+    return _masked_cut(clean_text(shown, limit + MASK_MARGIN, multiline=multiline), limit)
 
 
 def question_entries(value: object) -> list[tuple[dict, str, list[str]]]:
@@ -351,11 +360,12 @@ REPLY_TOKEN = re.compile(r"[a-z0-9]{1,32}")
 def validate_notice(value: object) -> dict:
     """A closed notice object as ``openswap attention`` sends it, or NoticeError.
 
-    Text must already be cleaned and cut to the report's caps (the hook does
-    that), so nothing is cut here. Claude's own words are masked again
-    (``mask_shapes``) and questions cleaned again (``clean_questions``), and an
-    ``answerable`` is dropped: an older hook still running after an update
-    sends them by older rules, and its notice still counts.
+    Text must already be cleaned and within the report's caps (the hook does
+    that). Claude's own words are masked again (``masked_text``, which cuts a
+    text the masks lengthened back to its cap) and questions cleaned again
+    (``clean_questions``), and an ``answerable`` is dropped: an older hook still
+    running after an update sends them by older rules, and its notice still
+    counts.
     """
     if not isinstance(value, dict):
         raise NoticeError("invalid_notice")
@@ -621,6 +631,12 @@ def _all_off():
 
 def preview_key(preview: str) -> str:
     return hashlib.sha256(preview.encode("utf-8", "surrogatepass")).hexdigest()[:32]
+
+
+def _withheld(item: Item) -> bool:
+    """Whether the hook found the item's call may hold a credential: its preview
+    is never shown, and it takes no Allow."""
+    return item.kind == "permission" and item.detail.get("description") == PREVIEW_WITHHELD
 
 
 # ``ps`` lstart in the C locale, as the worker reads it: any other form (another
@@ -1386,7 +1402,8 @@ class AttentionStore:
                     if sent.exit_at is None:
                         sent.exit_at = record.status_at
                         if self._hook_denied(item):
-                            self._due[item.id] = now + SESSION_END_GRACE_SECONDS  # its grace runs from here too
+                            # Its grace runs from here too, if that ends later.
+                            self._due[item.id] = max(self._due[item.id], now + SESSION_END_GRACE_SECONDS)
                     if self._hook_denied(item):
                         continue
                     # The dialog closed: approved (busy) or declined (idle; a channel's deny).
@@ -1578,9 +1595,11 @@ class AttentionStore:
                 continue
             self._requests.remove(request)
             self._attached[item.id] = request
-            # Shown as Claude Code relays it, so Allow names exactly what was shown.
-            item.detail = {k: v for k, v in (("tool_name", request.tool_name), ("description", request.description),
-                                             ("input_preview", request.preview)) if v}
+            if not _withheld(item):
+                # Shown as Claude Code relays it, so Allow names exactly what was shown.
+                item.detail = {k: v for k, v in (("tool_name", request.tool_name),
+                                                 ("description", request.description),
+                                                 ("input_preview", request.preview)) if v}
             changed = True
         return changed
 
@@ -1948,7 +1967,7 @@ class AttentionStore:
             # Only the channel that relayed the request can answer it.
             if request is None or item.id in self._tainted or request.channel != (channel.pid, channel.started):
                 return []
-            return ["allow", "deny"] if switches.details else ["deny"]
+            return ["allow", "deny"] if switches.details and not _withheld(item) else ["deny"]
         if item.kind == "question":
             waiters = self._waiters_for(item)
             return ["answer"] if switches.details and len(waiters) == 1 and self._shows(item, waiters[0]) else []
@@ -2150,8 +2169,10 @@ class AttentionStore:
                 del self._inflight[reply["id"]]
                 return "refused"
             if self._hook_denied(item):
-                # Settles once its grace from now passes (``tick``), or from when its dialog is seen to close.
-                self._due[item.id], self._due_exit[item.id] = sent.at + SESSION_END_GRACE_SECONDS, math.inf
+                # Settles once the confirm window and its grace from now pass (``tick``), or its grace from
+                # when its dialog is seen to close if that is later: a close seen late still counts.
+                self._due[item.id] = sent.at + CONFIRM_SECONDS + SESSION_END_GRACE_SECONDS
+                self._due_exit[item.id] = math.inf
             self.changed.set()
             for waiter in waiters:
                 waiter.result, waiter.reply_id = result, reply["id"]

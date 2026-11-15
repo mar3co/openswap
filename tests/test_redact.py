@@ -40,6 +40,9 @@ def test_a_key_block_line_or_a_url_password_holds_a_credential(text):
     "OPENAI_API_KEY=x", "tool --api-key x", "apiKey=x", "APIKEY=x", "access_key x", "privateKey: x",
     "curl -H 'Authorization: Basic x'", "curl -H 'Bearer x'", "curl --cookie sid=x", "XAuthToken=x",
     "make tests pass", "PGPASSWORD=hunter2 psql", "clientsecret=x", "MYSQLPASSWD=x", "cat secrets.yaml",
+    "GPG_PASSPHRASE=x", "gpg --passphrase x", "DB_PW=x", "HTTP_AUTH=x", "http --auth x", "OPENAI_KEY=x",
+    "MASTER_KEY=x", "RAILS_MASTER_KEY=x", "JWT_SIGNING_KEY=x", "cosign --signing-key x", "accesstoken=x",
+    "githubtoken x", "ACCESSTOKEN=x",
 ])
 def test_a_secret_sounding_name_holds_a_credential(text):
     assert holds_credential({"command": text})
@@ -54,10 +57,27 @@ def test_a_secret_sounding_key_at_any_depth_holds_a_credential(value):
     "npm test", "git push -u origin main", "cd $PWD && pwd", "PWD=/tmp ./run", "OLDPWD=/x ./run", 'echo "$(pwd)"',
     "src/auth.py", "fix-auth", "git log --author alice", "primary_key=id", "max_tokens=4000",
     "claude --max-tokens 4000", "bypass=yes", "monkey keyboard", "https://example.com/a@b",
-    "git clone https://ann@x.test/repo.git", "Bearertoken", "sshpass -p x ssh host", "mysql -u root -px app",
+    "git clone https://ann@x.test/repo.git", "sshpass -p x ssh host", "mysql -u root -px app",
+    "ForeignKey(User)", "cache_key=x", "encryption_key=x", "useAuth()", "cat auth/views.py", "KEY=x", "--key x",
+    "npm config set _auth x", "git commit -a -m 'fix: x'", "sort -u a.txt", "git log --author=ann:x",
 ])
 def test_ordinary_calls_hold_no_credential(text):
     assert not holds_credential({"command": text, "description": "Run it"})
+
+
+@pytest.mark.parametrize("text", [
+    "curl -u admin:hunter2 x.test", "curl -uadmin:hunter2 x.test", "curl --user=admin:hunter2 x.test",
+    "curl\n-u\nadmin:hunter2", "psql -U 'admin:hunter2'", "x -a admin:hunter2", "curl --proxy-user a:b x.test",
+    "http --auth alice:pw x.test", f"git clone https://{'0123456789abcdef' * 2}@github.com/o/r.git",
+])
+def test_a_user_and_password_after_a_flag_or_a_long_url_user_holds_a_credential(text):
+    assert holds_credential({"command": text}) and holds_credential({"command": text.split()})
+
+
+@pytest.mark.parametrize("prefix", ["\u5bc6\u94a5", "\u00e9", "\u3164", "\u00a0"])
+def test_a_token_shape_right_after_a_letter_outside_ascii_is_caught(prefix):
+    assert holds_credential({"command": f"{prefix}{SHAPES[2]}"})
+    assert mask_shapes(f"{prefix}{SHAPES[2]} x") == f"{prefix}[REDACTED] x"
 
 
 def test_a_call_past_the_check_budget_is_taken_to_hold_one():
@@ -70,7 +90,8 @@ HOSTILE = [
     "token=$( " * 30_000, "-u $( " * 40_000, "mysql -p$( " * 23_000, "TOKEN=$(" * 32_000, "tokens " * 37_000,
     "x" * 260_000, "a-" * 130_000, "s/" * 130_000, "eyJ" + "a" * 260_000, "eyJ-" * 65_000, "a://" + "x" * 260_000,
     "-----BEGIN PRIVATE KEY-----" * 9_000, "AAAAAAAa" * 32_000, "Cookie: " * 32_000, '"' + "\\" * 260_000,
-    "monkey " * 37_000,
+    "monkey " * 37_000, "-u." * 87_000, "-ua" * 87_000, "x_" * 130_000, "Bearer " * 37_000,
+    "https://" + "a" * 260_000, "'Cookie': '" * 23_000,
 ]
 
 
@@ -95,6 +116,14 @@ def test_prose_has_token_shapes_masked(shape):
     ("Sent -H 'Authorization: Bearer Zq9 secret' to it", "Sent -H 'Authorization: [REDACTED]' to it"),
     ("Proxy-Authorization: Basic Zq9\nnext line", "Proxy-Authorization: [REDACTED]\nnext line"),
     ('With "Cookie: sid=Zq9; theme=dark" set', 'With "Cookie: [REDACTED]" set'),
+    ('{"Authorization": "Bearer Zq9 secret", "x": 1}', '{"Authorization": "[REDACTED]", "x": 1}'),
+    ("{'Cookie': 'session=Zq9; theme=dark', 'x': 1}", "{'Cookie': '[REDACTED]', 'x': 1}"),
+    ("Set HTTP_AUTHORIZATION: Basic Zq9 now", "Set HTTP_AUTHORIZATION: [REDACTED]"),
+    ('Authorization: "Bearer Zq9 secret" sent', 'Authorization: "[REDACTED]" sent'),
+    ("Authorization: 'Bearer Zq9 secret\nnext", "Authorization: '[REDACTED]\nnext"),
+    (f"Use Bearer {'Zq9Xw7Vu5T' * 2} for it", "Use Bearer [REDACTED] for it"),
+    (f"Then basic {'Zq9Xw7Vu5T' * 3}", "Then basic [REDACTED]"),
+    (f"See https://{'0123456789abcdef' * 2}@github.com/o", "See https://[REDACTED]@github.com/o"),
 ])
 def test_prose_has_key_blocks_url_passwords_and_header_values_masked(text, masked):
     assert mask_shapes(text) == masked
@@ -103,6 +132,7 @@ def test_prose_has_key_blocks_url_passwords_and_header_values_masked(text, maske
 @pytest.mark.parametrize("text", [
     "Uses Bearer authentication.", "Set PASSWORD=hunter2 and the token Zq9.", "See https://ann@x.test/a@b.",
     "The Authorization header is missing.", "Masked: [REDACTED] and Authorization: [REDACTED]",
+    "Bearer authentication works.", "Use Basic auth here.",
 ])
 def test_prose_keeps_names_and_already_masked_text_readable(text):
     assert mask_shapes(text) == text

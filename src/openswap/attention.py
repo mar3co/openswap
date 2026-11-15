@@ -30,6 +30,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from openswap.exceptions import ConfigError
+from openswap.redact import PREVIEW_WITHHELD
 
 logger = logging.getLogger(__name__)
 
@@ -153,8 +154,6 @@ def channel_preview(tool_input: object) -> str | None:
 # Each field a preview shows keeps at least this many characters, more than
 # its cut marker, so a cut field always shows one.
 PREVIEW_FIELD_MIN = 60
-# What a permission item shows in place of Claude's description when its call may hold a credential.
-PREVIEW_WITHHELD = "Preview withheld: it may contain a credential."
 
 
 def input_preview(tool_input: object) -> tuple[str, bool]:
@@ -346,6 +345,7 @@ def _codex_notice(event: str, raw: bytes) -> dict | None:
     """The notice for one Codex hook input, or None when it is not one or is
     an approval no person is asked to give (``approval_policy = "never"``, or
     Codex's automatic reviewer deciding)."""
+    from openswap.redact import holds_credential
     from openswap.worker.attention import clean_text, is_agent_id, masked_text
     from openswap.worker.protocol import DETAIL_CAPS
 
@@ -375,7 +375,8 @@ def _codex_notice(event: str, raw: bytes) -> dict | None:
         if isinstance(tool_input, dict):
             notice["tool_key"] = tool_key({k: v for k, v in tool_input.items() if k != "description"})
             if event == "PermissionRequest":
-                description = masked_text(tool_input.get("description"), DETAIL_CAPS["description"])
+                description = (PREVIEW_WITHHELD if holds_credential(tool_input)
+                               else masked_text(tool_input.get("description"), DETAIL_CAPS["description"]))
                 if description:
                     notice["description"] = description
         else:

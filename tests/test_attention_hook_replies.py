@@ -282,8 +282,11 @@ def _denied(desktop, agent="", closed=0.5):
     return item
 
 
+CONFIRM_AND_GRACE = store_module.CONFIRM_SECONDS + store_module.SESSION_END_GRACE_SECONDS
+
+
 def _after_grace(desktop):
-    desktop.clock.now += store_module.SESSION_END_GRACE_SECONDS
+    desktop.clock.now += CONFIRM_AND_GRACE
     desktop.store.tick()
 
 
@@ -326,6 +329,54 @@ def test_g1_a_session_still_waiting_when_the_grace_from_the_hand_over_ends_close
     assert desktop.closes() == {item.id: "answered_on_mac"} and desktop.outcomes() == {}
 
 
+def test_h7_a_hook_deny_whose_dialog_closes_late_in_the_confirm_window_is_applied(desktop):
+    item = _denied(desktop, closed=None)
+    sent = desktop.clock.now
+    desktop.clock.now = sent + store_module.CONFIRM_SECONDS - 0.1
+    desktop.store.tick()
+    assert desktop.closes() == {}
+    desktop.status("busy", desktop.clock.now)
+    _after_grace(desktop)
+    assert desktop.closes() == {item.id: "answered_from_watch"} and desktop.outcomes() == {"r1": "applied"}
+
+
+def test_h7_a_hook_deny_whose_dialog_is_not_seen_closing_settles_on_the_mac_after_the_window_and_grace(desktop):
+    item = _denied(desktop, closed=None)
+    sent = desktop.clock.now
+    desktop.clock.now = sent + CONFIRM_AND_GRACE - 0.1
+    desktop.store.tick()
+    assert desktop.closes() == {}
+    desktop.clock.now = sent + CONFIRM_AND_GRACE
+    desktop.store.tick()
+    assert desktop.closes() == {item.id: "answered_on_mac"} and desktop.outcomes() == {}
+
+
+def test_h8_an_exit_seen_late_in_the_grace_restarts_it_for_the_calls_own_signal(desktop):
+    item = _denied(desktop, closed=None)
+    sent = desktop.clock.now
+    desktop.clock.now = sent + CONFIRM_AND_GRACE - 0.1
+    desktop.status("busy", sent + store_module.CONFIRM_SECONDS - 0.1)  # closed in the window, seen only now
+    desktop.clock.now = sent + CONFIRM_AND_GRACE + 0.5
+    desktop.store.tick()
+    assert desktop.closes() == {}
+    desktop.store.notice(hook("PostToolUse", tool_name="Bash", tool_input=bash("npm test")) | desktop.at(0))
+    _after_grace(desktop)
+    assert desktop.closes() == {item.id: "answered_on_mac"} and desktop.outcomes() == {}
+
+
+def test_h8_a_hook_deny_whose_hook_left_before_taking_it_settles_refused_and_closes_on_its_own_signal(desktop):
+    item = desktop.prompt(relay=False)
+    waiter = desktop.permission(item)
+    desktop.reply(item.id, "deny")
+    desktop.store.end_waiter(waiter)  # its connection ended before the hook took the deny
+    assert desktop.outcomes() == {"r1": "refused"}
+    _after_grace(desktop)
+    assert desktop.closes() == {}  # the dialog still waits at the Mac
+    desktop.status("busy", desktop.clock.now + 0.5)
+    _after_grace(desktop)
+    assert desktop.closes() == {item.id: "answered_on_mac"} and desktop.outcomes() == {}
+
+
 def test_g1_a_sibling_calls_signal_never_decides(desktop):
     item = _denied(desktop)
     desktop.store.notice(hook("PostToolUse", tool_name="Bash", tool_input=bash("ls")) | desktop.at(0.6))
@@ -352,7 +403,9 @@ def test_g1_a_denied_prompt_is_not_queued_beside_a_prompt_recorded_after_its_exi
     t = desktop.clock.now
     desktop.store.notice(hook("PermissionRequest", tool_name="Bash", tool_input=bash("npm run lint")) | {"at": t + 1})
     desktop.status("waiting", t + 0.9)
+    desktop.store.notice(hook("Notification", notification_type="permission_prompt") | {"at": t + 7})
     retry = next(i for i in desktop.store._items if i.created_at == t + 1)
+    assert retry.published
     waiter = desktop.permission(retry, "npm run lint")
     desktop.status("busy", t + 1.2)  # answered at the Mac while the denied one is in its grace
     assert desktop.store.waiter_over(waiter)
@@ -767,11 +820,9 @@ def test_token_shapes_and_header_values_in_claudes_own_words_are_masked(monkeypa
     assert stop["last_message"] == "Use Bearer authentication with Authorization: [REDACTED]"
     stop = hook("Stop", last_assistant_message="Set " + "x" * 975 + f" ghp_{SECRET} as the token.")
     assert len(stop["last_message"]) == 1000 and not _leaks(stop["last_message"], SECRET)
-    for event, data in (("PermissionRequest", {"tool_name": "Bash", "tool_input": {
-            "command": "x", "description": f"Uses sk-ant-api03-{SECRET}"}}),
-            ("Stop", {"last_assistant_message": f"Done: sk-ant-api03-{SECRET}"})):
-        codex = attention._codex_notice(event, json.dumps({"session_id": SESSION, "cwd": "/x", **data}).encode())
-        assert not _leaks(json.dumps(codex), SECRET) and "[REDACTED]" in json.dumps(codex)
+    data = {"session_id": SESSION, "cwd": "/x", "last_assistant_message": f"Done: sk-ant-api03-{SECRET}"}
+    codex = attention._codex_notice("Stop", json.dumps(data).encode())
+    assert not _leaks(json.dumps(codex), SECRET) and "[REDACTED]" in json.dumps(codex)
 
 
 def test_the_permission_hook_without_a_worker_prints_nothing(tmp_path, monkeypatch):
@@ -888,6 +939,28 @@ def test_g3_a_call_that_may_hold_a_credential_is_withheld_and_takes_deny_only(de
     assert entry["actions"] == ["deny"]
 
 
+@pytest.mark.parametrize("relay", [True, False], ids=["paired", "unpaired"])
+def test_h1_a_channel_session_withholds_a_credential_call_and_takes_deny_only_once_paired(env, relay):
+    item = env.prompt(f"deploy --token ghp_{SECRET}", relay=relay)
+    [entry] = env.report()["items"]
+    assert entry["detail"] == {"tool_name": "Bash", "description": attention.PREVIEW_WITHHELD}
+    assert not _leaks(json.dumps(entry), SECRET)
+    assert entry["actions"] == (["deny"] if relay else [])
+    if relay:
+        env.reply(item.id, "deny")
+        assert env.link.sent == [{"verdict": {"request_id": "abcde", "behavior": "deny"}}]
+
+
+@pytest.mark.parametrize("command", [["curl", "-u", f"admin:{SECRET}", "x.test"], f"deploy --token ghp_{SECRET}"])
+def test_h1_a_codex_call_that_may_hold_a_credential_has_its_description_withheld(command):
+    data = {"session_id": SESSION, "cwd": "/x", "tool_name": "Bash",
+            "tool_input": {"command": command, "description": "Fetch it"}}
+    codex = attention._codex_notice("PermissionRequest", json.dumps(data).encode())
+    assert codex["description"] == attention.PREVIEW_WITHHELD and not _leaks(json.dumps(codex), SECRET)
+    data["tool_input"]["command"] = ["curl", "x.test"]
+    assert attention._codex_notice("PermissionRequest", json.dumps(data).encode())["description"] == "Fetch it"
+
+
 def test_g3_an_ordinary_call_keeps_its_preview_and_allow(desktop):
     item = desktop.prompt("pytest tests/test_auth.py::test_max_tokens && cd $PWD", relay=False)
     desktop.permission(item, "pytest tests/test_auth.py::test_max_tokens && cd $PWD")
@@ -901,7 +974,7 @@ SHOWN_AS_IS = "café naïve ß ñ 漢字 ✓ → € ½ ™"
 HIDDEN = ["\u00a0", "\u2007", "\u3000", "\u0301", "\u20dd", "\ue000", "\u0378", "\ufeff", "\u200b", "\u202e",
           "\u2028", "\u2029", "\x7f", "\x85", "\ud800", "\u115f", "\u1160", "\u3164", "\uffa0", "\u2800",
           "\u034f", "\u17b4", "\u17b5", "\u180b", "\u180f", "\ufe00", "\ufe0f", "\U000e0100", "\U000e01ef",
-          "\U000e0041"]
+          "\U000e0041", "\U0001d159"]
 RIGHT_TO_LEFT = ["\u05e9\u05dc\u05d5\u05dd", "\u0645\u0631\u062d\u0628\u0627", "\u0661\u0662\u0663"]
 
 
@@ -940,6 +1013,7 @@ def test_g2_right_to_left_text_is_shown_as_it_is_but_never_exact(text):
     ("One\n\nTwo", True), ("One\r\n\r\nTwo", True), ("One\n\r\nTwo\n\nThree", True),
     ("One\n\n\nTwo", False), ("One\n \n\t\nTwo", False), ("One\r\n\r\n\r\nTwo", False), ("One\r\r\rTwo", False),
     ("A" + " " * 16 + "B", True), ("A" + " " * 17 + "B", False), (" Leading", False), ("Bell\x07", False),
+    ("A" + "\t" * 16 + "B", True), ("A" + "\t" * 17 + "B", False), ("A" + " \t" * 9 + "B", False),
     ("Q" * 1000, True), ("Q" * 1001, False), ("Uses Bearer authentication?", True),
     (f"Use ghp_{SECRET}?", False), ("Send Authorization: Basic Zq9?", False),
 ])
@@ -958,6 +1032,23 @@ def test_g2_a_header_or_option_that_could_hide_or_change_part_of_itself_takes_no
 def test_g2_a_question_shows_its_token_shapes_masked():
     [shown] = shown_questions([{"question": f"Use ghp_{SECRET}?", "options": [f"ghp_{SECRET}"]}])
     assert shown == {"question": "Use [REDACTED]?", "options": ["[REDACTED]"]}
+
+
+@pytest.mark.parametrize("char", ["\u00a0", "\u200b", "\u2028", "\ufe0f", "\u5bc6", "\u00e9", "\u3164"],
+                         ids=lambda c: f"U+{ord(c):04X}")
+def test_h4_a_token_or_header_value_right_after_any_character_is_masked_in_a_question(char):
+    for text in (f"{char}ghp_{SECRET}", f"{char}Cookie: {SECRET}"):
+        questions = [{"question": f"Use{text}", "header": f"H{text}", "options": [f"A{text}"]}]
+        assert not store_module.questions_whole(questions)
+        [shown] = shown_questions(questions)
+        assert not _leaks(json.dumps(shown), SECRET) and json.dumps(shown).count("[REDACTED]") == 3
+
+
+def test_a_token_the_cap_cuts_through_never_shows_part_of_its_mask():
+    text = "x" * 995 + f" ghp_{SECRET} done"
+    assert hook("Stop", last_assistant_message=text)["last_message"] == "x" * 995
+    [shown] = shown_questions([{"question": text, "options": ["A"]}])
+    assert shown["question"] == "x" * 995
 
 
 def test_g2_the_worker_takes_no_exact_or_whole_claim_for_text_that_reads_right_to_left(desktop):
