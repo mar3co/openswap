@@ -7,7 +7,7 @@ import time
 
 import pytest
 
-from openswap.redact import REDACTED, CHECK_BUDGET, holds_credential, mask_shapes
+from openswap.redact import CHECK_BUDGET, MASK_MARGIN, REDACTED, holds_credential, mask_shapes
 
 SHAPES = [
     "sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWx", "sk-proj-AbCdEfGhIjKlMnOpQrStUvWxYz012345",
@@ -123,8 +123,9 @@ HOSTILE = [
 
 @pytest.mark.parametrize("text", HOSTILE, ids=lambda text: f"{text[:12]}…{len(text)}")
 def test_checking_and_masking_a_hostile_input_within_the_budget_is_quick(text):
-    text = text[:CHECK_BUDGET - 10]
-    for check in (lambda: holds_credential({"command": text}), lambda: mask_shapes(text)):
+    # Each at the most it is ever given: a call up to the check budget, prose up to its cap plus the margin.
+    call, prose = text[:CHECK_BUDGET - 10], text[:1000 + MASK_MARGIN]
+    for check in (lambda: holds_credential({"command": call}), lambda: mask_shapes(prose)):
         started = time.perf_counter()
         check()
         assert time.perf_counter() - started < 0.5
