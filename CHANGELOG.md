@@ -13,6 +13,14 @@ opensoft.me/swap/changelog shows this file.
 
 ## Unreleased
 
+### New
+
+- Claude Desktop sessions, and terminal sessions started without `openswap claude`, can now be answered from your iPhone and Apple Watch: allow or deny a tool, answer a question, or reply to a finished turn. Turn on Settings › Remote › Sessions › Allow replies from my phone and watch on the Mac first; sessions started after that take replies. Sessions already running when you update need a restart to take replies.
+
+### Improved
+
+- When a waiting tool call may contain a password, key or token, your iPhone and Apple Watch now show "Preview withheld" and offer Deny only, and keys and tokens in Claude's messages and questions show as [REDACTED]. This applies to every session, including ones started with `openswap claude`.
+
 ### Fixed
 
 - A Claude Desktop or VS Code session that has finished its turn and waited a minute for you now shows in OpenTag on your iPhone and Apple Watch, as a terminal session already did.

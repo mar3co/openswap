@@ -17,6 +17,7 @@ from pathlib import Path
 from threading import Event
 from typing import TYPE_CHECKING, Protocol
 
+from openswap.worker import peers
 from openswap.worker.attention import log_limited
 
 logger = logging.getLogger(__name__)
@@ -34,7 +35,7 @@ IO_TIMEOUT_SECONDS = 2.0
 # Connections are served concurrently, so a slow or idle client cannot stall
 # status, pause or stop; past this many at once, a new one is closed unread.
 MAX_CONNECTIONS = 32
-# Of those, kept for status, pause and stop: notices, channels and question
+# Of those, kept for status, pause and stop: notices, channels and waiting
 # hooks never take the last of them.
 CONTROL_RESERVED = 2
 # ``accept()`` errors that mean the listening socket itself is unusable.
@@ -123,6 +124,7 @@ def _dispatch(
     control: WorkerControl,
     notices: AttentionStore | None = None,
     control_lock: threading.Lock | None = None,
+    connection: socket.socket | None = None,
 ) -> tuple[object | None, str | None]:
     if not isinstance(request, dict) or request.get("version") != IPC_VERSION:
         return None, "unsupported_request"
@@ -136,7 +138,7 @@ def _dispatch(
             notice = validate_notice(request.get("notice"))
         except NoticeError:
             return None, "invalid_notice"
-        notices.notice(notice)
+        notices.notice(notice, launched=_stop_launch(notice, connection))
         return {}, None
     if command not in ("status", "stop", "pause"):
         return None, "unsupported_request"
@@ -146,6 +148,19 @@ def _dispatch(
 
 
 _UNSHARED_LOCK = threading.Lock()
+
+
+def _stop_launch(notice: dict, connection: socket.socket | None) -> float | None:
+    """For a Claude ``Stop`` notice, when the process Claude Code started for its
+    hook began, read from the connection's peer (``peers.hook_launch``), as a
+    wake hook's launch is; None for any other notice, or when that is not known
+    or the hook runs under another Claude Code process than the notice names."""
+    if connection is None or notice["provider"] != "claude" or notice["event"] != "Stop":
+        return None
+    launch = peers.hook_launch(peers.peer_pid(connection))
+    if launch is None or launch[0].pid != notice.get("pid"):
+        return None
+    return peers.started_at(launch[1])
 
 
 def _dispatch_control(request: dict, command: object, control: WorkerControl) -> tuple[object | None, str | None]:
@@ -170,7 +185,7 @@ def _dispatch_control(request: dict, command: object, control: WorkerControl) ->
 
 
 # Connections that stay open and receive something back (plan 025 S2).
-LINKED_COMMANDS = frozenset({"channel", "question"})
+LINKED_COMMANDS = frozenset({"channel", "question", "permission", "wake"})
 
 
 def _handle_connection(
@@ -201,7 +216,7 @@ def _handle_connection(
                 return
             else:
                 try:
-                    result, error = _dispatch(request, control, notices, control_lock)
+                    result, error = _dispatch(request, control, notices, control_lock, connection)
                     response = _encode_response(result, error)
                 except Exception:
                     # Do not send callback exception strings or runtime details to
@@ -305,7 +320,7 @@ def serve(
         handlers: list[threading.Thread] = []
 
         def handle(connection: socket.socket, pool: threading.BoundedSemaphore) -> None:
-            # A channel or a waiting question hook, once accepted, gives its slot
+            # A channel or a waiting hook, once accepted, gives its slot
             # back: the attention store bounds how many of those stay open.
             released = threading.Event()
 

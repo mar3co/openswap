@@ -678,7 +678,9 @@ rows 8–17.
 
 - Answering Codex sessions (needs Codex's app-server, which only covers
   sessions it starts).
-- Answering in Claude Desktop's Code tab (no channel there).
+- Answering in Claude Desktop's Code tab (no channel there). Now planned in
+  [plan 028](028-desktop-replies.md), through waiting hooks (owner rulings
+  2026-11-15).
 - Cloud sessions (not on a paired Mac).
 - Starting new sessions from the watch (that is Remote tasks; a watch
   "start a task" can reuse plan 018's request and approval later).

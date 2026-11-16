@@ -714,14 +714,31 @@ exactly these fields, and optionally `session_id` and `detail`:
 - `detail` (optional, only while the owner sends details): a closed object
   with at least one of `tool_name` (1–100 characters), `description` (1–1,000),
   `input_preview` (1–4,000; the call as Claude Code itself previews it to
-  OpenSwap's channel, sent only for a permission that takes replies), `last_message`
-  (1–1,000, the start of the session's last message) and `questions` (1–4 closed objects, each with
+  OpenSwap's channel or, in a session without the channel, as the prompt's own
+  permission hook previews it in the same form; never for a call that may hold
+  a credential, Claude's or Codex's, whose `description` is then "Preview
+  withheld: it may contain a credential.", with or without the channel; sent
+  only for a permission that takes replies), `last_message`
+  (1–1,000, the start of the session's last message; `description`,
+  `last_message` and `questions` have API keys and tokens recognizable by their
+  shape, private-key blocks, a URL's password or a user as long as a token, the
+  values of `Authorization` and `Cookie` headers (a quoted name or value, as in
+  JSON, and a prefixed name such as `HTTP_AUTHORIZATION` too, a quoted value up
+  to its closing quote, and quoted parts after `=` in an unquoted value), the
+  password after a login flag such as `curl -u user:` (as far as any reading
+  of its quotes and backslashes takes it, the shell's or a writer's, and never
+  past a newline or carriage return) and a word of 20 or more
+  token characters after `Bearer` or `Basic` masked as `[REDACTED]`, never cut
+  through) and
+  `questions` (1–4 closed objects, each with
   `question` (1–1,000), an optional `header` (1–100) and `options`, 0–4
-  option labels of 1–100 characters). `tool_name`, `header` and option labels
+  option labels of 1–100 characters; every character outside ASCII but
+  letters, numbers, punctuation and symbols, and the ones that look blank, is
+  written as its JSON escape, such as `\u00a0`, after masking). `tool_name`, `header` and option labels
   contain no Unicode control characters; the other text may contain newline,
   carriage return and tab, and no other control character. A tool's raw input
   is never sent: for `Bash` the worker sends the model's own description of
-  the command.
+  the command, and the call itself only as `input_preview`.
 
 `closed` holds 0–50 closed objects with exactly `id` (the item ID's grammar,
 unique within the array) and `reason`, one for each item that closed since
@@ -1776,8 +1793,13 @@ against the session files and Claude Code processes when it starts.
 #### Answering from the phone and watch
 
 A third switch, **Allow replies from my phone and watch** (off by default,
-set on this Mac only), lets the owner answer sessions started with `openswap
-claude [claude's own arguments]`. That command starts Claude Code with
+set on this Mac only), lets the owner answer Claude Code sessions in Claude
+Desktop and in a terminal; VS Code sessions stay notice-only until a check
+shows the extension closes its dialog when a hook decides it
+(mar3co/openswap#210). A session started with `openswap claude [claude's own
+arguments]` is answered through OpenSwap's channel, on any surface; any other
+is answered through its own waiting hooks (below), in sessions started after
+the switch was turned on. `openswap claude` starts Claude Code with
 OpenSwap's channel: it passes a `--mcp-config` file in OpenSwap's support
 folder (`worker/channel-mcp.json`) naming `openswap attention channel`, and
 names it with `--dangerously-load-development-channels server:openswap`, so
@@ -1818,43 +1840,237 @@ backend accepted offered for that item, and an item is never offered `allow`
 or `answer` in a report that leaves out the detail showing its call or its
 questions (details off, or the detail cut for size):
 
-- A permission prompt takes `deny`, and `allow` while details are on (the
-  phone then shows the call as Claude Code previews it to the channel). It
-  takes either only when the channel's request is provably that very call:
+- A permission prompt in a session without the channel takes `deny` while
+  exactly one synchronous hook waits for that very prompt (the one Claude Code
+  ran with it: the same process, session, agent, tool and input, within 5
+  seconds), and `allow` too while details are on and the item shows that
+  hook's own preview of the call, exact. That hook (`openswap attention
+  permission`, a `PermissionRequest` hook on every tool with a 600-second
+  timeout, which leaves `AskUserQuestion` to the question hook) is installed
+  with the question hook. It sends the worker its own call as Claude Code's
+  channel form previews it, `{ "key": value, … }` with each value as JSON, and
+  that preview is the item's `input_preview`. A call that may hold a
+  credential sends no preview at all: one with a recognizable token shape
+  anywhere in its input, keys included (API keys and tokens, a private key's
+  BEGIN or END line, a URL's password, a URL's user of 20 or more token
+  characters, `user:password` after `-u`, `-U`, `-a`, `--user`, `--proxy-user`
+  or `--auth`, attached, after `=` or after any whitespace), a secret-sounding
+  word or name segment
+  (`password`, `passwd`, `pass`, `pwd` but not the bare `PWD`, `OLDPWD`,
+  `SSH_AUTH_SOCK` or `$(pwd)`, `secret`, `credential(s)`, `token` or a word ending in it such as
+  `accesstoken`, `apikey`, `api_key`,
+  `access_key`, `private_key`, `authorization`, `bearer`, `cookie`, split on
+  `_ - . /`, spaces, `=`, `:` and camelCase; `password`, `passwd`,
+  `passphrase`, `secret` and `credential` count anywhere in a name, as in
+  `PGPASSWORD`; in an upper-case name (an environment variable, or a constant
+  in code such as `STORAGE_KEY`), a flag or a header's name before its colon
+  and value (`X-…` or Title-Case, such as `X-Auth-Key:` and
+  `Ocp-Apim-Subscription-Key:`), also `auth`, `pw` and a last segment `key`
+  after another, as in `HTTP_AUTH`, `DB_PW`, `--auth`, `OPENAI_KEY` and
+  `--signing-key`, but not in other code, YAML keys or paths,
+  so `useAuth`, `auth/views.py`, `primary_key` and `ForeignKey` keep Allow),
+  or more than 262,144 characters of text (each entry of an object or list
+  counting one more);
+  its item shows "Preview withheld: it may contain a credential." and takes
+  `deny` only. A false positive costs only Allow and the preview for that
+  call. Known limits: a password with no recognizable shape and no
+  secret-sounding name next to it (`sshpass -p x`, `mysql -px`), and a
+  lower-case secret name in code style (`npm config set _auth x`), are not
+  caught.
+  Everything else in the preview that differs from the call shows and makes it
+  inexact, and then the item takes `deny` only: a field cut in its middle or
+  left out, with a marker; every character outside ASCII but letters, numbers,
+  punctuation and symbols (blanks other than the ASCII space, combining marks,
+  format, private-use and unassigned characters, lone surrogates, DEL, C1
+  controls, line and paragraph separators), and the letters and symbols that
+  look blank (Hangul fillers, the braille blank, variation selectors, the
+  musical null notehead), written
+  as their JSON escapes; and a run of more than 16 spaces, which could push
+  the rest of a command out of sight, shown as a marker (indentation stays
+  exact). Text that reads right to left (Hebrew, Arabic, Arabic-Indic digits)
+  is shown as it is but makes the preview inexact. JSON's own escapes (`\n`,
+  `\"`, `\u0001`) keep it exact. The worker cleans the preview once more and
+  keeps the hook's word that it is exact only if that changes nothing and
+  nothing in it reads right to left. A second hook for the same
+  prompt takes every reply away while it waits, and one with another preview
+  takes them away for good, so a command the session runs can block replies
+  but never approve a call. It gives Claude Code `allow`, or `deny` with the
+  message "The owner denied this from their phone or watch.", or nothing when
+  the prompt closes (an answer at the Mac; one while another prompt of the
+  same Claude Code process waits beside it keeps the hook waiting until its own
+  prompt closes, since which one was answered shows only on its own signal),
+  the session ends, the Claude Code process ends, replies or notices are
+  turned off (settings that cannot be read are not off: the hook keeps
+  waiting, and replies are refused until they read again), the wait passes
+  about 10 minutes or the worker is gone; in a session with the channel it
+  exits at once. A channel registration for an earlier Claude Code process with
+  the same PID (its start time differs from the hook's own Claude Code
+  process) is gone with that process. An allow counts as `applied` when the
+  session leaves `waiting` for `busy` within 2 seconds of the hook taking it.
+  Claude goes on after a hook's deny as after a Yes or a No at the Mac, so a
+  deny settles 3.5 seconds after it was handed over (the 2-second window below
+  and a 1.5-second grace), or 1.5 seconds after the session was first seen
+  leaving `waiting` if that is later: `applied` and
+  `answered_from_watch` when the session left `waiting` (for `busy` or `idle`)
+  within 2 seconds of the hand-over and no `PostToolUse` or
+  `PostToolUseFailure` of that call came meanwhile; `answered_on_mac` when that
+  call's signal came (the Mac's Yes won), the session never left `waiting` (the
+  next queued dialog showed at once) or left it later; `session_ended` when the
+  session ended first. Another call's signal, the turn's `Stop` and the
+  subagent's next call decide nothing. Until it settles, the denied prompt
+  counts as queued beside prompts recorded before its session left `waiting`,
+  never beside later ones. Known imprecision: a No at the Mac within 2 seconds
+  of the watch's Deny, or a Yes at the Mac whose call runs longer than the
+  grace, is credited to the watch.
+- A permission prompt in a session with the channel takes `deny`, and `allow`
+  while details are on (the phone then shows the call as Claude Code previews
+  it to the channel). It takes either only when the channel's request is
+  provably that very call:
   the same tool, the same input (the hook compares a digest of Claude Code's
   preview format, and only for a preview Claude Code did not cut, mask or
   normalize), within 5 seconds, and no other waiting prompt or request with
   the same preview. Anything else stays a notice, so Allow never approves a
-  call other than the one shown.
+  call other than the one shown. A call that may hold a credential (as above)
+  keeps the withheld line in place of the channel's preview and description,
+  and takes `deny` only.
 - A question takes `answer` while exactly one synchronous hook waits for that
-  very question (the one Claude Code ran with it), and only when every
-  question and option is sent whole (none past the caps, cut or cleaned to
-  nothing) while details are on. Any command a session runs can connect as a
-  question hook; it gains nothing (a second one only keeps the question from
-  taking an answer), and at most 4 wait per Claude Code process, so such
-  commands can also keep that process's questions from taking answers until
-  they leave. That hook
+  very question (the one Claude Code ran with it), details are on, the item
+  shows the questions that hook sent, and the hook says they are whole (none
+  past the caps, cut, changed by cleaning or masking, or with a character
+  written as its escape or reading right to left, a run of more than 16
+  spaces or tabs, mixed or not, or more than two line breaks in a row in a
+  question's text, with
+  `\r\n` one break, and breaks with only spaces or tabs between them in a row); a
+  notice's own word never makes a question answerable, and neither does an
+  older hook's `answerable` (the hook's word is now `whole`). A notice from an
+  older hook still running across an update is taken with its questions
+  cleaned again and its `answerable` dropped, and the worker masks the
+  `description` and `last_message` of every notice again. A notice
+  whose questions differ from its hook's, or two hooks with different
+  questions, leave the question without an answer for good, so a forged
+  notice can never relabel the options the hook answers by position. Any
+  command a session runs can connect as a question hook; it gains nothing (a
+  second one only keeps the question from taking an answer), and at most 4
+  wait per Claude Code process, so such commands can also keep that process's
+  questions from taking answers until they leave. A hook whose request would
+  not fit what the worker reads (64 KiB) sends nothing and leaves the dialog to
+  the owner. That hook
   (`openswap attention question`, a `PermissionRequest` hook on
   `AskUserQuestion` with a 600-second timeout) is installed in every managed
-  config home only while replies are on. It is served only in a session whose
-  Claude Code process holds a channel registration and whose session file
-  names its session; anywhere else it exits at once and leaves the dialog to
-  the owner. It gives Claude Code the chosen options, or nothing when the
-  question closes, the wait passes about 10 minutes or the worker is gone.
-- An idle session takes `message`, which arrives as a channel event the
+  config home only while replies are on. It is served only where its Claude
+  Code process's session file names its session, and either that process holds
+  a connected channel registration or none is registered and the session is in
+  Claude Desktop or a terminal; anywhere else it exits at once and leaves the
+  dialog to the owner. It gives Claude Code the chosen options, or nothing
+  when the question closes, the wait passes about 10 minutes or the worker is
+  gone.
+- An idle session with the channel takes `message`, which arrives as a channel event the
   channel's instructions describe as the owner's message from the paired
   device. It is handed over only while the session file says `idle` with no
   turn since the item opened: otherwise `refused` (the owner typed, a turn
   runs or a dialog waits). A turn that ends while the session stays idle (a
   background task's result) closes the item as `superseded` and opens a new
   one, which takes messages; a reply to the old one gets `item_closed`.
+- An idle session without the channel, in Claude Desktop or a terminal, takes
+  `message` while the session file says `idle` and the wake hook paired with
+  that Claude Code process's latest `Stop` waits. That hook (`openswap
+  attention wake`, a `Stop` hook with `asyncRewake` and a 3,660-second
+  timeout, matcher `""`) is installed with the question and permission hooks.
+  At every `Stop`, the woken turn's own included, it registers with the worker
+  and waits. It is served under the same checks as the other hooks (its command
+  line ends `attention wake`, it runs under a Claude Code process whose session
+  file names its session, on a surface that takes hook replies, with no channel
+  registered for that process). It pairs with the process's latest `Stop`,
+  whichever of the two reaches the worker first, when that `Stop` is dated
+  after the process's latest prompt, the hook registered within 5 seconds of
+  it, and the process of the hook's line that Claude Code started itself began
+  no earlier than the second before the one the `Stop` notice's own hook's line
+  began in (both read from `ps`, in whole seconds). When that launch can't be
+  read, that hook runs under another Claude Code process than the notice
+  names, or its line began more than 5 seconds before the `Stop`'s time (so it
+  is not that turn's own `Stop` hook), the hook must have begun no more than 2
+  seconds before the `Stop`'s time instead. So a session command started 2 s or more before the `Stop` (a
+  background task's shell, started during the turn) never pairs, unless a
+  forged `Stop` notice is used, dated near the command's own start, and no real
+  `Stop` comes later (the real one is suppressed, or the turn ended by Esc,
+  which runs no `Stop`); the forged notice, and any suppression, need a
+  hostile local process. These bounds hold when the `Stop` hook starts
+  promptly; one that takes about 4 to 5 seconds or more to start (counted in
+  whole seconds; a cold start under memory pressure) leaves that turn without
+  a typed-reply box. When two hooks qualify, neither pairs and the item
+  takes no `message`. A `Stop` older than the one recorded pairs nothing and
+  releases nothing. A newer `Stop` releases the hooks that can no longer pair;
+  the owner typing releases every hook of that process except one paired with
+  a `Stop` dated after the prompt (its notice came late). A process keeps at
+  most the paired hook and two others (a newcomer past that releases the
+  oldest of the others), and 32 wait in all, apart from the question and
+  permission hooks' places; past that a hook exits at once. What remains: a
+  command the session runs that starts less than 2 seconds before the `Stop`
+  and runs OpenSwap's wake command can pair and receive a typed reply meant
+  for that session (the same class as the channel's limit, mar3co/openswap#181);
+  it never approves anything. Given a message, the hook writes "Reply from the
+  owner's phone or watch:", a newline and the text, exactly, to Claude Code's
+  stderr and exits 2, which starts a turn with it in a task notification
+  (Claude Code shows it as "Stop hook feedback"). Its wrapper sends the
+  program's own stderr to `/dev/null` and turns only the program's own exit
+  status 90 into that exit 2, so an older or broken program never starts a
+  turn. The hook exits 0 and prints nothing otherwise: when the owner types at
+  the Mac (a slash command that starts no turn too; the idle item then closes
+  as `answered_on_mac`), the session ends, `/clear`s or its session file goes
+  away, its Claude Code process ends, a newer `Stop` or newcomer releases it
+  (above), replies or notices are turned off (unreadable settings keep it
+  waiting and refuse messages), the worker is gone (a worker restart ends
+  every wake hook, and an idle session takes no `message` until its next
+  turn's hook, mar3co/openswap#215), or an hour passes on the wall clock (a
+  Mac's sleep counts); never because no idle item is recorded yet, since a
+  terminal's comes a minute after its `Stop`. The worker stops offering and
+  handing over messages a minute before that hour, and the item then stays
+  open with no `message`.
+  A `message` whose text is blank once whitespace and byte order marks are
+  trimmed from its ends, is not strict UTF-8 (a lone surrogate) or holds
+  `</system-reminder>` is `refused`. One to an item after whose `Stop` a turn
+  began, shown by a prompt dated after that `Stop` or a `busy` status set
+  after it, gets `item_closed` (a newer `Stop` supersedes the item, as above;
+  a background subagent's dialog, `waiting`, is not a newer turn); one to an
+  item already holding a message is `refused`; the first `idle` after the
+  `Stop` belongs to the turn it ended, however late it is written.
+  A `message` handed to the hook is `sent`, and settles on the first decisive
+  signal: the woken turn's `UserPromptSubmit`, a `<task-notification>` prompt
+  dated at or after the hand-over holding that note line followed by the text
+  sent (up to the first `</system-reminder>` after it, with whitespace and
+  byte order marks trimmed from both ends; the hook sends the worker a digest
+  of it, never the text), makes it `applied` and closes the item as
+  `answered_from_watch`; a prompt the owner typed first closes it as
+  `answered_on_mac` and the reply stays
+  `sent` (a text already handed over then runs after the owner's turn); the
+  session ending or `/clear` first closes it as `session_ended`. The session
+  going `busy`, a background turn's prompt without the note and another turn's
+  `Stop` decide nothing: the item holds its message until its own turn shows.
+  The hold ends, and the reply stays `sent`, when a note-carrying prompt dated
+  after the hand-over names another text (the worker logs it; that turn's
+  `Stop` then supersedes the item, at once if it already came), or when no
+  matching prompt comes within the hour after the hand-over. When the woken
+  turn's `Stop` reached the worker before its prompt, the item that `Stop`
+  would have opened opens once the hold ends (in Claude Desktop, shown once it
+  has stayed idle a minute). After a worker restart between the hand-over and
+  the woken turn the reply stays `sent`; it is never handed over twice.
+- Any local process can forge hook notices for any session (session IDs are
+  readable from the session files). Typed replies accept what that allows,
+  none of which approves anything: blocking typed replies (forged prompts,
+  `SessionEnd` notices or a flood of `Stop` notices), a handed-over reply
+  settling `sent` instead of `applied` (a forged note-carrying prompt followed
+  by a `Stop`), a forged future-dated `Stop` keeping hooks from pairing for up
+  to an hour, and, with the real `Stop` notice suppressed, a forged `Stop`
+  letting such a process's own wake command pair and receive a typed reply
+  meant for that session, which it can then make read `applied` with a forged
+  prompt naming the text (mar3co/openswap#181).
 
 Before handing a verdict or an answer over, the worker reads the session file:
 a prompt that is no longer waiting was answered at the Mac (`item_closed`).
 It saves the record that the reply was handled first, and refuses the reply
 when that save fails; a reply arriving after the saved state had to be set
 aside at start is refused too. `sent` is reported only once the channel or
-the question hook took the reply; one that never got there (the hook left,
+the waiting hook took the reply; one that never got there (the hook left,
 the send failed) settles as `refused` (`item_closed` if the item closed) and
 the item takes a reply again. A reply a worker restart left between the two
 is never reported `refused` or `item_closed` (it may have landed), and its
@@ -1867,15 +2083,19 @@ call's `PostToolUse` or `PostToolUseFailure` after an allow (also when the
 turn's `Stop` or the subagent's `SubagentStop` comes first; without it the
 item closes 1.5 seconds later as `answered_on_mac`), the `Stop` that
 follows a channel deny (a "No" at the Mac fires none), a subagent's next call
-after a deny of its prompt, a `PostToolUse` carrying the chosen options, or
-the channel turn carrying the message's own token. Otherwise the item closes
+after a channel deny of its prompt, the end of a waiting hook's deny's grace
+without that call's own signal (above), a `PostToolUse` carrying the chosen
+options, the
+channel turn carrying the message's own token, or the woken turn's prompt
+carrying a wake hook's note and text (above). Otherwise the item closes
 with its usual reason and the reply stays `sent`.
 
 Always sent: the kind, the provider, a session label, the time and an opaque
 folder ID. With details on, also the folder's name (an approved Remote tasks
 folder's label is always sent), the tool name and, for `Bash`, the model's own
 description of the command (never the command itself; for a prompt that takes
-replies, Claude Code's own preview of the call, which shows the command), a question with its
+replies, the preview of the call, withheld for a call that may hold a
+credential), a question with its
 header and option labels, and the first 1,000 characters of the session's
 last message. Never sent: prompts the owner typed, transcripts, account data
 or a tool's raw input.

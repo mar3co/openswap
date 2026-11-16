@@ -20,7 +20,10 @@ from openswap import attention, channel
 from openswap.settings import AttentionSettings, configure_worker_service, update_worker_settings, \
     write_attention_settings
 from openswap.worker import channel_link, ipc, peers
-from openswap.worker.attention import SESSION_END_GRACE_SECONDS, AttentionStore, SessionRecord, validate_notice
+from openswap.worker.attention import (
+    HOOK_WAIT_SECONDS, SESSION_END_GRACE_SECONDS, AttentionStore, SessionRecord, questions_whole, shown_questions,
+    validate_notice,
+)
 from openswap.worker.peers import Process
 from openswap.worker.protocol import ProtocolError, attention_reply, attention_report
 from openswap.worker.refserver import ControlStore
@@ -117,11 +120,13 @@ class Env:
         self.clock.now = t + 7
         return next(i for i in self.store._items if i.created_at == t + 0.1)
 
-    def waiter(self, key=None):
-        """The question's synchronous hook, connected when its PermissionRequest ran."""
+    def waiter(self, questions=QUESTIONS):
+        """The question's synchronous hook, connected when its PermissionRequest ran, with
+        its own questions as the hook sends them."""
         now, self.clock.now = self.clock.now, self.asked
         try:
-            return self.store.question_waiter(CLAUDE, SESSION, key or attention.question_key({"questions": QUESTIONS}))
+            return self.store.waiter("question", CLAUDE, SESSION, attention.question_key({"questions": questions}),
+                                     shown=shown_questions(questions), whole=questions_whole(questions))
         finally:
             self.clock.now = now
 
@@ -468,7 +473,7 @@ def test_a_question_takes_answers_only_while_its_hook_waits_and_applies_the_matc
     waiter = env.waiter()
     assert env.actions(item) == ["answer"]
     env.reply(item.id, "answer", answers=[{"question": 0, "option": 1}])
-    assert waiter.done.is_set() and waiter.answers == [[0, 1]]
+    assert waiter.done.is_set() and waiter.result == [[0, 1]]
     assert env.outcomes() == {}  # "sent" only once the hook took it
     env.store.handed_over(waiter.reply_id)
     assert env.outcomes() == {"r1": "sent"} and env.link.sent == []
@@ -502,34 +507,36 @@ def test_an_answer_that_does_not_fit_the_question_is_refused(env, answers):
     assert not waiter.done.is_set() and env.outcomes() == {"r1": "refused"}
 
 
-def test_the_question_hook_is_served_only_in_its_own_channel_session(env):
+def test_the_question_hook_is_served_only_in_its_own_session(env):
     key = attention.question_key({"questions": QUESTIONS})
-    assert env.store.question_waiter(CLAUDE, OTHER, key) is None  # another session's hook
+    assert env.store.waiter("question", CLAUDE, OTHER, key) is None  # another session's hook
     stranger = Process(PID + 5, 1, "Fri Nov  6 13:00:00 2026", ("claude",))
-    assert env.store.question_waiter(stranger, SESSION, key) is None  # a Claude Code process with no channel
+    assert env.store.waiter("question", stranger, SESSION, key) is None  # a process with no session file here
     env.switches = AttentionSettings(notices=True, details=True, replies=False)
-    assert env.store.question_waiter(CLAUDE, SESSION, key) is None  # replies off
+    assert env.store.waiter("question", CLAUDE, SESSION, key) is None  # replies off
     env.switches = AttentionSettings(notices=True, details=True, replies=True)
-    assert env.store.question_waiter(CLAUDE, SESSION, key) is not None
+    assert env.store.waiter("question", CLAUDE, SESSION, key) is not None
 
 
 def test_a_waiting_question_hook_ends_when_its_question_closes_or_was_answered(env):
     key = attention.question_key({"questions": QUESTIONS})
-    waiter = env.store.question_waiter(CLAUDE, SESSION, key)
+    waiter = env.store.waiter("question", CLAUDE, SESSION, key)
     item = env.question()
     assert not env.store.waiter_over(waiter)
     env.store.notice(hook("PostToolUse", tool_name="AskUserQuestion", tool_input={"questions": QUESTIONS})
                      | env.at(1))
     assert item not in env.store._items and env.store.waiter_over(waiter)
-    # Never matched to an item (its notice was lost): it ends once the session stopped waiting.
-    lone = env.store.question_waiter(CLAUDE, SESSION, "f" * 32)
-    assert not env.store.waiter_over(lone)
+    # Never matched to an item (its notice was lost, or not recorded yet): it waits
+    # until its own bound, the session leaving ``waiting`` notwithstanding (fix round F5).
+    lone = env.store.waiter("question", CLAUDE, SESSION, "f" * 32)
     env.status("busy", env.clock.now + 1)
+    assert not env.store.waiter_over(lone)
+    env.clock.now += HOOK_WAIT_SECONDS
     assert env.store.waiter_over(lone)
 
 
 def test_a_waiting_question_hook_gives_up_before_its_own_timeout(env):
-    waiter = env.store.question_waiter(CLAUDE, SESSION, "f" * 32)
+    waiter = env.store.waiter("question", CLAUDE, SESSION, "f" * 32)
     env.clock.now += 589
     assert not env.store.waiter_over(waiter)
     env.clock.now += 1
@@ -576,7 +583,8 @@ def test_the_question_hook_prints_a_decision_only_for_a_fitting_answer(tmp_path,
     monkeypatch.setattr(sys, "stdout", out)
     assert attention.question_main(backup_root=root) == 0
     assert seen[0] == {"version": 1, "command": "question", "session_id": SESSION,
-                       "tool_key": attention.question_key(tool_input)}
+                       "tool_key": attention.question_key(tool_input), "questions": shown_questions(QUESTIONS),
+                       "whole": True}
     if printed:
         decision = json.loads(out.getvalue())["hookSpecificOutput"]["decision"]
         assert decision == {"behavior": "allow", "updatedInput": {**tool_input,
@@ -802,7 +810,7 @@ def test_a_hook_connection_never_receives_anything_but_an_acknowledgement(env, m
     monkeypatch.setattr(peers, "hook_claude", lambda pid: Process(4241, 1, "Fri Nov  6 13:00:00 2026", ("claude",)))
     channel_link.serve(env.store, connection, {"version": 1, "command": "question", "session_id": SESSION,
                                                "tool_key": "a" * 32}, threading.Event(), lambda: None)
-    assert json.loads(connection.out) == {"answers": None}  # a Claude Code process without a channel
+    assert json.loads(connection.out) == {"answers": None}  # a process with no session file here
 
 
 # --- the channel server -------------------------------------------------------------------
@@ -911,18 +919,18 @@ def test_the_launcher_says_plainly_when_managed_settings_turn_channels_off(tmp_p
     assert "turned Claude Code channels off" in capsys.readouterr().err
 
 
-def test_the_question_hook_is_installed_only_with_replies_and_removed_alone(tmp_path):
+def test_the_waiting_hooks_are_installed_only_with_replies_and_removed_alone(tmp_path):
     home = tmp_path / "home"
     home.mkdir()
     (home / "settings.json").write_text(json.dumps({"hooks": {"PermissionRequest": [
         {"matcher": "Bash", "hooks": [{"type": "command", "command": "mine"}]}]}}))
-    attention.set_hooks(home, "/usr/local/bin/openswap", question=True)
+    attention.set_hooks(home, "/usr/local/bin/openswap", replies=True)
     groups = json.loads((home / "settings.json").read_text())["hooks"]["PermissionRequest"]
-    question = [g for g in groups if g["matcher"] == "AskUserQuestion"]
-    assert question == [{"matcher": "AskUserQuestion", "hooks": [{
-        "type": "command", "command": attention.hook_command("question", "/usr/local/bin/openswap"),
-        "timeout": 600}]}]
-    attention.set_hooks(home, "/usr/local/bin/openswap", question=False)
+    waiting = [g for g in groups if "async" not in g["hooks"][0] and g["hooks"][0]["command"] != "mine"]
+    assert waiting == [{"matcher": matcher, "hooks": [{
+        "type": "command", "command": attention.hook_command(event, "/usr/local/bin/openswap"),
+        "timeout": 600}]} for matcher, event in (("AskUserQuestion", "question"), ("", "permission"))]
+    attention.set_hooks(home, "/usr/local/bin/openswap", replies=False)
     groups = json.loads((home / "settings.json").read_text())["hooks"]["PermissionRequest"]
     assert [g["matcher"] for g in groups] == ["Bash", ""]
     attention.set_hooks(home, None)
@@ -1133,8 +1141,8 @@ def test_a_verdict_while_another_prompt_waits_is_never_claimed(env):
 
 def test_an_answer_reaches_only_its_own_agents_question(env):
     key = attention.question_key({"questions": QUESTIONS})
-    first = env.store.question_waiter(CLAUDE, SESSION, key, "a1")
-    second = env.store.question_waiter(CLAUDE, SESSION, key, "a2")
+    first, second = (env.store.waiter("question", CLAUDE, SESSION, key, agent, shown=shown_questions(QUESTIONS),
+                                      whole=True) for agent in ("a1", "a2"))
     t = env.clock.now
     for agent, offset in (("a1", 0.1), ("a2", 0.2)):
         env.store.notice(hook("PermissionRequest", tool_name="AskUserQuestion", tool_input={"questions": QUESTIONS},
@@ -1237,7 +1245,7 @@ def test_a_question_that_cannot_be_shown_whole_takes_no_answer(env):
     env.store.notice(notice | {"at": t + 0.1})
     env.status("waiting", t + 0.05)
     env.store.notice(hook("Notification", notification_type="permission_prompt") | {"at": t + 6.1})
-    env.store.question_waiter(CLAUDE, SESSION, attention.question_key({"questions": partial}))
+    env.store.waiter("question", CLAUDE, SESSION, attention.question_key({"questions": partial}))
     [item] = env.store._items
     assert env.actions(item) == []
 
@@ -1289,7 +1297,7 @@ def test_q2_a_question_not_sent_whole_takes_no_answer(env, questions):
                      | {"at": t + 0.1})
     env.status("waiting", t + 0.05)
     env.store.notice(hook("Notification", notification_type="permission_prompt") | {"at": t + 6.1})
-    env.waiter(attention.question_key({"questions": questions}))
+    env.waiter(questions)
     [item] = env.store._items
     assert env.actions(item) == []
 
@@ -1413,12 +1421,12 @@ def test_q11_two_waiters_for_one_question_take_no_answer(env):
 def test_q11_a_waiter_from_another_occurrence_or_past_the_cap_is_not_used(env):
     item = env.question()
     env.clock.now, now = env.asked + 30, env.clock.now  # connected long after this question was asked
-    late = env.store.question_waiter(CLAUDE, SESSION, attention.question_key({"questions": QUESTIONS}))
+    late = env.store.waiter("question", CLAUDE, SESSION, attention.question_key({"questions": QUESTIONS}))
     env.clock.now = now
     assert late is not None and env.actions(item) == []
     for _ in range(3):
-        assert env.store.question_waiter(CLAUDE, SESSION, "f" * 32) is not None
-    assert env.store.question_waiter(CLAUDE, SESSION, "f" * 32) is None  # four per Claude Code process
+        assert env.store.waiter("question", CLAUDE, SESSION, "f" * 32) is not None
+    assert env.store.waiter("question", CLAUDE, SESSION, "f" * 32) is None  # four per Claude Code process
 
 
 def test_q11_only_openswaps_question_command_is_served(env, monkeypatch):
@@ -1427,8 +1435,8 @@ def test_q11_only_openswaps_question_command_is_served(env, monkeypatch):
     _running(monkeypatch, stranger)
     a, b = socket.socketpair()
     with a, b:
-        channel_link._serve_question(env.store, a, {"session_id": SESSION, "tool_key": "f" * 32},
-                                     threading.Event(), lambda: None)
+        channel_link._serve_waiter(env.store, a, {"session_id": SESSION, "tool_key": "f" * 32}, "question",
+                                   threading.Event(), lambda: None)
         assert json.loads(b.recv(4096)) == {"answers": None} and env.store._waiters == []
 
 

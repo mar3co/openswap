@@ -103,12 +103,12 @@ def closes(store):
 
 
 def test_hook_input_maps_to_its_notice_and_never_carries_raw_tool_input():
-    notice = permission(command="curl https://x?token=secret")
+    notice = permission(command="curl https://x?q=raw-input")
     assert notice["event"] == "PermissionRequest" and notice["tool_name"] == "Bash"
     assert notice["description"] == "Run the tests"
-    assert "secret" not in json.dumps(notice)
+    assert "raw-input" not in json.dumps(notice)
     assert len(notice["tool_key"]) == 32
-    assert post(command="curl https://x?token=secret")["tool_key"] == notice["tool_key"]
+    assert post(command="curl https://x?q=raw-input")["tool_key"] == notice["tool_key"]
     assert hook("Notification", notification_type="idle_prompt")["notification_type"] == "idle_prompt"
     stop = hook("Stop", last_assistant_message="Done.\x1b[31m\nAll green " + "x" * 2000)
     assert stop["last_message"].startswith("Done. [31m\nAll green") and len(stop["last_message"]) == 1000
@@ -731,6 +731,18 @@ def test_open_items_survive_a_restart_and_a_lost_file_reports_no_closes(tmp_path
     (tmp_path / "worker" / "attention.json").write_text("{torn")
     empty = AttentionStore(tmp_path, clock=clock)
     assert published(empty) == [] and closes(empty) == []
+
+
+def test_items_saved_by_a_build_whose_questions_said_answerable_still_load(tmp_path):
+    clock = Clock()
+    first = AttentionStore(tmp_path, clock=clock)
+    first.notice(notification("idle_prompt"))
+    [item] = published(first)
+    path = tmp_path / "worker" / "attention.json"
+    saved = json.loads(path.read_text())
+    saved["items"][0]["answerable"] = False
+    path.write_text(json.dumps(saved))
+    assert published(AttentionStore(tmp_path, clock=clock)) == [item]
 
 
 def test_notices_are_dropped_while_switched_off(tmp_path):
@@ -1631,7 +1643,10 @@ def test_settings_rows_show_the_switches_on_a_paired_mac():
                                                 "launcher": "/Apps/O S.app/Contents/MacOS/OpenSwap claude"}},
                                  enabled=True)
     assert rows[-1]["id"] == "remote_attention_replies_note"
-    assert "start Claude with /Apps/O S.app/Contents/MacOS/OpenSwap claude instead" in rows[-1]["label"]
+    assert rows[-1]["label"] == (
+        "Replies work in Claude Desktop and terminal sessions started after you turn this on; VS Code sessions show "
+        "notices only for now. Start Claude with /Apps/O S.app/Contents/MacOS/OpenSwap claude to have typed replies "
+        "arrive as your own message.")
 
 
 @pytest.mark.parametrize(("on_path", "launcher"), [
@@ -2693,7 +2708,8 @@ def test_review_the_question_hook_stops_waiting_once_claude_code_gave_up(tmp_pat
     monkeypatch.setattr(attention.os, "getppid", lambda: next(parents))
     started = time.monotonic()
     try:
-        assert attention._wait_for_answer(SESSION, "f" * 32, "", root) is None
+        assert attention._wait_for_worker({"command": "question", "session_id": SESSION, "tool_key": "f" * 32},
+                                         "answers", root) is None
     finally:
         server.close()
     assert time.monotonic() - started < 3

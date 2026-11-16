@@ -1,7 +1,7 @@
 """Which process is on the other end of the worker's socket, and what started it (plan 025 S2).
 
 Every process the owner runs can reach the socket, so a connection that
-receives anything back (an OpenSwap channel, a waiting question hook) is
+receives anything back (an OpenSwap channel, a waiting hook) is
 served only after its place in the process tree is checked.
 """
 
@@ -12,12 +12,14 @@ import struct
 import subprocess
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 SHELLS = frozenset({"sh", "bash", "zsh", "dash", "fish", "ksh", "mksh", "tcsh", "csh"})
 CHANNEL_NAME = "server:openswap"
 CHANNEL_FLAGS = ("--dangerously-load-development-channels", "--channels")
 PS_TIMEOUT_SECONDS = 1.0
+MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 
 
 @dataclass(frozen=True)
@@ -59,6 +61,18 @@ def process(pid: int) -> Process | None:
         return None
 
 
+def started_at(proc: Process) -> float | None:
+    """When ``proc`` began, in seconds since the epoch (whole seconds, as ``ps``
+    gives them); None when its start does not read as ``process`` writes it."""
+    try:
+        _, month, day, clock, year = proc.started.split()
+        hour, minute, second = clock.split(":")
+        return datetime(int(year), MONTHS.index(month) + 1, int(day), int(hour), int(minute), int(second),
+                        tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
 def names_channel(args: tuple[str, ...]) -> bool:
     """Whether Claude Code was started with OpenSwap's channel named on
     ``--dangerously-load-development-channels`` or ``--channels``."""
@@ -87,13 +101,22 @@ def is_shell(proc: Process) -> bool:
 
 
 def hook_claude(pid: int) -> Process | None:
-    """The Claude Code process a hook process runs under: its first ancestor
+    """The Claude Code process a hook process runs under (``hook_launch``). None when unknown."""
+    launch = hook_launch(pid)
+    return launch[0] if launch is not None else None
+
+
+def hook_launch(pid: int) -> tuple[Process, Process] | None:
+    """The Claude Code process a hook process runs under, its first ancestor
     that is not a shell (the hook's own wrapper, and a shell Claude Code ran
-    it through, sit in between). None when unknown."""
-    hook = process(pid)
-    ancestor = process(hook.ppid) if hook is not None else None
+    it through, sit in between), and the process of that line Claude Code
+    started itself. None when unknown."""
+    started = process(pid)
+    ancestor = process(started.ppid) if started is not None else None
     for _ in range(3):
-        if ancestor is None or not is_shell(ancestor):
-            return ancestor
-        ancestor = process(ancestor.ppid)
+        if ancestor is None:
+            return None
+        if not is_shell(ancestor):
+            return ancestor, started
+        started, ancestor = ancestor, process(ancestor.ppid)
     return None

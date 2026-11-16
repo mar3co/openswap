@@ -5,6 +5,8 @@
 launcher script at a fixed path). Both hand a *notice* to the local worker
 and exit within a second whatever happens, printing nothing: a hook's output
 could be read as a decision. Without a running worker the notice is dropped.
+The reply hooks (``question``, ``permission`` and ``wake``) wait for the
+owner's reply from the phone or watch instead, and give only that.
 
 The Claude Code hooks go into the ``settings.json`` of every config home
 OpenSwap manages (``~/.claude``, account session profiles and Claude Desktop
@@ -30,6 +32,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from openswap.exceptions import ConfigError
+from openswap.redact import PREVIEW_WITHHELD
 
 logger = logging.getLogger(__name__)
 
@@ -49,10 +52,25 @@ HOOK_EVENTS = {
     "SessionEnd": "",
 }
 HOOK_TIMEOUT_SECONDS = 10
-# The synchronous question hook (installed only while replies are on) waits up to
-# this long for an answer from the phone or watch; the worker ends its wait sooner.
+# The synchronous question and permission hooks (installed only while replies
+# are on) wait up to this long for a reply from the phone or watch; the worker
+# ends their wait sooner.
 QUESTION_EVENT = "question"
-QUESTION_TIMEOUT_SECONDS = 600
+PERMISSION_EVENT = "permission"
+REPLY_HOOK_TIMEOUT_SECONDS = 600
+DENY_MESSAGE = "The owner denied this from their phone or watch."
+# The Stop hook that starts a turn with a typed reply (asyncRewake), installed
+# with them. It waits R3's hour by the wall clock; Claude Code's timeout leaves a margin.
+WAKE_EVENT = "wake"
+WAKE_WAIT_SECONDS = 3600
+WAKE_HOOK_TIMEOUT_SECONDS = 3660
+WAKE_NOTE = "Reply from the owner's phone or watch:"
+# The wake hook's wrapper sends the program's own stderr to /dev/null and keeps
+# Claude Code's on this descriptor, so only the note and the text reach Claude.
+# It turns WAKE_STATUS, and nothing else, into the exit 2 that starts the turn:
+# an older or broken program's exit 2 and usage text never do.
+WAKE_FD = 3
+WAKE_STATUS = 90
 CHANNEL_COMMAND = "channel"
 
 
@@ -70,15 +88,20 @@ SESSION_COMMANDS = frozenset({"/clear", "/exit", "/quit"})
 def main(argv: list[str]) -> int:
     """``openswap attention <event>``: never raises, never prints, exits 0.
 
-    ``openswap attention channel`` is OpenSwap's channel (see ``openswap.channel``)
-    and ``openswap attention question`` the synchronous question hook, which
-    prints a decision when it has one."""
+    ``openswap attention channel`` is OpenSwap's channel (see ``openswap.channel``),
+    ``openswap attention question`` and ``openswap attention permission``
+    the synchronous hooks, which print a decision when they have one, and
+    ``openswap attention wake`` the hook that starts a turn with a typed reply."""
     if argv == [CHANNEL_COMMAND]:
         from openswap.channel import main as channel_main
 
         return channel_main()
     if argv == [QUESTION_EVENT]:
         return question_main()
+    if argv == [PERMISSION_EVENT]:
+        return permission_main()
+    if argv == [WAKE_EVENT]:
+        return wake_main()
     import signal
     import time
 
@@ -145,6 +168,67 @@ def channel_preview(tool_input: object) -> str | None:
     return preview if len(preview) <= PREVIEW_TOTAL_LIMIT else None
 
 
+# Each field a preview shows keeps at least this many characters, more than
+# its cut marker, so a cut field always shows one.
+PREVIEW_FIELD_MIN = 60
+
+
+def input_preview(tool_input: object) -> tuple[str, bool]:
+    """The call the permission hook waits for, as the phone and watch show it
+    before Allow (plan 028, R1a), and whether it shows the call exactly.
+
+    The form is Claude Code's channel form, ``{ "key": value, … }`` with each
+    value as JSON. It is exact when nothing in it differs from the call but
+    JSON's own escapes, and nothing in it reads right to left; anything else is
+    visible in it and makes it inexact: a field cut in its middle or left out,
+    with a marker; every character ``escape_hidden`` escapes, written as its
+    JSON escape; a run of more than 16 spaces, which could push the rest of a
+    command out of sight, as a marker. ("", False) for an input that is not an
+    object, is empty, or may hold a credential (``holds_credential``): its
+    preview is withheld."""
+    from openswap.redact import holds_credential
+    from openswap.worker.attention import SPACE_RUN, escape_hidden, reads_as_is
+    from openswap.worker.protocol import DETAIL_CAPS
+
+    if not isinstance(tool_input, dict) or not tool_input or holds_credential(tool_input):
+        return "", False
+    cap = DETAIL_CAPS["input_preview"]
+    fields = list(tool_input.items())
+    room = (cap - 4) // (PREVIEW_FIELD_MIN + 2)
+    entries = fields
+    if len(fields) > room:
+        # The first and last fields, and a marker for those left out between them.
+        shown = room - 1
+        entries = [*fields[:shown // 2], None, *fields[len(fields) - (shown - shown // 2):]]
+    share = (cap - 4 - 2 * (len(entries) - 1)) // len(entries)
+    exact, parts = entries is fields, []
+    for entry in entries:
+        if entry is None:
+            text = f"⋯ {len(fields) - len(entries) + 1} fields left out ⋯"
+        else:
+            key, value = entry
+            try:
+                raw = json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+            except (TypeError, ValueError, RecursionError):
+                raw = None
+            text = f"{json.dumps(key, ensure_ascii=False)}: " + ("(value unserializable)" if raw is None else raw)
+            exact = exact and raw is not None
+        shown = _middle_cut(SPACE_RUN.sub(lambda m: f" ⋯ {len(m[0])} spaces ⋯ ", escape_hidden(text)), share)
+        exact = exact and shown == text and reads_as_is(text)
+        parts.append(shown)
+    return "{ " + ", ".join(parts) + " }", exact
+
+
+def _middle_cut(text: str, limit: int) -> str:
+    """``text`` within ``limit`` characters, its middle left out when longer,
+    and a marker where it was: its start and end both show."""
+    if len(text) <= limit:
+        return text
+    marker = f" ⋯ {len(text)} characters, the middle left out ⋯ "
+    keep = limit - len(marker)
+    return text[:keep - keep // 2] + marker + text[len(text) - keep // 2:]
+
+
 def tool_key(tool_input: object) -> str:
     """A digest that matches a ``PermissionRequest`` to its ``PostToolUse``; the
     tool's input itself never leaves the hook."""
@@ -166,7 +250,8 @@ def _agent(data: dict) -> str:
 
 def _hook_notice(event: str, raw: bytes) -> dict | None:
     """The notice for one Claude Code hook input, or None when it is not one."""
-    from openswap.worker.attention import clean_questions, clean_text
+    from openswap.redact import holds_credential
+    from openswap.worker.attention import clean_text, masked_text
     from openswap.worker.protocol import DETAIL_CAPS
 
     try:
@@ -211,18 +296,16 @@ def _hook_notice(event: str, raw: bytes) -> dict | None:
                 notice["answers"] = positions
         if event == "PermissionRequest" and isinstance(tool_input, dict):
             if tool_name == "AskUserQuestion":
-                from openswap.worker.attention import questions_whole
+                from openswap.worker.attention import shown_questions
 
-                raw, questions = tool_input.get("questions"), clean_questions(tool_input.get("questions"))
-                # Shown only with every question; answerable only with every option whole too.
-                if isinstance(raw, list) and len(questions) == len(raw):
+                questions = shown_questions(tool_input.get("questions"))
+                if questions:
                     notice["questions"] = questions
-                    if questions_whole(raw):
-                        notice["answerable"] = True
+            elif holds_credential(tool_input):
+                notice["description"] = PREVIEW_WITHHELD
             elif tool_name == "Bash":
                 # The model's own words for the command, never the raw command.
-                description = clean_text(tool_input.get("description"), DETAIL_CAPS["description"],
-                                         multiline=True)
+                description = masked_text(tool_input.get("description"), DETAIL_CAPS["description"])
                 if description:
                     notice["description"] = description
     elif event == "Notification":
@@ -237,13 +320,29 @@ def _hook_notice(event: str, raw: bytes) -> dict | None:
                 notice["reply"] = token.group(1)
         elif prompt.startswith(TASK_TAG):
             notice["prompt_kind"] = "task"
+            from openswap.worker.attention import WOKEN_TAG, reply_key
+
+            text = _woken_text(prompt, "\n" + WOKEN_TAG)
+            if text is not None:
+                notice["reply"] = reply_key(text)  # names the text, never carries it
         elif prompt.strip().split(" ", 1)[0] in SESSION_COMMANDS:
             notice["prompt_kind"] = "end"
     elif event == "Stop":
-        message = clean_text(data.get("last_assistant_message"), DETAIL_CAPS["last_message"], multiline=True)
+        message = masked_text(data.get("last_assistant_message"), DETAIL_CAPS["last_message"])
         if message:
             notice["last_message"] = message
     return notice
+
+
+def _woken_text(prompt: str, end: str) -> str | None:
+    """The text a wake hook gave Claude Code, in the prompt of the turn it
+    started: after the note, up to the first ``end`` (how Claude Code closes
+    the hook's output there); None for a prompt without the note."""
+    start = prompt.find(WAKE_NOTE + "\n")
+    if start < 0:
+        return None
+    text = prompt[start + len(WAKE_NOTE) + 1:]
+    return text.split(end, 1)[0]
 
 
 _SHELLS = frozenset({"sh", "bash", "zsh", "dash", "fish", "ksh", "mksh", "tcsh", "csh"})
@@ -279,7 +378,8 @@ def _codex_notice(event: str, raw: bytes) -> dict | None:
     """The notice for one Codex hook input, or None when it is not one or is
     an approval no person is asked to give (``approval_policy = "never"``, or
     Codex's automatic reviewer deciding)."""
-    from openswap.worker.attention import clean_text, is_agent_id
+    from openswap.redact import holds_credential
+    from openswap.worker.attention import clean_text, is_agent_id, masked_text
     from openswap.worker.protocol import DETAIL_CAPS
 
     try:
@@ -308,14 +408,14 @@ def _codex_notice(event: str, raw: bytes) -> dict | None:
         if isinstance(tool_input, dict):
             notice["tool_key"] = tool_key({k: v for k, v in tool_input.items() if k != "description"})
             if event == "PermissionRequest":
-                description = clean_text(tool_input.get("description"), DETAIL_CAPS["description"],
-                                         multiline=True)
+                description = (PREVIEW_WITHHELD if holds_credential(tool_input)
+                               else masked_text(tool_input.get("description"), DETAIL_CAPS["description"]))
                 if description:
                     notice["description"] = description
         else:
             notice["tool_key"] = tool_key(tool_input)
     elif event == "Stop":
-        message = clean_text(data.get("last_assistant_message"), DETAIL_CAPS["last_message"], multiline=True)
+        message = masked_text(data.get("last_assistant_message"), DETAIL_CAPS["last_message"])
         if message:
             notice["last_message"] = message
     return notice
@@ -358,10 +458,11 @@ def question_main(*, backup_root: Path | None = None) -> int:
     """``openswap attention question``: the synchronous ``PermissionRequest`` hook
     on ``AskUserQuestion``, installed only while replies are on.
 
-    In a session with OpenSwap's channel it waits for the owner's answer from
-    the phone or watch and gives it to Claude Code; it prints nothing (leaving
-    the dialog to the owner) when the session has no channel, the question
-    closes, the wait passes 10 minutes or the worker is gone. Never raises."""
+    It sends the worker its questions as the phone and watch show them, and
+    whether they are whole, then waits for the owner's answer from the phone
+    or watch and gives it to Claude Code; it prints nothing (leaving the dialog
+    to the owner) when the worker serves no reply there, the question closes,
+    the wait passes 10 minutes or the worker is gone. Never raises."""
     try:
         data = json.loads(_read_stdin())
         if not isinstance(data, dict) or data.get("tool_name") != "AskUserQuestion":
@@ -369,7 +470,18 @@ def question_main(*, backup_root: Path | None = None) -> int:
         session, tool_input = data.get("session_id"), data.get("tool_input")
         if not isinstance(session, str) or not isinstance(tool_input, dict):
             return 0
-        positions = _wait_for_answer(session, question_key(tool_input), _agent(data), backup_root)
+        from openswap.worker.attention import questions_whole, shown_questions
+
+        request = {"command": QUESTION_EVENT, "session_id": session, "tool_key": question_key(tool_input)}
+        if _agent(data):
+            request["agent_id"] = _agent(data)
+        # The questions as the phone and watch show them: the item must show these very ones.
+        questions = shown_questions(tool_input.get("questions"))
+        if questions:
+            request["questions"] = questions
+            if questions_whole(tool_input.get("questions")):
+                request["whole"] = True
+        positions = _wait_for_worker(request, "answers", backup_root)
         answers = _answers(tool_input.get("questions"), positions)
         if answers:
             sys.stdout.write(json.dumps({"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": {
@@ -380,27 +492,107 @@ def question_main(*, backup_root: Path | None = None) -> int:
     return 0
 
 
-def _wait_for_answer(session: str, key: str, agent: str, backup_root: Path | None) -> object:
+def permission_main(*, backup_root: Path | None = None) -> int:
+    """``openswap attention permission``: the synchronous ``PermissionRequest``
+    hook on every tool but ``AskUserQuestion``, installed only while replies
+    are on (plan 028).
+
+    In a session without OpenSwap's channel it waits for the owner's Allow or
+    Deny from the phone or watch and gives it to Claude Code. It sends the
+    worker its own call's preview, which is what the phone and watch show
+    before Allow, and whether that shows the call exactly (only then can Allow
+    come); none for a call that may hold a credential. It prints nothing
+    (leaving the dialog to the owner) when the session has a channel or the
+    worker serves no reply there, the prompt closes, the wait passes 10 minutes
+    or the worker is gone. Never raises."""
+    try:
+        from openswap.worker.attention import QUESTION_TOOL, clean_text
+        from openswap.worker.protocol import DETAIL_CAPS
+
+        data = json.loads(_read_stdin())
+        if not isinstance(data, dict):
+            return 0
+        session, tool_input = data.get("session_id"), data.get("tool_input")
+        tool_name = clean_text(data.get("tool_name"), DETAIL_CAPS["tool_name"])
+        if not isinstance(session, str) or not session or not tool_name or tool_name == QUESTION_TOOL:
+            return 0
+        request = {"command": PERMISSION_EVENT, "session_id": session[:200], "tool_key": tool_key(tool_input),
+                   "tool_name": tool_name}
+        if _agent(data):
+            request["agent_id"] = _agent(data)
+        preview, exact = input_preview(tool_input)
+        if preview:
+            request["preview"] = preview
+            if exact:
+                request["exact"] = True
+        behavior = _wait_for_worker(request, "behavior", backup_root)
+        if behavior in ("allow", "deny"):
+            decision = {"behavior": behavior, **({"message": DENY_MESSAGE} if behavior == "deny" else {})}
+            sys.stdout.write(json.dumps({"hookSpecificOutput": {"hookEventName": "PermissionRequest",
+                                                                "decision": decision}}))
+            sys.stdout.flush()
+    except BaseException:  # noqa: BLE001 - a hook must never fail loudly
+        pass
+    return 0
+
+
+def wake_main(*, backup_root: Path | None = None) -> int:
+    """``openswap attention wake``: the ``Stop`` hook with ``asyncRewake``,
+    installed with the question and permission hooks only while replies are on
+    (plan 028).
+
+    At every ``Stop`` (the woken turn's own too) it waits for a typed reply to
+    the session from the phone or watch. Given one, it writes the note line, a
+    newline and the text to ``WAKE_FD`` and exits ``WAKE_STATUS``: the wrapper
+    turns that into the exit 2 that starts a turn with it. It exits 0 printing
+    nothing when the worker serves no reply there or releases it (the owner
+    typed, the session ended, replies turned off, a newer turn's hook took
+    over), the worker is gone, or the hour passes. Never raises."""
+    try:
+        data = json.loads(_read_stdin())
+        session = data.get("session_id") if isinstance(data, dict) else None
+        if not isinstance(session, str) or not session:
+            return 0
+        text = _wait_for_worker({"command": WAKE_EVENT, "session_id": session[:200]}, "message", backup_root,
+                                seconds=WAKE_WAIT_SECONDS, wall=True)
+        if not isinstance(text, str) or not text:
+            return 0
+        out = f"{WAKE_NOTE}\n{text}".encode()
+        while out:
+            out = out[os.write(WAKE_FD, out):]
+        return WAKE_STATUS
+    except BaseException:  # noqa: BLE001 - a hook must never fail loudly
+        return 0
+
+
+def _wait_for_worker(request: dict, field: str, backup_root: Path | None, *,
+                     seconds: float = REPLY_HOOK_TIMEOUT_SECONDS - 5, wall: bool = False) -> object:
+    """Send a waiting hook's ``request`` to the worker and wait for its one
+    reply; the reply's ``field``, or None when there is no worker, it went
+    away, Claude Code gave up on the hook, ``seconds`` passed (by the wall
+    clock with ``wall``, which a Mac's sleep does not stop), or the request is
+    past what the worker reads (then it is never sent)."""
     from openswap import paths
-    from openswap.worker.ipc import IPC_VERSION, socket_path
+    from openswap.worker.ipc import IPC_VERSION, MAX_REQUEST_BYTES, socket_path
 
     import time
 
+    encoded = json.dumps({"version": IPC_VERSION, **request}, ensure_ascii=False).encode()
+    if len(encoded) > MAX_REQUEST_BYTES:
+        return None
     path = socket_path(backup_root or paths.get_backup_root())
-    parent, deadline = os.getppid(), time.monotonic() + QUESTION_TIMEOUT_SECONDS - 5
+    clock = time.time if wall else time.monotonic
+    parent, deadline = os.getppid(), clock() + seconds
     line = b""
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
         client.settimeout(1.0)
         try:
             client.connect(str(path))
-            request = {"version": IPC_VERSION, "command": QUESTION_EVENT, "session_id": session, "tool_key": key}
-            if agent:
-                request["agent_id"] = agent
-            client.sendall(json.dumps(request).encode() + b"\n")
+            client.sendall(encoded + b"\n")
             while b"\n" not in line and len(line) <= 65536:
                 # Claude Code gave up on the hook (its wrapper was killed): stop waiting
-                # rather than take an answer nobody will read.
-                if os.getppid() != parent or time.monotonic() > deadline:
+                # rather than take a reply nobody will read.
+                if os.getppid() != parent or clock() > deadline:
                     return None
                 try:
                     chunk = client.recv(65536)
@@ -415,7 +607,7 @@ def _wait_for_answer(session: str, key: str, agent: str, backup_root: Path | Non
         answer = json.loads(line)
     except (ValueError, RecursionError):
         return None
-    return answer.get("answers") if isinstance(answer, dict) else None
+    return answer.get(field) if isinstance(answer, dict) else None
 
 
 def _answers(questions: object, positions: object) -> dict:
@@ -505,14 +697,16 @@ def claude_launcher() -> str:
 # nothing, so no Claude Code or Codex event ever fails or is blocked over it.
 HOOK_SHELL = "/bin/sh"
 HOOK_SCRIPT = 'command -v "$0" >/dev/null 2>&1 || exit 0; "$0" "$@" 2>/dev/null || exit 0'
+WAKE_SCRIPT = (f'command -v "$0" >/dev/null 2>&1 || exit 0; "$0" "$@" {WAKE_FD}>&2 2>/dev/null; '
+               f'[ $? -eq {WAKE_STATUS} ] && exit 2; exit 0')
 
 
-def _wrapped(*words: str) -> str:
-    return " ".join([HOOK_SHELL, "-c", shlex.quote(HOOK_SCRIPT), *(shlex.quote(w) for w in words)])
+def _wrapped(*words: str, script: str = HOOK_SCRIPT) -> str:
+    return " ".join([HOOK_SHELL, "-c", shlex.quote(script), *(shlex.quote(w) for w in words)])
 
 
 def hook_command(event: str, executable: str) -> str:
-    return _wrapped(executable, "attention", event)
+    return _wrapped(executable, "attention", event, script=WAKE_SCRIPT if event == WAKE_EVENT else HOOK_SCRIPT)
 
 
 def _hook_words(command: object) -> list[str]:
@@ -822,10 +1016,11 @@ def _settings_without_ours(settings: dict) -> dict:
     return result
 
 
-def _with_hooks(settings: dict, executable: str, *, question: bool = False) -> dict:
+def _with_hooks(settings: dict, executable: str, *, replies: bool = False) -> dict:
     """``settings`` with OpenSwap's hooks for ``executable``, and with
-    ``question`` the synchronous question hook too. Every other hook is kept
-    as written. Raises ConfigError for a ``hooks`` value this would have to overwrite."""
+    ``replies`` the synchronous question and permission hooks and the wake
+    hook too. Every other hook is kept as written. Raises ConfigError for a ``hooks`` value this would
+    have to overwrite."""
     hooks = settings.get("hooks", {})
     if not isinstance(hooks, dict) or any(not isinstance(hooks.get(e, []), list) for e in HOOK_EVENTS):
         raise ConfigError("Claude Code's hooks setting is not in the expected form; refusing to rewrite it")
@@ -836,19 +1031,29 @@ def _with_hooks(settings: dict, executable: str, *, question: bool = False) -> d
             "type": "command", "command": hook_command(event, executable),
             "async": True, "timeout": HOOK_TIMEOUT_SECONDS,
         }]})
-        if question and event == "PermissionRequest":
+        if replies and event == "PermissionRequest":
             groups.append({"matcher": "AskUserQuestion", "hooks": [{
                 "type": "command", "command": hook_command(QUESTION_EVENT, executable),
-                "timeout": QUESTION_TIMEOUT_SECONDS,
+                "timeout": REPLY_HOOK_TIMEOUT_SECONDS,
+            }]})
+            # Every tool: the hook itself leaves AskUserQuestion to the question hook.
+            groups.append({"matcher": "", "hooks": [{
+                "type": "command", "command": hook_command(PERMISSION_EVENT, executable),
+                "timeout": REPLY_HOOK_TIMEOUT_SECONDS,
+            }]})
+        if replies and event == "Stop":
+            groups.append({"matcher": "", "hooks": [{
+                "type": "command", "command": hook_command(WAKE_EVENT, executable),
+                "asyncRewake": True, "timeout": WAKE_HOOK_TIMEOUT_SECONDS,
             }]})
         hooks[event] = groups
     return {**settings, "hooks": hooks}
 
 
-def set_hooks(config_home: Path, executable: str | None, *, question: bool = False,
+def set_hooks(config_home: Path, executable: str | None, *, replies: bool = False,
               backup_root: Path | None = None) -> bool:
     """Install OpenSwap's hooks for ``executable`` in one config home (with
-    ``question``, the question hook too), recorded under ``backup_root``; or,
+    ``replies``, the question, permission and wake hooks too), recorded under ``backup_root``; or,
     with None, take them out of it (never deleting the file). Reads before
     writing: a settings file that cannot be read is left alone (ConfigError).
     Returns whether the file changed."""
@@ -856,7 +1061,7 @@ def set_hooks(config_home: Path, executable: str | None, *, question: bool = Fal
     if executable is None:
         return _strip_file(path, _settings_without_ours, None)
     settings = _read_document(path) or {}
-    updated = _with_hooks(settings, executable, question=question)
+    updated = _with_hooks(settings, executable, replies=replies)
     if updated == settings and (backup_root is None or str(path) in _record(backup_root)):
         return False
     _write_hooks_file(backup_root, path, updated)
@@ -892,7 +1097,7 @@ def profile_hooks(session_dir: Path, backup_root: Path) -> None:
         with _switch_lock(root, timeout=1):
             switches = load_attention_settings(root, strict=True)
             if switches.notices:
-                set_hooks(session_dir, program(), question=switches.replies, backup_root=root)
+                set_hooks(session_dir, program(), replies=switches.replies, backup_root=root)
     except Exception as exc:  # noqa: BLE001 - never in the way of starting a session
         logger.debug("Session hooks for %s left to the worker: %s", session_dir, exc)
 
@@ -1495,8 +1700,8 @@ def codex_hooks_status(codex_home: Path, backup_root: Path) -> str | None:
 
 def apply(backup_root: Path, enabled: bool, replies: bool = False, *, owner: bool = False,
           problems: list | None = None, notes: list | None = None) -> bool:
-    """Install the hooks in every managed config home (the question hook only
-    while ``replies`` too) and in the Codex home, or take them out of every
+    """Install the hooks in every managed config home (the question,
+    permission and wake hooks only while ``replies`` too) and in the Codex home, or take them out of every
     file OpenSwap ever put them in. Every place is tried; returns whether
     anything changed. What could not be changed goes into ``problems``, and
     what the owner should know into ``notes``, in words. ``owner`` is True for
@@ -1512,7 +1717,7 @@ def apply(backup_root: Path, enabled: bool, replies: bool = False, *, owner: boo
         homes_problems: list = []
         for home in config_homes(backup_root, homes_problems):
             try:
-                changed = set_hooks(home, executable, question=replies, backup_root=backup_root) or changed
+                changed = set_hooks(home, executable, replies=replies, backup_root=backup_root) or changed
             except (ConfigError, OSError) as exc:
                 problems.append(f"{home}: {exc}")
         problems.extend(homes_problems)
@@ -1584,7 +1789,8 @@ def set_notices(backup_root: Path, enabled: bool) -> list[str]:
 
 def set_replies(backup_root: Path, enabled: bool) -> list[str]:
     """Settings › Remote › "Allow replies from my phone and watch" (this Mac
-    only): the switch, then the question hook in every managed config home.
+    only): the switch, then the question, permission and wake hooks in every
+    managed config home.
     Not an owner's action for Codex: it never turns Codex's hooks feature on
     or moves the owner's Codex hooks."""
     from openswap import bundle
@@ -1594,7 +1800,7 @@ def set_replies(backup_root: Path, enabled: bool) -> list[str]:
         if load_attention_settings(backup_root).notices and bundle.runs_from_temporary_location():
             # Rewriting the hooks would name a path that disappears. Turning
             # replies off needs no hook change: the worker refuses them, and the
-            # question hook then exits at once until the next worker start.
+            # waiting hooks then exit at once until the next worker start.
             if enabled:
                 from openswap.exceptions import ClaudeSwitchError
                 from openswap.launch_agent import MOVE_TO_APPLICATIONS

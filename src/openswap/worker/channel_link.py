@@ -8,8 +8,13 @@ is served only after the peer's place in the process tree is checked:
   named and running from a managed config home; the first such channel of that
   process's life holds the registration. It relays permission prompts in and
   takes verdicts and messages out, one JSON object per line.
-- ``question``: the synchronous question hook of a session with a registered
-  channel. It gets one answer (option positions), or none, and ends.
+- ``question`` and ``permission``: a session's synchronous hook waiting for
+  the watch's reply to its own prompt (plan 028: in a session without a
+  channel, a permission's verdict too). It gets one reply (a question's option
+  positions, or ``allow`` or ``deny``), or none, and ends.
+- ``wake``: a session's wake hook, waiting since its turn's ``Stop`` for a
+  typed message to that session (plan 028, in a session without a channel).
+  It gets the message's text, or none, and ends.
 """
 
 from __future__ import annotations
@@ -23,6 +28,16 @@ from openswap.worker import peers
 
 LINE_LIMIT = 65536
 POLL_SECONDS = 0.5
+# Each waiting hook's request fields (required, optional), the field its reply
+# goes in, and the fields carrying its own prompt as shown and its word that
+# this is the prompt exactly or whole.
+WAITERS = {
+    "question": ({"version", "command", "session_id", "tool_key"}, {"agent_id", "questions", "whole"},
+                 "answers", "questions", "whole"),
+    "permission": ({"version", "command", "session_id", "tool_key", "tool_name"}, {"agent_id", "preview", "exact"},
+                   "behavior", "preview", "exact"),
+    "wake": ({"version", "command", "session_id"}, set(), "message", None, None),
+}
 
 
 class Link:
@@ -62,14 +77,15 @@ def _reply(connection: socket.socket, payload: dict) -> bool:
 
 
 def serve(store, connection: socket.socket, request: dict, stop_event: threading.Event, release) -> None:
-    """Serve one ``channel`` or ``question`` connection until it ends. Never raises.
-    ``release()`` frees the caller's short-request slot once the peer is accepted."""
+    """Serve one ``channel``, ``question``, ``permission`` or ``wake`` connection
+    until it ends. Never raises. ``release()`` frees the caller's short-request slot once
+    the peer is accepted."""
     try:
-        if request.get("command") == "channel" and set(request) == {"version", "command"}:
+        command = request.get("command")
+        if command == "channel" and set(request) == {"version", "command"}:
             _serve_channel(store, connection, stop_event, release)
-        elif request.get("command") == "question" and {"version", "command", "session_id", "tool_key"} <= set(
-                request) <= {"version", "command", "session_id", "tool_key", "agent_id"}:
-            _serve_question(store, connection, request, stop_event, release)
+        elif command in WAITERS and WAITERS[command][0] <= set(request) <= WAITERS[command][0] | WAITERS[command][1]:
+            _serve_waiter(store, connection, request, command, stop_event, release)
         else:
             _reply(connection, {"version": 1, "ok": False, "error": "unsupported_request"})
     except Exception:  # noqa: BLE001 - a local peer must never take the worker down
@@ -119,15 +135,29 @@ def _serve_channel(store, connection, stop_event, release) -> None:
         store.unregister_channel(claude.pid, link)
 
 
-def _serve_question(store, connection, request, stop_event, release) -> None:
+def _serve_waiter(store, connection, request, kind, stop_event, release) -> None:
     pid = peers.peer_pid(connection)
     hook = peers.process(pid)
-    # The session's own synchronous hook: OpenSwap's question command, under Claude Code.
-    claude = peers.hook_claude(pid) if hook is not None and hook.args[-2:] == ("attention", "question") else None
-    waiter = store.question_waiter(claude, request["session_id"], request["tool_key"],
-                                   request.get("agent_id", "")) if claude else None
+    _, _, field, shown, whole = WAITERS[kind]
+    # The session's own reply hook (question, permission or wake): OpenSwap's command for ``kind``,
+    # under Claude Code.
+    ours = hook is not None and hook.args[-2:] == ("attention", kind)
+    waiter = None
+    if ours and kind == "wake":
+        # Taken only when its launch is known: it takes a message only once paired with the turn's
+        # own Stop (``_paired``).
+        launch = peers.hook_launch(pid)
+        if launch is not None:
+            waiter = store.wake_waiter(launch[0], request["session_id"], peers.started_at(launch[1]))
+    elif ours:
+        claude = peers.hook_claude(pid)
+        extra = {"tool_name": request["tool_name"]} if kind == "permission" else {}
+        if claude is not None:
+            waiter = store.waiter(kind, claude, request["session_id"], request["tool_key"],
+                                  request.get("agent_id", ""), shown=request.get(shown),
+                                  whole=request.get(whole) is True, **extra)
     if waiter is None:
-        _reply(connection, {"answers": None})
+        _reply(connection, {field: None})
         return
     release()
     handed = False
@@ -138,8 +168,8 @@ def _serve_question(store, connection, request, stop_event, release) -> None:
             readable, _, _ = select.select([connection], [], [], 0)
             if readable and not connection.recv(1, socket.MSG_PEEK):
                 return  # the hook is gone (Claude Code moved on)
-        answers = waiter.answers if waiter.done.is_set() else None
-        if _reply(connection, {"answers": answers}) and answers is not None:
+        result = waiter.result if waiter.done.is_set() else None
+        if _reply(connection, {field: result}) and result is not None:
             handed = True
             store.handed_over(waiter.reply_id)
     except OSError:
