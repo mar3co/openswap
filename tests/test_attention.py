@@ -23,8 +23,8 @@ from openswap.settings import (
 )
 from openswap.worker import ipc
 from openswap.worker.attention import (
-    SESSION_END_GRACE_SECONDS, AttentionStore, Item, NoticeError, SessionRecord, approved_folder_label, read_records,
-    validate_notice,
+    IDLE_READ_SECONDS, SESSION_END_GRACE_SECONDS, AttentionStore, Item, NoticeError, SessionRecord,
+    approved_folder_label, idle_seconds_from, read_records, validate_notice,
 )
 from openswap.worker.protocol import MAX_BODY, ProtocolError, attention_report
 from openswap.worker.refserver import ControlStore
@@ -1626,7 +1626,8 @@ def test_attention_switches_default_off_and_fail_closed(tmp_path):
     raw = json.loads((tmp_path / "settings.json").read_text())
     raw["worker"]["attention"] = {"notices": "yes"}
     (tmp_path / "settings.json").write_text(json.dumps(raw))
-    assert load_attention_settings(tmp_path) == AttentionSettings(notices=False, details=False, readable=False)
+    assert load_attention_settings(tmp_path) == AttentionSettings(notices=False, details=False, away=False,
+                                                                  readable=False)
 
 
 def test_settings_rows_show_the_switches_on_a_paired_mac():
@@ -1635,7 +1636,8 @@ def test_settings_rows_show_the_switches_on_a_paired_mac():
     assert remote_attention_rows({}, enabled=True) == []
     rows = remote_attention_rows({"attention": {"notices": False, "details": True}}, enabled=True)
     assert [(r["id"], r.get("value"), r.get("disabled")) for r in rows[1:]] == [
-        ("remote_attention_notices", False, None), ("remote_attention_details", True, True),
+        ("remote_attention_notices", False, None), ("remote_attention_away", True, True),
+        ("remote_attention_details", True, True),
         ("remote_attention_replies", False, True)]
     rows = remote_attention_rows({"attention": {"notices": True, "details": True}}, enabled=False)
     assert rows[-1]["id"] == "remote_attention_note"
@@ -2972,7 +2974,7 @@ def test_f3_one_read_of_the_settings_decides_a_notice(tmp_path, monkeypatch):
         reads.append(1)
         if racing and len(reads) % 2:
             return AttentionSettings(notices=False, details=False, readable=False)
-        return AttentionSettings(notices=True)  # readable again by the next read
+        return AttentionSettings(notices=True, away=False)  # readable again by the next read
 
     monkeypatch.setattr(settings, "load_attention_settings", load)
     items = runtime._attention_store(tmp_path)
@@ -3073,3 +3075,175 @@ def test_f5_a_413_any_time_after_the_budget_came_back_shrinks_it_for_good(report
         report()
     assert shape.budget < REPORT_BUDGET
 
+
+
+# --- notices only while the owner is away from the Mac ----------------------------------
+
+
+class _Desk:
+    """This Mac's idle time as the worker reads it (None: unreadable), and the
+    owner's "Only when I'm away from this Mac" switch."""
+
+    def __init__(self):
+        self.idle, self.away, self.reads = 0.0, True, 0
+
+    def seconds(self):
+        self.reads += 1
+        return self.idle
+
+    def switches(self):
+        return AttentionSettings(notices=True, away=self.away)
+
+
+@pytest.fixture
+def desk(tmp_path):
+    clock, mac = Clock(), _Desk()
+    items = AttentionStore(tmp_path, clock=clock, switches=mac.switches, idle_seconds=mac.seconds,
+                           codex_answers=Answers())
+    return items, clock, mac
+
+
+def _prompt_due(items, clock):
+    items.notice(permission() | at(clock, 0))
+    clock.now += 6
+    items.notice(notification("permission_prompt"))
+
+
+def _codex_due(items, clock):
+    items.notice(codex_permission() | at(clock, 0))
+    wait(items, clock, 6)
+
+
+def _desktop_due(items, clock):
+    items.notice(desktop(hook("Stop", last_assistant_message="Done.")))
+    wait(items, clock, 60)
+
+
+DUE = {"prompt": _prompt_due, "codex": _codex_due, "desktop": _desktop_due}
+
+
+@pytest.mark.parametrize("due", DUE)
+def test_away_an_item_due_while_the_owner_is_at_the_mac_waits_for_a_minute_without_input(desk, due):
+    items, clock, mac = desk
+    mac.idle = 59
+    DUE[due](items, clock)
+    wait(items, clock, 30)
+    assert published(items) == []
+    mac.idle = 60
+    wait(items, clock, IDLE_READ_SECONDS)
+    assert len(published(items)) == 1
+
+
+@pytest.mark.parametrize(("due", "answer"), [
+    ("prompt", lambda items, clock: items.observe(record("busy", clock.now + 1), True)),
+    ("codex", lambda items, clock: items.notice(codex("Interrupt", turn_id="t1") | at(clock, 1))),
+    ("desktop", lambda items, clock: items.notice(desktop(hook("UserPromptSubmit", prompt="next")) | at(clock, 1))),
+])
+def test_away_an_item_answered_at_the_mac_before_the_owner_leaves_never_reaches_the_phone(desk, due, answer):
+    items, clock, mac = desk
+    DUE[due](items, clock)
+    answer(items, clock)
+    mac.idle = 120
+    wait(items, clock, 10)
+    assert published(items) == [] and closes(items) == [] and items._items == []
+
+
+@pytest.mark.parametrize("due", DUE)
+def test_away_an_owner_already_away_gets_the_item_at_todays_timing(desk, due):
+    items, clock, mac = desk
+    mac.idle = 600
+    DUE[due](items, clock)
+    assert len(published(items)) == 1
+
+
+@pytest.mark.parametrize("due", DUE)
+def test_away_with_the_switch_off_items_go_at_todays_timing_and_the_idle_time_is_never_read(desk, due):
+    items, clock, mac = desk
+    mac.away = False
+    DUE[due](items, clock)
+    assert len(published(items)) == 1 and mac.reads == 0
+
+
+def test_away_an_idle_time_that_cannot_be_read_counts_as_away(desk):
+    items, clock, mac = desk
+    mac.idle = None
+    _prompt_due(items, clock)
+    assert len(published(items)) == 1
+
+
+def test_away_a_held_desktop_turn_is_replaced_by_a_later_turn_and_goes_once(desk):
+    items, clock, mac = desk
+    _desktop_due(items, clock)
+    items.notice(desktop(hook("UserPromptSubmit", prompt="<task-notification>\n<task-id>x</task-id>"))
+                 | at(clock, 1))
+    items.notice(desktop(hook("Stop", last_assistant_message="Result is 42.")) | at(clock, 2))
+    wait(items, clock, 61)
+    assert published(items) == [] and len(items._items) == 1
+    mac.idle = 60
+    wait(items, clock, IDLE_READ_SECONDS)
+    [item] = published(items)
+    assert item["detail"] == {"last_message": "Result is 42."} and closes(items) == []
+
+
+def test_away_items_held_for_the_owner_survive_a_restart(desk, tmp_path):
+    items, clock, mac = desk
+    _prompt_due(items, clock)
+    assert published(items) == []
+    again = AttentionStore(tmp_path, clock=clock, switches=mac.switches, idle_seconds=mac.seconds)
+    mac.idle = 60
+    again.tick()
+    assert len(published(again)) == 1
+
+
+def test_away_the_idle_time_is_read_only_while_an_item_waits_and_at_most_every_few_seconds(desk):
+    items, clock, mac = desk
+    for _ in range(20):
+        wait(items, clock, 0.5)
+    assert mac.reads == 0
+    items.notice(codex_permission() | at(clock, 0))
+    for _ in range(40):
+        wait(items, clock, 0.5)
+    assert 1 <= mac.reads <= 20 / IDLE_READ_SECONDS + 1
+
+
+@pytest.mark.parametrize(("output", "seconds"), [
+    ('    | |     "HIDIdleTime" = 1978261334666\n', 1978.261334666),
+    ('  "HIDIdleTime" = 0\n', 0.0),
+    ('  "HIDIdleTime" = <00000000>\n', None),
+    ("", None),
+])
+def test_away_the_idle_time_reads_from_ioregs_hid_idle_time(output, seconds):
+    assert idle_seconds_from(output) == seconds
+
+
+def test_away_switch_is_on_by_default_and_written_only_once_turned_off(tmp_path):
+    def saved():
+        return json.loads((tmp_path / "settings.json").read_text())["worker"]["attention"]
+
+    write_attention_settings(tmp_path, notices=True)
+    assert "away" not in saved() and load_attention_settings(tmp_path).away is True
+    write_attention_settings(tmp_path, away=False)
+    assert saved()["away"] is False and load_attention_settings(tmp_path).away is False
+    write_attention_settings(tmp_path, away=True)
+    assert load_attention_settings(tmp_path).away is True
+    raw = json.loads((tmp_path / "settings.json").read_text())
+    raw["worker"]["attention"]["away"] = "no"
+    (tmp_path / "settings.json").write_text(json.dumps(raw))
+    assert load_attention_settings(tmp_path).readable is False
+
+
+def test_away_settings_row_follows_the_notices_switch_and_explains_the_wait():
+    from openswap.menubar_display import REMOTE_ATTENTION_AWAY, remote_attention_rows
+
+    rows = remote_attention_rows({"attention": {"notices": True, "away": True}}, enabled=True)
+    assert [r["id"] for r in rows[1:3]] == ["remote_attention_notices", "remote_attention_away"]
+    assert (rows[2]["label"], rows[2]["value"], rows[2]["disabled"]) == (
+        "Only when I'm away from this Mac", True, False)
+    assert {"id": "remote_attention_away_note", "label": REMOTE_ATTENTION_AWAY}.items() <= next(
+        r for r in rows if r["id"] == "remote_attention_away_note").items()
+    assert REMOTE_ATTENTION_AWAY == ("Notices wait until this Mac has had no keyboard or mouse input for a "
+                                     "minute.")
+    for switches in ({"notices": True, "away": False}, {"notices": False, "away": True}):
+        rows = remote_attention_rows({"attention": switches}, enabled=True)
+        assert not any(r["id"] == "remote_attention_away_note" for r in rows)
+    assert rows[2]["disabled"] is True

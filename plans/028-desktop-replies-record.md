@@ -610,3 +610,14 @@ union verified, linear time). Minors:
   later. From here, every further preview or masking miss becomes a tracked
   issue with no fix round in this PR. Only a way to get a hidden command
   allowed (code the watch doesn't show) reopens the code.
+- **2026-11-15, notices only while away (owner, in this session; picks "Only
+  when I'm away (Recommended)", "1 minute (Recommended)", "On by default, with
+  a toggle (Recommended)").** The owner got a phone notice for every session
+  while working at the Mac. Every notice now waits until the Mac has had no
+  keyboard or mouse input for 60 seconds. Anything answered at the Mac before
+  then never reaches the phone. Settings › Remote › Sessions gets "Only when
+  I'm away from this Mac", on by default; turning it off restores the earlier
+  timing. The wait is fixed. This supersedes publishing a prompt at Claude
+  Code's 6-second `permission_prompt` while the owner is at the Mac. The 0.4.3
+  release waits for this change, since #209 also publishes Desktop finished
+  turns.

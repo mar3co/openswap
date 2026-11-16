@@ -10,9 +10,12 @@ Code itself decides the owner seems away (its ``permission_prompt`` and
 ``idle_prompt`` notifications; ``permission_prompt`` fires for questions too).
 Codex has no such notification: its approval is published after the same six
 seconds, and its finished turn after Claude Code's 60-second idle wait, each
-only if nothing on the thread has answered it by then. Every item gets a
-fresh random ID that is never reused. Open items are kept in a private file
-under the backup root so they survive a worker restart.
+only if nothing on the thread has answered it by then. With the owner's
+"Only when I'm away from this Mac" on, an item due while the Mac has had
+keyboard or mouse input within ``AWAY_SECONDS`` is held until it has had none
+for that long; one answered at the Mac meanwhile is never published. Every
+item gets a fresh random ID that is never reused. Open items are kept in a
+private file under the backup root so they survive a worker restart.
 
 A "No" or Esc at the Mac fires no hook, so the worker also reads each
 session's ``sessions/{pid}.json`` (``status`` and ``statusUpdatedAt``) in every
@@ -39,6 +42,8 @@ import os
 import re
 import secrets
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -157,6 +162,12 @@ WOKEN_TAG = "</system-reminder>"
 ACK_RETRY_SECONDS = 60.0
 MAX_REQUESTS = 50
 MAX_INCOMING = 100
+# The owner is away from this Mac after this long without keyboard or mouse input.
+AWAY_SECONDS = 60.0
+# This Mac's idle time (``ioreg``) is read at most this often, and only while an item may be published.
+IDLE_READ_SECONDS = 5.0
+IDLE_READ_TIMEOUT_SECONDS = 2.0
+_HID_IDLE = re.compile(r'"HIDIdleTime" = (\d+)$', re.MULTILINE)
 
 
 class NoticeError(ValueError):
@@ -694,6 +705,25 @@ def _withheld(item: Item) -> bool:
 _LSTART = re.compile(r"(Mon|Tue|Wed|Thu|Fri|Sat|Sun) [A-Z][a-z]{2} \d{1,2} \d\d:\d\d:\d\d \d{4}")
 
 
+def idle_seconds_from(output: str) -> float | None:
+    """Seconds since the last keyboard or mouse input, from ``ioreg -c IOHIDSystem``'s
+    ``HIDIdleTime`` (nanoseconds); None when it does not say."""
+    match = _HID_IDLE.search(output)
+    return int(match.group(1)) / 1e9 if match else None
+
+
+def read_idle_seconds() -> float | None:
+    """Seconds since this Mac's last keyboard or mouse input; None when it cannot be read."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        return idle_seconds_from(subprocess.run(["/usr/sbin/ioreg", "-c", "IOHIDSystem", "-d", "4"],
+                                                capture_output=True, text=True, errors="replace",
+                                                timeout=IDLE_READ_TIMEOUT_SECONDS).stdout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
 def _session_record(data: dict, session: str, pid: int) -> SessionRecord:
     at, waiting, started = data.get("statusUpdatedAt"), data.get("waitingFor"), data.get("procStart")
     started = " ".join(started.split()) if isinstance(started, str) else ""
@@ -731,7 +761,7 @@ class AttentionStore:
     """
 
     def __init__(self, backup_root: Path, *, clock=time.time, enabled=None, records=None, codex_answers=None,
-                 switches=None, homes=None, install=None):
+                 switches=None, homes=None, install=None, idle_seconds=None):
         self.backup_root = Path(backup_root)
         self.path = self.backup_root / STATE_FILE
         self.clock = clock
@@ -795,7 +825,14 @@ class AttentionStore:
         self._reported = False  # a report was accepted since this start
         self._inflight: dict[str, str] = {}  # reply ID -> item ID, marked sent but not yet handed over
         self._unknown: set[str] = set()  # items with a reply whose hand-over a restart left unknown
-        self._held: set[str] = set()  # Claude items to publish once the settings read again
+        # Items ready to publish but held: until the settings read again, or, with
+        # ``away`` on, until the owner has been away from this Mac (``_owner_present``).
+        self._held: set[str] = set()
+        # ``idle_seconds()``: seconds since this Mac's last input, None when unreadable;
+        # without it nothing waits for the owner to leave.
+        self._idle_seconds = idle_seconds
+        self._away_only = True  # the ``away`` switch as last read
+        self._presence = (-math.inf, True)  # (when read, by ``clock``; whether the owner was at this Mac)
         self._reset_until = 0.0  # replies may predate a set-aside state until then (by ``clock``)
         self._seen: dict[str, dict[int, float]] = {}  # session -> process (0: unknown) -> when last seen
         self._install = install  # puts hooks into config homes created since; returns problems
@@ -1055,7 +1092,8 @@ class AttentionStore:
 
         Dropped while notices are off. While the settings cannot be read it is
         applied, but nothing new is published until they read again (an item
-        replacing one the phone shows is). A ``permission_prompt`` is applied
+        replacing one the phone shows is); while the owner is at this Mac
+        (``_owner_present``), until they leave. A ``permission_prompt`` is applied
         against a fresh read of the session files, so only a prompt still
         waiting is published."""
         if not self._ensure_ready():
@@ -1072,23 +1110,53 @@ class AttentionStore:
         if notice.get("event") == "Notification" or (notice.get("provider") == "claude" and any(
                 i.session == notice.get("session_id") for i in self._items if i.id in self._sent)):
             self.refresh(for_notice=True)
+        if notice.get("event") == "Notification":
+            self._check_presence()
         with self._lock:
             if self._apply(notice, publishes, launched):
                 self._commit()
 
     def _shown(self, item: Item) -> bool:
-        """Published, or held only until the settings read again."""
+        """Published, or ready and held (``_held``): for the settings to read
+        again, or for the owner to leave this Mac."""
         return item.published or item.id in self._held
 
     def _publish(self, item: Item, publishes: bool) -> None:
-        if publishes:
+        if publishes and not self._owner_present():
             item.published = True
         else:
             self._held.add(item.id)
 
+    def _check_presence(self) -> None:
+        """Outside the lock (it may run ``ioreg``): read the ``away`` switch, and
+        with it on, whether the owner is at this Mac, at most every
+        ``IDLE_READ_SECONDS``. An idle time that cannot be read counts as away."""
+        if self._idle_seconds is None:
+            return
+        switches = self.switches()
+        self._away_only = switches.away or not switches.readable
+        now = self.clock()
+        if not self._away_only or 0 <= now - self._presence[0] < IDLE_READ_SECONDS:
+            return
+        idle = self._idle_seconds()
+        if idle is None:
+            log_limited("idle_unreadable", "This Mac's idle time cannot be read; session notices go out as if "
+                        "the owner were away")
+        self._presence = (now, idle is not None and idle < AWAY_SECONDS)
+
+    def _owner_present(self) -> bool:
+        """Whether a ready item waits for the owner to leave this Mac: ``away`` is
+        on and the latest read (``_check_presence``) found input within
+        ``AWAY_SECONDS``, or is older than ``IDLE_READ_SECONDS``."""
+        if self._idle_seconds is None or not self._away_only:
+            return False
+        at, present = self._presence
+        return present or not 0 <= self.clock() - at < IDLE_READ_SECONDS
+
     def _apply(self, notice: dict, publishes: bool, launched: float | None = None) -> bool:
-        """One notice; without ``publishes``, what it would publish is held
-        (``_held``) until the settings read again."""
+        """One notice; what it would publish is held (``_held``) without
+        ``publishes`` until the settings read again, and while the owner is at
+        this Mac until they leave."""
         if notice["provider"] == "codex":
             return self._apply_codex(notice, publishes)
         event, session, at = notice["event"], notice["session_id"], self._at(notice)
@@ -1562,10 +1630,13 @@ class AttentionStore:
     def tick(self) -> None:
         """Close the answers whose grace has passed; end the Codex items whose
         process ended, expire old ones and publish those still open after
-        their wait. Replies or notices turned off release every waiting hook,
-        without a reply."""
+        their wait, or hold them while the owner is at this Mac. Replies or
+        notices turned off release every waiting hook, without a reply."""
         with self._lock:
             waiting = [w for w in self._waiters + self._wakers if not w.done.is_set()]
+            unpublished = any(not i.published for i in self._items)
+        if unpublished:
+            self._check_presence()
         if waiting:
             switches = self.switches()
             # Unreadable is not off: the hooks wait, and the gate refuses replies meanwhile.
@@ -1594,18 +1665,23 @@ class AttentionStore:
             changed = self._close(ended, "session_ended") or changed
             expired = [i for i in codex if i not in ended and now - i.created_at >= CODEX_ITEM_SECONDS]
             changed = self._close(expired, "expired") or changed
-            waited = [i for i in self._items if i.provider == "codex" and not i.published and now - i.created_at >= (
-                CODEX_FINISHED_SECONDS if i.kind == "finished" else CODEX_PROMPT_SECONDS)]
+            waited = [i for i in self._items if i.provider == "codex" and not self._shown(i)
+                      and now - i.created_at >= (CODEX_FINISHED_SECONDS if i.kind == "finished"
+                                                 else CODEX_PROMPT_SECONDS)]
             waited += [i for i in self._items if i.provider == "claude" and i.kind == "idle" and not self._shown(i)
                        and now - i.created_at >= IDLE_NOTICE_SECONDS and self._still_idle(i)]
             # A held prompt already answered at the Mac (awaiting its close) never goes.
             held = [i for i in self._items if i.id in self._held and i.id not in self._due]
             # Nothing new goes while the settings cannot be read.
             if (waited or held) and self.enabled() is True:
-                for item in waited + held:
-                    item.published = True
-                    self._held.discard(item.id)
-                changed = True
+                if self._owner_present():
+                    self._held.update(i.id for i in waited)
+                    changed = changed or bool(waited)
+                else:
+                    for item in waited + held:
+                        item.published = True
+                        self._held.discard(item.id)
+                    changed = True
             if changed:
                 self._commit()
 
