@@ -19,6 +19,7 @@ opensoft.me/swap/changelog shows this file.
 
 ### Improved
 
+- While you're at your Mac, sessions no longer ping your iPhone and Apple Watch: questions and permission prompts wait until you've been away for a minute, and a session that finishes while you're there isn't sent. Turn off Settings › Remote › Sessions › Only when I'm away from this Mac to get every notice right away.
 - When a waiting tool call may contain a password, key or token, your iPhone and Apple Watch now show "Preview withheld" and offer Deny only, and keys and tokens in Claude's messages and questions show as [REDACTED]. This applies to every session, including ones started with `openswap claude`.
 
 ### Fixed

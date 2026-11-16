@@ -753,6 +753,8 @@ def remote_folder_rows(worker_status: dict) -> list[dict]:
 
 
 REMOTE_ATTENTION_NEEDS_WORKER = "Notices are sent while the local worker is on."
+REMOTE_ATTENTION_AWAY = ("Questions and permission prompts wait until this Mac has had no keyboard or mouse input "
+                         "for a minute. A session that finishes while you're here isn't sent.")
 REMOTE_ATTENTION_UNREADABLE = ("OpenSwap can't read its settings file, so these switches show as off and sessions "
                                "send nothing new until it can.")
 REMOTE_ATTENTION_MISSING = ("Some session hooks run {program}, which is gone{more}; sessions skip them quietly. "
@@ -778,28 +780,37 @@ REMOTE_REPLIES_HOW = ("Replies work in Claude Desktop and terminal sessions star
 
 
 def remote_attention_rows(worker_status: dict, *, enabled: bool) -> list[dict]:
-    """Settings › Remote › Sessions: the two session attention switches (shown on a
+    """Settings › Remote › Sessions: the session attention switches (shown on a
     paired Mac, and on an unpaired one while notices are on so they can be turned off).
 
-    ``worker_status["attention"]`` is ``{"notices": bool, "details": bool, "replies": bool}``
-    as read from settings, plus ``codex``, Codex's state for OpenSwap's hooks
-    (None without Codex), and ``launcher``, the ``openswap claude`` command
-    line; no rows until it is known.
+    ``worker_status["attention"]`` holds ``notices``, ``away``, ``details`` and
+    ``replies`` as read from settings, and ``readable``, False when they could
+    not be read; plus ``codex``, Codex's state for OpenSwap's hooks (None
+    without Codex), ``launcher``, the ``openswap claude`` command line,
+    ``missing``, programs the session hooks run that are gone, ``others``,
+    another OpenSwap copy's hook launchers in the same files, and
+    ``problems``, what keeps notices or replies from working. No rows until
+    it is known.
     """
     switches = worker_status.get("attention")
     if not isinstance(switches, dict):
         return []
     notices = switches.get("notices") is True
+    away = switches.get("away", True) is True
     rows = [
         _section_row("group_remote_attention", "Sessions"),
         {"kind": "toggle", "section": SETTINGS_SECTION_REMOTE, "id": "remote_attention_notices",
          "label": "Tell me when a session needs me", "value": notices},
+        {"kind": "toggle", "section": SETTINGS_SECTION_REMOTE, "id": "remote_attention_away",
+         "label": "Only when I'm away from this Mac", "value": away, "disabled": not notices},
         {"kind": "toggle", "section": SETTINGS_SECTION_REMOTE, "id": "remote_attention_details",
          "label": "Send details", "value": switches.get("details") is True, "disabled": not notices},
         {"kind": "toggle", "section": SETTINGS_SECTION_REMOTE, "id": "remote_attention_replies",
          "label": "Allow replies from my phone and watch", "value": switches.get("replies") is True,
          "disabled": not notices},
     ]
+    if notices and away:
+        rows.append(_remote_hint("remote_attention_away_note", REMOTE_ATTENTION_AWAY))
     if notices and not enabled:
         rows.append(_remote_hint("remote_attention_note", REMOTE_ATTENTION_NEEDS_WORKER))
     if switches.get("readable") is False:

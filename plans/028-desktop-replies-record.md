@@ -610,3 +610,60 @@ union verified, linear time). Minors:
   later. From here, every further preview or masking miss becomes a tracked
   issue with no fix round in this PR. Only a way to get a hidden command
   allowed (code the watch doesn't show) reopens the code.
+- **2026-11-15, notices only while away (owner, in this session; picks "Only
+  when I'm away (Recommended)", "1 minute (Recommended)", "On by default, with
+  a toggle (Recommended)").** The owner got a phone notice for every session
+  while working at the Mac. Every notice now waits until the Mac has had no
+  keyboard or mouse input for 60 seconds. Anything answered at the Mac before
+  then never reaches the phone. Settings › Remote › Sessions gets "Only when
+  I'm away from this Mac", on by default; turning it off restores the earlier
+  timing. The wait is fixed. This supersedes publishing a prompt at Claude
+  Code's 6-second `permission_prompt` while the owner is at the Mac. The 0.4.3
+  release waits for this change, since #209 also publishes Desktop finished
+  turns.
+- **Review of 6fecf7d (cold + silent-failure, Opus).** Three Important
+  findings:
+  - finished and idle items held while the owner was at the Mac went out
+    hours later in a burst;
+  - an `_idle_again` replacement published at once while the owner was at
+    the Mac;
+  - a held idle item was released without re-checking `_still_idle`.
+
+  The ruling below covers all three. A notice held forever under synthetic
+  input (a mouse jiggler) is filed as mar3co/openswap#223. During this review a
+  probe that imported `tests.test_attention` outside pytest skipped conftest
+  and overwrote the owner's real `~/.claude/settings.json` and Desktop
+  profiles. It was restored with the owner, and the hardening is filed as
+  mar3co/openswap#222. The implementer's suggestion of an in-process
+  CoreGraphics call instead of `ioreg` was declined: `ioreg` is the verified
+  path, and it runs at most every 5 s, only while something is held.
+- **2026-11-15, finished turns while at the Mac (owner, in this session; pick
+  "Don't send it later (Recommended)").** Only permission prompts and
+  questions, which block the session, are held for the owner to step away. A
+  finished or idle item (Claude `idle_prompt`, Desktop/VS Code idle, Codex
+  finished) that comes due while the owner is at the Mac is never published.
+  The owner was there when it finished.
+- **Fix round 1 (d23054b, fresh Opus implementer from notes; a pre-dispatch
+  check amended four rows first).** The amendments:
+  - every decision uses a fresh presence reading;
+  - a replacement inherits no suppression and comes due 60 s after it opens;
+  - turning the switch off sends held prompts, but never items already kept
+    back;
+  - items that come due while the settings are unreadable are decided once
+    they read again.
+
+  The last one reverses the old "a replacement of a shown item goes at once
+  while the settings are unreadable" rule, and the b3 tests were rewritten to
+  match. Items held for unreadable settings aren't re-checked with
+  `_still_idle` when released, as before this feature. 7844 tests pass.
+  Implementer suggestions: none.
+- **Final review (cold + silent on d23054b, cold on cleanup 21c0c7f).** Round
+  1's seats found no Critical. Their Importants are fixed in the cleanup round:
+  another macOS user at the console counts the owner as away, and an idle item
+  held for unreadable settings is re-checked with `_still_idle`. The low-reach
+  points are filed: mar3co/openswap#224 (`ioreg` on Intel) and
+  mar3co/openswap#225 (a downgrade sends kept-back items). Under the
+  final-review budget, the cleanup seat's findings are filed rather than fixed:
+  mar3co/openswap#226 (a skipped idle item can go out stale before its `Stop`
+  lands; not a regression) and mar3co/openswap#227 (b3 assertion, `_unread`
+  comment). 7852 tests pass.

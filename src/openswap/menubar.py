@@ -968,7 +968,7 @@ def run(switcher, codex=None) -> int:
             root = self.switcher.backup_dir
             status = dict(self._worker_status_cache)
             switches = load_attention_settings(root)
-            status["attention"] = {"notices": switches.notices, "details": switches.details,
+            status["attention"] = {"notices": switches.notices, "details": switches.details, "away": switches.away,
                                    "codex": self._codex_hooks_status() if switches.notices else None,
                                    "replies": switches.replies, "launcher": claude_launcher(),
                                    "readable": switches.readable,
@@ -2522,7 +2522,8 @@ def run(switcher, codex=None) -> int:
                 self._toggle_reset_events_mac()
             elif row_id == "claude_status_line":
                 self._toggle_status_line()
-            elif row_id in ("remote_attention_notices", "remote_attention_details", "remote_attention_replies"):
+            elif row_id in ("remote_attention_notices", "remote_attention_away", "remote_attention_details",
+                            "remote_attention_replies"):
                 self._toggle_attention(row_id)
             elif row_id == "kickoff_time":
                 self.on_kickoff_time(value)
@@ -2681,6 +2682,9 @@ def run(switcher, codex=None) -> int:
                 current = load_attention_settings(root)
                 if row_id == "remote_attention_details":
                     write_attention_settings(root, details=not current.details)
+                    return
+                if row_id == "remote_attention_away":
+                    write_attention_settings(root, away=not current.away)
                     return
                 from openswap.attention import set_notices, set_replies
 
