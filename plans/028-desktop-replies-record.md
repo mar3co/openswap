@@ -621,3 +621,25 @@ union verified, linear time). Minors:
   Code's 6-second `permission_prompt` while the owner is at the Mac. The 0.4.3
   release waits for this change, since #209 also publishes Desktop finished
   turns.
+- **Review of 6fecf7d (cold + silent-failure, Opus).** Three Important
+  findings:
+  - finished and idle items held while the owner was at the Mac went out
+    hours later in a burst;
+  - an `_idle_again` replacement published at once while the owner was at
+    the Mac;
+  - a held idle item was released without re-checking `_still_idle`.
+
+  The ruling below covers all three. A notice held forever under synthetic
+  input (a mouse jiggler) is filed as mar3co/openswap#223. During this review a
+  probe that imported `tests.test_attention` outside pytest skipped conftest
+  and overwrote the owner's real `~/.claude/settings.json` and Desktop
+  profiles. It was restored with the owner, and the hardening is filed as
+  mar3co/openswap#222. The implementer's suggestion of an in-process
+  CoreGraphics call instead of `ioreg` was declined: `ioreg` is the verified
+  path, and it runs at most every 5 s, only while something is held.
+- **2026-11-15, finished turns while at the Mac (owner, in this session; pick
+  "Don't send it later (Recommended)").** Only permission prompts and
+  questions, which block the session, are held for the owner to step away. A
+  finished or idle item (Claude `idle_prompt`, Desktop/VS Code idle, Codex
+  finished) that comes due while the owner is at the Mac is never published.
+  The owner was there when it finished.
