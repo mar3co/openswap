@@ -657,3 +657,13 @@ union verified, linear time). Minors:
   match. Items held for unreadable settings aren't re-checked with
   `_still_idle` when released, as before this feature. 7844 tests pass.
   Implementer suggestions: none.
+- **Final review (cold + silent on d23054b, cold on cleanup 21c0c7f).** Round
+  1's seats found no Critical. Their Importants are fixed in the cleanup round:
+  another macOS user at the console counts the owner as away, and an idle item
+  held for unreadable settings is re-checked with `_still_idle`. The low-reach
+  points are filed: mar3co/openswap#224 (`ioreg` on Intel) and
+  mar3co/openswap#225 (a downgrade sends kept-back items). Under the
+  final-review budget, the cleanup seat's findings are filed rather than fixed:
+  mar3co/openswap#226 (a skipped idle item can go out stale before its `Stop`
+  lands; not a regression) and mar3co/openswap#227 (b3 assertion, `_unread`
+  comment). 7852 tests pass.
