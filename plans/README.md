@@ -130,8 +130,8 @@ Pair/unpair use login Keychain on macOS; service connectivity and remote last
 seen are independent of local process/provider status. On an Apple silicon
 Mac the production Codex and Claude Code adapters run jobs only after the
 owner's live-check opt-in for that provider; elsewhere the adapter reports
-unavailable. Only synthetic fake-adapter tests exercise job execution and
-lifecycle. See [017 progress](017-progress.md).
+unavailable. In the test suite, only synthetic fake adapters exercise job
+execution and lifecycle; `live-check` and opted-in adapters run real jobs. See [017 progress](017-progress.md).
 
 ## Dependency notes
 

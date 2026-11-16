@@ -3,9 +3,9 @@
 This MIT protocol describes a single-owner research pilot. A compatible server
 needs only this specification. The worker makes outbound requests; the Mac has
 no inbound network listener. Provider authentication stays local. A Mac runs
-provider jobs only after its owner passes `openswap worker live-check` and opts
-in, separately for Codex and Claude Code; Plan 017's live-evidence exit gates
-are still open.
+provider jobs only on Apple silicon, after its owner passes `openswap worker
+live-check` on each account jobs may use and opts in, separately for Codex and
+Claude Code; Plan 017's live-evidence exit gates are still open.
 
 ## Transport, identity, and limits
 
@@ -1623,8 +1623,9 @@ and label and the execution mode. A label is the owner's (`--label` or
 `workspace label`) or, by default, the folder's own name, which is the only
 part of the path that leaves the Mac; set a label if the folder's name is
 private. The execution mode comes from one hook,
-`openswap.worker.adapter.execution_mode()`: it is `live` only when the adapter
-for the pinned account's provider declares `execution_mode = "live"`. The
+`WorkerRuntime.execution_mode()`: it is `live` only when the adapter for the
+pinned account's provider (Codex when nothing is pinned) declares
+`execution_mode = "live"`. The
 production Codex and Claude Code adapters declare it only while the owner's
 opt-in for that provider is recorded on this Mac; `UnavailableCodexAdapter`,
 the fallback on a Mac that is not Apple silicon, always declares `disabled`. A 404 `unsupported_version`
