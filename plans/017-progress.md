@@ -26,12 +26,14 @@ most of the Windows/macOS timing flakes, merging on 2026-10-02 (`2e714a3`).
 [mar3co/openswap#71](https://github.com/mar3co/openswap/pull/71) (merged 2026-10-02 as `c9eccfb`) fixed the reference-store starvation
 behind the Windows failures that remained. Its local
 protocol/service/client evidence does not pass Phase 1 or the Phase 3 network
-exit gate. The production Codex adapter remains disabled. The Phase 4 OpenTag
+exit gate. Live Codex and Claude Code adapters now ship behind a per-provider
+owner opt-in (`openswap worker live-check`); the Phase 1 exit gates are still
+open. The Phase 4 OpenTag
 connector merged to OpenTag `main` on 2026-10-03 (mar3co/opentag#137–#141,
 follow-ups #143–#144) and is deployed; its exit is still open (see Phase 4).
 
-The next unblocking step is Phase 1 live evidence, and the code for it is now
-in review (see [Live path prepared](#live-path-prepared-2026-10-07)): the
+The next unblocking step is Phase 1 live evidence, and the code for it is
+merged (see [Live path prepared](#live-path-prepared-2026-10-07)): the
 owner pins a Codex account, installs the pinned CLI, signs that account in to
 its isolated Codex home and runs `openswap worker live-check` on their
 MacBook Pro. That command runs real `codex exec --json` jobs, records

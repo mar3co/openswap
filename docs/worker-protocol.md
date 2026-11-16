@@ -2,8 +2,10 @@
 
 This MIT protocol describes a single-owner research pilot. A compatible server
 needs only this specification. The worker makes outbound requests; the Mac has
-no inbound network listener. Provider authentication stays local. Production
-Codex execution remains disabled until Plan 017's live-evidence gates pass.
+no inbound network listener. Provider authentication stays local. A Mac runs
+provider jobs only after its owner passes `openswap worker live-check` and opts
+in, separately for Codex and Claude Code; Plan 017's live-evidence exit gates
+are still open.
 
 ## Transport, identity, and limits
 
@@ -455,10 +457,11 @@ it, and by default it is the folder's own name. No path, read-only source,
 account, credential or usage data is reported.
 
 `execution` is `"disabled"` or `"live"`. `"disabled"` means the Mac refuses
-every job before launch, whatever else is configured; this release always
-reports it, because the production adapter is still disabled
-(`live_adapter_disabled`). `"live"` means the Mac runs approved jobs with its
-local provider. The value describes how the Mac is built and configured, not a
+every job before launch (`live_adapter_disabled`), whatever else is
+configured; it is the default. `"live"` means the owner passed the live check
+and opted in for the pinned account's provider (Codex when nothing is pinned;
+see [Running jobs live](#running-jobs-live-codex)), and the Mac runs approved
+jobs with its local provider. The value describes how the Mac is built and configured, not a
 moment's availability: a paused worker, a missing account or a signed-out
 provider is not reported here.
 
@@ -1621,8 +1624,10 @@ and label and the execution mode. A label is the owner's (`--label` or
 part of the path that leaves the Mac; set a label if the folder's name is
 private. The execution mode comes from one hook,
 `openswap.worker.adapter.execution_mode()`: it is `live` only when the adapter
-in use declares `execution_mode = "live"`, and the production adapter
-(`UnavailableCodexAdapter`) declares `disabled`. A 404 `unsupported_version`
+for the pinned account's provider declares `execution_mode = "live"`. The
+production Codex and Claude Code adapters declare it only while the owner's
+opt-in for that provider is recorded on this Mac; `UnavailableCodexAdapter`,
+the fallback on a Mac that is not Apple silicon, always declares `disabled`. A 404 `unsupported_version`
 (or `not_found`) stops the report until the next registration. The report is
 sent at the end of a synchronization pass, after results are delivered and new
 work is claimed, so a slow `readiness` route never delays either. The reference
@@ -2141,10 +2146,11 @@ generated key or a relative expiry is still refused locally unless the expiry
 lies in the future. Errors from the service (for
 example `queue_full`, `offline_worker`, `idempotency_conflict`) are printed by
 code with exit status 1.
-The command is **test-only** and does not bypass the disabled production Codex
-adapter or local owner policy. Fake adapters are Python test injections, not a
-CLI feature. A production paired worker can heartbeat, but it will not execute
-provider jobs until its live adapter gates are cleared.
+The command is **test-only** and does not bypass the production adapter's
+live-execution opt-in or local owner policy. Fake adapters are Python test
+injections, not a CLI feature. A production paired worker can heartbeat, but it
+will not execute provider jobs until the owner passes the live check and
+enables live execution.
 
 Run the credential-free roundtrip and deterministic failure tests with:
 

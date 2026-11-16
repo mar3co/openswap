@@ -103,9 +103,10 @@ are dated 2026-09-27 and must be revalidated during the feasibility spike. The
 OpenTag connector side is tracked in mar3co/opentag#135 (private repository).
 Phase 1 remains blocked pending supported-version authenticated execution,
 restriction, cancellation/recovery and account-ownership evidence. The owner
-authorized Phase 2 local-only infrastructure to proceed in parallel; remote
-access stays off and the production Codex adapter remains disabled. The Claude
-auth decision is a separate gate before any Claude adapter. PR
+authorized Phase 2 local-only infrastructure to proceed in parallel. Live
+Codex and Claude Code adapters now ship behind a per-provider owner opt-in
+(`openswap worker live-check`), and the owner recorded the Claude auth decision
+on 2026-10-07; the Phase 1 gates above are still open. PR
 [#59](https://github.com/mar3co/openswap/pull/59) merged on 2026-09-30 as
 Phase 1 signoff and PR [#60](https://github.com/mar3co/openswap/pull/60)
 merged the local-only Phase 2 worker the same day; neither merge replaces the
@@ -126,9 +127,11 @@ local pairing and
 `--i-understand-this-is-a-test-tool`; the reference service and
 [protocol](../docs/worker-protocol.md) provide the credential-free round trip.
 Pair/unpair use login Keychain on macOS; service connectivity and remote last
-seen are independent of local process/provider status. The
-production Codex adapter reports unavailable; only synthetic fake-adapter
-tests exercise job execution and lifecycle. See [017 progress](017-progress.md).
+seen are independent of local process/provider status. On an Apple silicon
+Mac the production Codex and Claude Code adapters run jobs only after the
+owner's live-check opt-in for that provider; elsewhere the adapter reports
+unavailable. Only synthetic fake-adapter tests exercise job execution and
+lifecycle. See [017 progress](017-progress.md).
 
 ## Dependency notes
 
