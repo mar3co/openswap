@@ -811,7 +811,8 @@ class AttentionSettings:
     details: bool = True
     # "Allow replies from my phone and watch": set on this Mac only, never from the web.
     replies: bool = False
-    # "Only when I'm away from this Mac": notices wait for a minute without keyboard or mouse input.
+    # "Only when I'm away from this Mac": prompts wait for a minute without keyboard or mouse input,
+    # and a turn that finishes while the owner is at the Mac is not sent.
     away: bool = True
     # False when the settings could not be read: every switch then reads off,
     # which must not be taken for the owner turning notices off.

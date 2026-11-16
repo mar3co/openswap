@@ -1797,7 +1797,7 @@ def _attention_store(backup_root: Path):
                           switches=lambda: load_attention_settings(backup_root),
                           homes=lambda: hooks.config_homes(backup_root),
                           install=lambda: hooks.reconcile(backup_root, installs_only=True),
-                          idle_seconds=read_idle_seconds)
+                          idle_seconds=read_idle_seconds if sys.platform == "darwin" else None)
 
 
 def _session_records(backup_root: Path):
