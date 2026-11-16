@@ -724,6 +724,15 @@ def read_idle_seconds() -> float | None:
         return None
 
 
+def owns_console() -> bool | None:
+    """Whether this user has this Mac's screen: False while another user's
+    session or the login window has it; None when it cannot be read."""
+    try:
+        return os.stat("/dev/console").st_uid == os.getuid()
+    except OSError:
+        return None
+
+
 def _session_record(data: dict, session: str, pid: int) -> SessionRecord:
     at, waiting, started = data.get("statusUpdatedAt"), data.get("waitingFor"), data.get("procStart")
     started = " ".join(started.split()) if isinstance(started, str) else ""
@@ -761,7 +770,7 @@ class AttentionStore:
     """
 
     def __init__(self, backup_root: Path, *, clock=time.time, enabled=None, records=None, codex_answers=None,
-                 switches=None, homes=None, install=None, idle_seconds=None):
+                 switches=None, homes=None, install=None, idle_seconds=None, owns_console=None):
         self.backup_root = Path(backup_root)
         self.path = self.backup_root / STATE_FILE
         self.clock = clock
@@ -828,11 +837,15 @@ class AttentionStore:
         # Items that came due but are not published, for ``_settle``: until the settings
         # read again, and prompts, with ``away`` on, until the owner leaves this Mac.
         self._held: set[str] = set()
+        # Held items that waited for the settings to read again.
+        self._unread: set[str] = set()
         # Finished and idle items that came due while the owner was at this Mac: never published.
         self._suppressed: set[str] = set()
         # ``idle_seconds()``: seconds since this Mac's last input, None when unreadable;
-        # without it nothing waits for the owner to leave.
+        # without it nothing waits for the owner to leave. ``owns_console()``: whether
+        # this user has this Mac's screen, None when unknown; without it, the idle time decides.
         self._idle_seconds = idle_seconds
+        self._owns_console = owns_console
         self._presence = (-math.inf, False)  # (when read, by ``clock``; whether the owner was at this Mac)
         self._reset_until = 0.0  # replies may predate a set-aside state until then (by ``clock``)
         self._seen: dict[str, dict[int, float]] = {}  # session -> process (0: unknown) -> when last seen
@@ -908,12 +921,12 @@ class AttentionStore:
                 raise ValueError("invalid attention state")
             saved, handled, acks = data.get("channels", {}), data.get("handled", {}), data.get("acks", {})
             inflight, codex_seen = data.get("inflight", {}), data.get("codex_seen", {})
-            held, suppressed = data.get("held", []), data.get("suppressed", [])
+            held, suppressed, unread = data.get("held", []), data.get("suppressed", []), data.get("unread", [])
             if (not isinstance(saved, dict) or not isinstance(handled, dict) or not isinstance(acks, dict)
                     or not isinstance(inflight, dict) or not all(isinstance(v, str) for v in inflight.values())
                     or not isinstance(codex_seen, dict)
                     or not all(isinstance(ids, list) and all(isinstance(i, str) for i in ids)
-                               for ids in (held, suppressed))
+                               for ids in (held, suppressed, unread))
                     or not all(type(v) in (int, float) for v in codex_seen.values())):
                 raise ValueError("invalid attention state")
             channels = {int(pid): Channel.from_saved(int(pid), entry) for pid, entry in saved.items()}
@@ -957,6 +970,7 @@ class AttentionStore:
         self._inflight = {r: i for r, i in inflight.items() if i in open_ids}
         self._unknown, self._codex_seen = set(self._inflight.values()), dict(codex_seen)
         self._held = {i for i in held if i in open_ids}
+        self._unread = self._held.intersection(unread)
         self._suppressed = {i for i in suppressed if i in open_ids}
         self.ready = True
         self.note_problem("state", None)
@@ -968,7 +982,7 @@ class AttentionStore:
                 "items": [asdict(item) for item in self._items], "closed": self._closed,
                 "channels": {str(pid): c.saved() for pid, c in self._channels.items()},
                 "handled": self._handled, "inflight": self._inflight, "codex_seen": self._codex_seen,
-                "held": sorted(self._held), "suppressed": sorted(self._suppressed)}
+                "held": sorted(self._held), "unread": sorted(self._unread), "suppressed": sorted(self._suppressed)}
         with self._ack_lock:
             data["acks"] = dict(self._acks)
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1011,6 +1025,7 @@ class AttentionStore:
             self._attached.pop(item.id, None)
             self._tainted.discard(item.id)
             self._held.discard(item.id)
+            self._unread.discard(item.id)
             self._suppressed.discard(item.id)
             self._offered.pop(item.id, None)
             if item.id in self._unknown:
@@ -1126,9 +1141,11 @@ class AttentionStore:
     def _owner_present(self) -> bool:
         """Outside the lock (it may run ``ioreg``): whether an item coming due now
         finds the owner at this Mac, with ``away`` on and keyboard or mouse input
-        within ``AWAY_SECONDS``. The switch and the idle time are read at most
-        every ``IDLE_READ_SECONDS``, and a reading is used for no longer. An idle
-        time that cannot be read counts as away."""
+        within ``AWAY_SECONDS``. While another user has this Mac's screen
+        (``owns_console``) the owner is away, whatever the idle time says: it
+        counts that user's input too. The switch, the screen and the idle time
+        are read at most every ``IDLE_READ_SECONDS``, and a reading is used for
+        no longer. An idle time that cannot be read counts as away."""
         if self._idle_seconds is None:
             return False
         now = self.clock()
@@ -1138,11 +1155,16 @@ class AttentionStore:
         switches = self.switches()
         present = False
         if switches.away or not switches.readable:
-            idle = self._idle_seconds()
-            if idle is None:
-                log_limited("idle_unreadable", "This Mac's idle time cannot be read; session notices go out as "
-                            "if the owner were away")
-            present = idle is not None and idle < AWAY_SECONDS
+            console = self._owns_console() if self._owns_console is not None else True
+            if console is None:
+                log_limited("console_unreadable", "Who has this Mac's screen cannot be read; session notices "
+                            "follow its idle time alone")
+            if console is not False:
+                idle = self._idle_seconds()
+                if idle is None:
+                    log_limited("idle_unreadable", "This Mac's idle time cannot be read; session notices go out "
+                                "as if the owner were away")
+                present = idle is not None and idle < AWAY_SECONDS
         self._presence = (now, present)
         return present
 
@@ -1151,20 +1173,31 @@ class AttentionStore:
         owner away from this Mac they are published; with the owner here
         (``_owner_present``) a prompt or question stays held until they leave,
         and a finished or idle turn is kept from the phone for good
-        (``_suppressed``). Nothing is decided while the settings cannot be read.
+        (``_suppressed``). Nothing is decided while the settings cannot be read
+        (``_unread``); a Claude idle item that waited for them, and whose session
+        is no longer idle once they read again, is neither published nor kept
+        back: it comes due again as one never published.
         ``enabled``: the caller's own read of the settings just found notices on."""
         with self._lock:
-            if not self._held:
+            # A held prompt already answered at the Mac (awaiting its close) never goes.
+            if self._held <= self._due.keys():
                 return
         if not enabled and self.enabled() is not True:
+            with self._lock:
+                if not self._held <= self._unread:
+                    self._unread |= self._held
+                    self._commit()
             return
         present = self._owner_present()
         with self._lock:
-            # A held prompt already answered at the Mac (awaiting its close) never goes.
             decided = [i for i in self._items if i.id in self._held and i.id not in self._due
                        and not (present and i.kind in ("permission", "question"))]
             for item in decided:
                 self._held.discard(item.id)
+                if item.id in self._unread:
+                    self._unread.discard(item.id)
+                    if item.kind == "idle" and not self._still_idle(item):
+                        continue
                 if present:
                     self._suppressed.add(item.id)
                 else:
@@ -1358,7 +1391,8 @@ class AttentionStore:
         the session stays idle, with ``last`` its last message: a turn the owner
         did not start (a background task's result) makes what the owner saw out
         of date (``_idle_again``); on a surface without an idle notice, the
-        session's idle item opens, published by ``tick`` once it has stayed idle."""
+        session's idle item opens, and comes due (``tick``) once it has stayed
+        idle for ``IDLE_NOTICE_SECONDS``."""
         session, pid, at = notice["session_id"], notice.get("pid", 0), notice["at"]
         mine = [i for i in self._items if i.provider == "claude" and i.kind == "idle" and i.session == session
                 and self._same_process(session, i.pid, pid)]
@@ -1704,6 +1738,7 @@ class AttentionStore:
                 self._unknown = set()
                 self._tainted.clear()
                 self._held.clear()
+                self._unread.clear()
                 self._suppressed.clear()
                 self._commit()
 

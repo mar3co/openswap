@@ -1780,7 +1780,7 @@ def _attention_store(backup_root: Path):
     from openswap import attention as hooks
     from openswap.codex.auth import codex_home
     from openswap.settings import load_attention_settings
-    from openswap.worker.attention import AttentionStore, read_codex_answers, read_idle_seconds
+    from openswap.worker.attention import AttentionStore, owns_console, read_codex_answers, read_idle_seconds
 
     def notices():
         switches = load_attention_settings(backup_root)
@@ -1791,13 +1791,15 @@ def _attention_store(backup_root: Path):
             logger.warning("Session notices: %s", problem)
     except Exception:
         logger.warning("Session notice hooks could not be checked", exc_info=True)
+    mac = sys.platform == "darwin"
     return AttentionStore(backup_root, enabled=notices,
                           records=_session_records(backup_root),
                           codex_answers=lambda threads: read_codex_answers([codex_home()], threads),
                           switches=lambda: load_attention_settings(backup_root),
                           homes=lambda: hooks.config_homes(backup_root),
                           install=lambda: hooks.reconcile(backup_root, installs_only=True),
-                          idle_seconds=read_idle_seconds if sys.platform == "darwin" else None)
+                          idle_seconds=read_idle_seconds if mac else None,
+                          owns_console=owns_console if mac else None)
 
 
 def _session_records(backup_root: Path):

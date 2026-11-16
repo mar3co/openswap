@@ -2914,9 +2914,11 @@ def test_b3_unreadable_settings_still_close_and_update_what_the_phone_shows(tmp_
     assert sorted(c["reason"] for c in closes(items)) == ["answered_on_mac", "superseded"]
     # b, c, the third session's idle item and the turn replacing the one the phone dropped wait, unpublished
     assert len(items._items) == 4
+    items.notice(hook("UserPromptSubmit", session=OTHER, prompt="typed") | at(clock, 80))
+    assert len(items._items) == 3
     switch.readable = True
     items.tick()
-    assert sorted(e.get("detail", {}).get("last_message", "") for e in published(items)) == ["", "", "two"]
+    assert sorted(e.get("detail", {}).get("last_message", "") for e in published(items)) == ["", ""]
 
 
 def test_b3_a_codex_turn_replacing_a_sent_one_while_the_settings_are_unreadable_goes_once_they_read_again(
@@ -3092,10 +3094,14 @@ class _Desk:
 
     def __init__(self):
         self.idle, self.away, self.readable, self.reads = 0.0, True, True, 0
+        self.console = True
 
     def seconds(self):
         self.reads += 1
         return self.idle
+
+    def owns_console(self):
+        return self.console
 
     def enabled(self):
         return True if self.readable else None
@@ -3110,7 +3116,7 @@ class _Desk:
 def desk(tmp_path):
     clock, mac = Clock(), _Desk()
     items = AttentionStore(tmp_path, clock=clock, enabled=mac.enabled, switches=mac.switches,
-                           idle_seconds=mac.seconds, codex_answers=Answers())
+                           idle_seconds=mac.seconds, owns_console=mac.owns_console, codex_answers=Answers())
     return items, clock, mac
 
 
@@ -3334,6 +3340,60 @@ def test_away_the_idle_time_is_read_only_when_an_item_comes_due_or_while_a_promp
     assert mac.reads == 2 + 20 / IDLE_READ_SECONDS
 
 
+@pytest.mark.parametrize(("console", "idle", "sent"), [
+    (False, 0, True),  # another user's session, or the login window, has the screen
+    (True, 0, False),
+    (True, 600, True),
+    (None, 0, False),  # cannot be read: the idle time alone decides
+    (None, 600, True),
+])
+def test_away_the_owner_counts_as_away_while_another_user_has_this_macs_screen(desk, caplog, monkeypatch, console,
+                                                                              idle, sent):
+    from openswap.worker import attention as worker_attention
+
+    monkeypatch.setattr(worker_attention, "_logged", {})
+    items, clock, mac = desk
+    mac.console, mac.idle = console, idle
+    _claude_prompt_due(items, clock)
+    _desktop_finished(items, clock, OTHER)
+    assert len(published(items)) == 2 * sent
+    assert len([r for r in caplog.records if "screen" in r.getMessage()]) == (console is None)
+
+
+def test_away_a_held_prompt_answered_at_the_mac_needs_no_idle_time_while_its_answer_settles(desk):
+    items, clock, mac = desk
+    _claude_prompt_due(items, clock)
+    reads = mac.reads
+    clock.now += IDLE_READ_SECONDS
+    items.observe(record("busy", clock.now), True)
+    wait(items, clock, 1)
+    assert mac.reads == reads
+    wait(items, clock, 1)
+    assert items._items == [] and published(items) == [] and mac.reads == reads
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_away_a_turn_due_while_the_settings_are_unreadable_and_busy_once_they_read_waits_for_its_next_stop(
+        desk, tmp_path, restart):
+    items, clock, mac = desk
+    mac.readable, mac.idle = False, 600
+    _desktop_finished(items, clock)
+    if restart:
+        items = AttentionStore(tmp_path, clock=clock, enabled=mac.enabled, switches=mac.switches,
+                               idle_seconds=mac.seconds, owns_console=mac.owns_console)
+    items.notice(desktop(hook("UserPromptSubmit", prompt="<task-notification>\n<task-id>x</task-id>")) | at(clock, 0))
+    items.observe(record("busy", clock.now), True)
+    mac.readable = True
+    wait(items, clock, IDLE_READ_SECONDS)
+    assert published(items) == []
+    items.notice(desktop(hook("Stop", last_assistant_message="Result is 42.")) | at(clock, 0))
+    items.observe(record("idle", clock.now), True)
+    wait(items, clock, 59)
+    assert published(items) == []
+    wait(items, clock, 1)
+    assert _messages(items) == ["Result is 42."] and closes(items) == []
+
+
 @pytest.mark.parametrize("leaves", [True, False])
 def test_away_turns_due_while_the_settings_are_unreadable_are_decided_once_they_read_again(desk, leaves):
     items, clock, mac = desk
@@ -3368,7 +3428,7 @@ def test_away_a_codex_turn_replacing_a_sent_one_while_the_settings_are_unreadabl
 
 
 @pytest.mark.parametrize("platform", ["darwin", "linux"])
-def test_away_only_a_mac_worker_reads_the_idle_time(tmp_path, monkeypatch, platform):
+def test_away_only_a_mac_worker_reads_the_idle_time_and_the_console_owner(tmp_path, monkeypatch, platform):
     from openswap import settings
     from openswap.worker import attention as worker_attention
     from openswap.worker import runtime
@@ -3376,11 +3436,12 @@ def test_away_only_a_mac_worker_reads_the_idle_time(tmp_path, monkeypatch, platf
     reads = []
     monkeypatch.setattr(attention, "reconcile", lambda *a, **k: [])
     monkeypatch.setattr(settings, "load_attention_settings", lambda root, **kwargs: AttentionSettings(notices=True))
-    monkeypatch.setattr(worker_attention, "read_idle_seconds", lambda: reads.append(1) or 600.0)
+    monkeypatch.setattr(worker_attention, "read_idle_seconds", lambda: reads.append("idle") or 600.0)
+    monkeypatch.setattr(worker_attention, "owns_console", lambda: reads.append("console") or True)
     monkeypatch.setattr(sys, "platform", platform)
     items = runtime._attention_store(tmp_path)
     items.notice(notification("idle_prompt"))
-    assert len(published(items)) == 1 and len(reads) == (platform == "darwin")
+    assert len(published(items)) == 1 and reads == (["console", "idle"] if platform == "darwin" else [])
 
 
 @pytest.mark.parametrize(("output", "seconds"), [
