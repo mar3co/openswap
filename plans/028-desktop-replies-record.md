@@ -643,3 +643,17 @@ union verified, linear time). Minors:
   finished or idle item (Claude `idle_prompt`, Desktop/VS Code idle, Codex
   finished) that comes due while the owner is at the Mac is never published.
   The owner was there when it finished.
+- **Fix round 1 (d23054b, fresh Opus implementer from notes; a pre-dispatch
+  check amended four rows first).** The amendments:
+  - every decision uses a fresh presence reading;
+  - a replacement inherits no suppression and comes due 60 s after it opens;
+  - turning the switch off sends held prompts, but never items already kept
+    back;
+  - items that come due while the settings are unreadable are decided once
+    they read again.
+
+  The last one reverses the old "a replacement of a shown item goes at once
+  while the settings are unreadable" rule, and the b3 tests were rewritten to
+  match. Items held for unreadable settings aren't re-checked with
+  `_still_idle` when released, as before this feature. 7844 tests pass.
+  Implementer suggestions: none.
