@@ -604,3 +604,9 @@ union verified, linear time). Minors:
   mar3co/openswap#220. Minors accepted: a `pwd` object key withholds (an MCP
   tool with a `pwd` working-directory parameter loses Allow), and so does a
   compact quoted literal.
+- **2026-11-15, command previews (owner, relayed, quoting their pick "Ship as
+  is (Recommended)").** Ship with the known denylist gaps tracked
+  (mar3co/openswap#221); a Settings choice for always withholding can come
+  later. From here, every further preview or masking miss becomes a tracked
+  issue with no fix round in this PR. Only a way to get a hidden command
+  allowed (code the watch doesn't show) reopens the code.
