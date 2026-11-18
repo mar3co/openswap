@@ -505,6 +505,7 @@ class SessionRecord:
     waiting_for: str = ""
     proc_start: str = ""  # when the process began (``procStart``, as ``ps`` lstart shows it); "" when not said
     entrypoint: str = ""  # Claude Code's name for its surface (``cli``, ``claude-desktop``, ...); "" when not said
+    cwd: str = ""
 
 
 def read_records(config_homes) -> tuple[list[SessionRecord], bool]:
@@ -739,7 +740,8 @@ def _session_record(data: dict, session: str, pid: int) -> SessionRecord:
     return SessionRecord(session, pid, data.get("status") if isinstance(data.get("status"), str) else "",
                          at / 1000 if type(at) in (int, float) and math.isfinite(at) else 0.0,
                          waiting if isinstance(waiting, str) else "", started if _LSTART.fullmatch(started) else "",
-                         data["entrypoint"] if is_entrypoint(data.get("entrypoint")) else "")
+                         data["entrypoint"] if is_entrypoint(data.get("entrypoint")) else "",
+                         data["cwd"] if isinstance(data.get("cwd"), str) else "")
 
 
 def read_session(home: str, pid: int) -> SessionRecord | None:
@@ -1721,6 +1723,7 @@ class AttentionStore:
                                                  else CODEX_PROMPT_SECONDS)]
             waited += [i for i in self._items if i.provider == "claude" and i.kind == "idle" and not self._shown(i)
                        and now - i.created_at >= IDLE_NOTICE_SECONDS and self._still_idle(i)]
+            waited += self._open_stopless(now)
             self._held.update(i.id for i in waited)
             if changed or waited:
                 self._commit()
@@ -1729,8 +1732,10 @@ class AttentionStore:
     def clear(self) -> None:
         """Notices were turned off: drop every item without reporting closes."""
         with self._lock:
-            if self._items or self._closed or self._last_message:
+            if self._items or self._closed or self._last_message or self._prompted:
                 self._items, self._closed, self._last_message, self._due = [], [], {}, {}
+                # Hooks are dropped while off: what is known of a turn goes stale.
+                self._prompted, self._stopped, self._stop_launch = {}, {}, {}
                 self._due_exit = {}
                 self._attached, self._sent, self._requests = {}, {}, []
                 # A reply whose hand-over is unknown stays "sent"; one in hand-over settles there.
@@ -1754,6 +1759,25 @@ class AttentionStore:
                    and i.created_at < before
                    and not (self._hook_denied(i) and item.created_at >= (self._sent[i.id].exit_at or math.inf))
                    for i in self._items)
+
+    def _open_stopless(self, now: float) -> list[Item]:
+        """On a surface without an idle notice, open the idle item of each turn
+        that ended with no ``Stop`` (Esc, an API error) and has been idle for
+        ``IDLE_NOTICE_SECONDS``: its session file went ``idle`` after the
+        latest prompt, and no idle item is open. A turn's ``Stop``, even a
+        late one, opens that item itself, with the turn's last message."""
+        opened = []
+        for record in [r for rs in self._records.values() for r in rs]:
+            prompted = self._prompted.get((record.session_id, record.pid))
+            if (record.entrypoint in NO_IDLE_NOTICE and record.status == "idle" and prompted is not None
+                    and prompted < record.status_at <= now - IDLE_NOTICE_SECONDS
+                    and not any(i.provider == "claude" and i.kind == "idle" and i.session == record.session_id
+                                and self._same_process(record.session_id, i.pid, record.pid) for i in self._items)):
+                self._open("idle", "claude", record.session_id, {"cwd": record.cwd, "pid": record.pid,
+                                                                 "entrypoint": record.entrypoint,
+                                                                 "at": record.status_at}, published=False)
+                opened.append(self._items[-1])
+        return opened
 
     def _still_idle(self, item: Item) -> bool:
         """Whether the session file, if one is read and says, still says ``idle``:

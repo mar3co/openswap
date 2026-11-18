@@ -565,10 +565,11 @@ def test_session_records_are_read_from_every_home(tmp_path):
     (other / "sessions").mkdir(parents=True)
     (home / "sessions" / f"{os.getpid()}.json").write_text(json.dumps({
         "pid": os.getpid(), "sessionId": SESSION, "status": "waiting", "statusUpdatedAt": 1_800_000_000_500,
-        "waitingFor": "permission prompt"}))
+        "waitingFor": "permission prompt", "cwd": "/Users/o/code/app"}))
     (other / "sessions" / "999999.json").write_text(json.dumps({"pid": 999999, "sessionId": OTHER}))  # gone
     assert read_records([home, other, tmp_path / "missing"]) == (
-        [SessionRecord(SESSION, os.getpid(), "waiting", 1_800_000_000.5, "permission prompt")], True)
+        [SessionRecord(SESSION, os.getpid(), "waiting", 1_800_000_000.5, "permission prompt",
+                       cwd="/Users/o/code/app")], True)
     (other / "sessions" / "1.json").write_text("{torn")
     assert read_records([home, other])[1] is False
 
@@ -667,6 +668,55 @@ def test_a_later_desktop_turn_restarts_the_wait_and_reports_nothing_for_the_firs
 def test_a_terminal_session_still_waits_for_claude_codes_own_idle_notice(store):
     items, clock = store
     items.notice(hook("Stop", last_assistant_message="Done.") | {"entrypoint": "cli", "pid": os.getpid()})
+    wait(items, clock, 120)
+    assert published(items) == []
+
+
+def desktop_record(status, status_at, entrypoint="claude-desktop"):
+    return [SessionRecord(SESSION, os.getpid(), status, status_at, entrypoint=entrypoint, cwd="/Users/o/code/app")]
+
+
+@pytest.mark.parametrize("entrypoint", ["claude-desktop", "claude-vscode"])
+def test_a_desktop_turn_ended_without_a_stop_publishes_sixty_seconds_after_it_went_idle(store, entrypoint):
+    items, clock = store
+    # Esc, or an API error: the session goes idle and no Stop comes.
+    items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | at(clock, 0))
+    items.observe(desktop_record("busy", clock.now + 1, entrypoint), True)
+    items.observe(desktop_record("idle", clock.now + 5, entrypoint), True)
+    wait(items, clock, 64.9)
+    assert published(items) == []
+    wait(items, clock, 0.1)
+    [item] = published(items)
+    assert (item["kind"], item.get("detail")) == ("idle", None)
+    items.notice(desktop(hook("UserPromptSubmit", prompt="next")) | at(clock, 0))
+    assert closes(items) == [{"id": item["id"], "reason": "answered_on_mac"}]
+
+
+def test_a_desktop_turn_with_its_stop_opens_one_notice_with_its_last_message(store):
+    items, clock = store
+    items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | at(clock, 0))
+    items.observe(desktop_record("idle", clock.now + 6), True)
+    items.notice(desktop(hook("Stop", last_assistant_message="Done.")) | at(clock, 5))  # its hook arrives late
+    wait(items, clock, 120)
+    [item] = published(items)
+    assert item["detail"] == {"last_message": "Done."}
+
+
+@pytest.mark.parametrize("entrypoint", ["claude-desktop", "cli"])
+def test_an_idle_session_with_no_prompt_seen_or_a_terminal_session_opens_nothing(store, entrypoint):
+    items, clock = store
+    if entrypoint == "cli":  # its own idle_prompt says when it waits
+        items.notice(hook("UserPromptSubmit", prompt="go") | {"entrypoint": "cli", "pid": os.getpid()} | at(clock, 0))
+    items.observe(desktop_record("idle", clock.now + 5, entrypoint), True)
+    wait(items, clock, 120)
+    assert published(items) == []
+
+
+def test_a_desktop_turn_from_before_notices_were_turned_off_opens_nothing(store):
+    items, clock = store
+    items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | at(clock, 0))
+    items.clear()  # turned off: this turn's later hooks never come
+    items.observe(desktop_record("idle", clock.now + 5), True)
     wait(items, clock, 120)
     assert published(items) == []
 
