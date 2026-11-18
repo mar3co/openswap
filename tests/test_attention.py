@@ -729,6 +729,17 @@ def test_a_resumed_session_never_reuses_a_prompt_of_unknown_process_from_before_
     assert published(items) == []
 
 
+def test_another_process_ending_with_an_unknown_pid_keeps_this_processs_prompt(store):
+    items, clock = store
+    theirs = [SessionRecord(SESSION, os.getppid(), "idle", clock.now - 30, entrypoint="claude-desktop")]
+    items.observe(desktop_record("busy", clock.now - 30) + theirs, True)
+    items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | at(clock, 0))
+    items.notice(desktop(hook("SessionEnd")) | {"pid": 0} | at(clock, 3))  # the other process's /exit
+    items.observe(desktop_record("idle", clock.now + 5), True)  # Esc: no Stop
+    wait(items, clock, 120)
+    assert [i["kind"] for i in published(items)] == ["idle"]
+
+
 @pytest.mark.parametrize("ended", ["Stop", "Esc"])
 def test_a_slash_command_just_after_a_desktop_turn_ended_opens_nothing(store, ended):
     """``/cost`` starts no turn: the session file keeps the earlier turn's ``idle``."""

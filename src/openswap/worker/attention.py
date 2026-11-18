@@ -790,6 +790,7 @@ class AttentionStore:
         # A Codex thread's prompt time is kept by thread ID.
         self._last_message: dict[tuple, tuple[float, str]] = {}
         self._prompted: dict[object, float] = {}
+        self._tied: set[tuple[str, int]] = set()  # ``_prompted`` keys a prompt of unknown process was given
         self._left_waiting: dict[tuple[str, int], float] = {}
         # The session files: ``records()`` reads them as (records, complete).
         self._read_records = records
@@ -1331,8 +1332,10 @@ class AttentionStore:
                 # A hook that could not tell its process speaks for the one process running the session.
                 bound = (session, record.pid)
                 self._prompted[bound] = max(at, self._prompted.get(bound, 0.0))
+                self._tied.add(bound)
             for oldest in list(self._prompted)[:-MAX_LAST_MESSAGES]:
                 del self._prompted[oldest]
+                self._tied.discard(oldest)
             if prompt == "task":
                 # A background task's result starting a turn: the owner did
                 # nothing, and a subagent's prompt may still be waiting. Or the
@@ -1741,7 +1744,7 @@ class AttentionStore:
             if self._items or self._closed or self._last_message or self._prompted:
                 self._items, self._closed, self._last_message, self._due = [], [], {}, {}
                 # Hooks are dropped while off: what is known of a turn goes stale.
-                self._prompted, self._stopped, self._stop_launch = {}, {}, {}
+                self._prompted, self._stopped, self._stop_launch, self._tied = {}, {}, {}, set()
                 self._due_exit = {}
                 self._attached, self._sent, self._requests = {}, {}, []
                 # A reply whose hand-over is unknown stays "sent"; one in hand-over settles there.
@@ -1767,12 +1770,14 @@ class AttentionStore:
                    for i in self._items)
 
     def _forget_unknown(self, session: str, pid: int) -> None:
-        """A process of ``session`` that its hooks could not tell (``pid`` 0)
-        ended: its prompts may stand under any of the session's processes
-        (``UserPromptSubmit``), so none of the session's is kept."""
+        """Process ``pid`` of ``session`` ended. One its hooks could not tell
+        (0) may be the process its prompts were given to (``UserPromptSubmit``):
+        those go too. Another process's own prompts stay."""
+        self._tied.discard((session, pid))
         if not pid:
-            for key in [k for k in self._prompted if isinstance(k, tuple) and k[0] == session]:
-                del self._prompted[key]
+            for key in [k for k in self._tied if k[0] == session]:
+                self._tied.discard(key)
+                self._prompted.pop(key, None)
 
     def _open_stopless(self, now: float) -> list[Item]:
         """On a surface without an idle notice, open the idle item of each turn
