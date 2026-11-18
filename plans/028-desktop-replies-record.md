@@ -695,3 +695,11 @@ union verified, linear time). Minors:
 
   The two seats on the window found its holes. The final seat on the net diff
   since 181f8e4 (tests and docstring) found nothing. 7860 tests pass.
+- **Codex round (PR mar3co/openswap#236).** Codex found that a prompt hook
+  reporting pid 0 never counted for the session's process. The fix ties such
+  a prompt to the session's one process when it arrives, after a complete read
+  (4483042). An earlier check-time lookup (ea624ca) was replaced: a cold seat
+  showed it let a stale pid-0 prompt speak for a later process. The final cold
+  seat found that a pid-0 `SessionEnd` doesn't undo that tie. Under the review
+  budget, that is filed as mar3co/openswap#237 rather than fixed here. 7863
+  tests pass.
