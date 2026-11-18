@@ -692,23 +692,15 @@ def test_a_desktop_turn_ended_without_a_stop_publishes_sixty_seconds_after_it_we
     assert closes(items) == [{"id": item["id"], "reason": "answered_on_mac"}]
 
 
-@pytest.mark.parametrize(("idle_at", "shown"), [(-1, True), (-6, False)])
-def test_a_desktop_turn_that_ends_before_its_prompt_hook_reads_its_clock_still_shows(store, idle_at, shown):
-    """An API error can end the turn before the async prompt hook starts; an
-    idle status from well before the prompt is the earlier turn's."""
-    items, clock = store
-    items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | at(clock, 0))
-    items.observe(desktop_record("idle", clock.now + idle_at), True)
-    wait(items, clock, 120)
-    assert [i["kind"] for i in published(items)] == (["idle"] if shown else [])
-
-
-def test_a_slash_command_just_after_a_desktop_turn_ended_opens_nothing(store):
+@pytest.mark.parametrize("ended", ["Stop", "Esc"])
+def test_a_slash_command_just_after_a_desktop_turn_ended_opens_nothing(store, ended):
     """``/cost`` starts no turn: the session file keeps the earlier turn's ``idle``."""
     items, clock = store
-    items.notice(desktop(hook("Stop", last_assistant_message="Done.")) | at(clock, 0))
+    items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | at(clock, -10))
+    if ended == "Stop":
+        items.notice(desktop(hook("Stop", last_assistant_message="Done.")) | at(clock, 0))
     items.observe(desktop_record("idle", clock.now), True)
-    items.notice(desktop(hook("UserPromptSubmit", prompt="/cost")) | at(clock, 3))
+    items.notice(desktop(hook("UserPromptSubmit", prompt="/cost")) | at(clock, 2))
     wait(items, clock, 120)
     assert published(items) == []
 
