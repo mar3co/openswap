@@ -703,3 +703,15 @@ union verified, linear time). Minors:
   seat found that a pid-0 `SessionEnd` doesn't undo that tie. Under the review
   budget, that is filed as mar3co/openswap#237 rather than fixed here. 7863
   tests pass.
+- **Codex round 2.** Codex found that a pid-0 `SessionEnd` left the tied key
+  (the earlier mar3co/openswap#237). 5fba591 forgot every key of the session.
+  A cold seat showed that wiped other live processes' prompts. 4cdfec8 forgets
+  only keys tied by pid-0 prompts (`_tied`). The final seat found three
+  narrower cases:
+  - a second process's pid-0 exit drops a tie;
+  - a `_tied` leak through the Codex trim;
+  - pre-existing: no cleanup when a record goes with no item open.
+
+  The pid-0 loop wasn't converging, so they are filed in the rewritten
+  mar3co/openswap#237. A `test-windows` timing flake in `test_redact` is
+  mar3co/openswap#238. 7866 tests pass.
