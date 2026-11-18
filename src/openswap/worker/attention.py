@@ -1765,15 +1765,20 @@ class AttentionStore:
         """On a surface without an idle notice, open the idle item of each turn
         that ended with no ``Stop`` (Esc, an API error) and has been idle for
         ``IDLE_NOTICE_SECONDS``: its session file went ``idle`` after the
-        latest prompt (or up to ``HOOK_START_SECONDS`` before its hook read
-        its clock: an API error can end a turn that fast), and no idle item is
-        open. A turn's ``Stop`` within that wait opens the item itself, with
-        the turn's last message."""
+        latest prompt, and no idle item is open. An API error can end a turn
+        before its prompt's hook reads its clock: an ``idle`` up to
+        ``HOOK_START_SECONDS`` before the prompt counts too, unless a ``Stop``
+        that close before it says the earlier turn ended there (a slash
+        command that starts no turn leaves that ``idle`` as it was). A turn's
+        ``Stop`` within the wait opens the item itself, with its last message."""
         opened = []
         for record in [r for rs in self._records.values() for r in rs]:
-            prompted = self._prompted.get((record.session_id, record.pid))
+            key = (record.session_id, record.pid)
+            prompted, at = self._prompted.get(key), record.status_at
             if (record.entrypoint in NO_IDLE_NOTICE and record.status == "idle" and prompted is not None
-                    and prompted - HOOK_START_SECONDS < record.status_at <= now - IDLE_NOTICE_SECONDS
+                    and at <= now - IDLE_NOTICE_SECONDS
+                    and (prompted < at or (prompted - HOOK_START_SECONDS < at
+                                           and self._stopped.get(key, -math.inf) < at - HOOK_START_SECONDS))
                     and not any(i.provider == "claude" and i.kind == "idle" and i.session == record.session_id
                                 and self._same_process(record.session_id, i.pid, record.pid) for i in self._items)):
                 self._open("idle", "claude", record.session_id, {"cwd": record.cwd, "pid": record.pid,

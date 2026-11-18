@@ -703,6 +703,16 @@ def test_a_desktop_turn_that_ends_before_its_prompt_hook_reads_its_clock_still_s
     assert [i["kind"] for i in published(items)] == (["idle"] if shown else [])
 
 
+def test_a_slash_command_just_after_a_desktop_turn_ended_opens_nothing(store):
+    """``/cost`` starts no turn: the session file keeps the earlier turn's ``idle``."""
+    items, clock = store
+    items.notice(desktop(hook("Stop", last_assistant_message="Done.")) | at(clock, 0))
+    items.observe(desktop_record("idle", clock.now), True)
+    items.notice(desktop(hook("UserPromptSubmit", prompt="/cost")) | at(clock, 3))
+    wait(items, clock, 120)
+    assert published(items) == []
+
+
 def test_a_desktop_turn_with_its_stop_opens_one_notice_with_its_last_message(store):
     items, clock = store
     items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | at(clock, 0))
