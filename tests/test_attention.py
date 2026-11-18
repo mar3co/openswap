@@ -695,11 +695,23 @@ def test_a_desktop_turn_ended_without_a_stop_publishes_sixty_seconds_after_it_we
 @pytest.mark.parametrize("processes", [1, 2])
 def test_a_prompt_whose_process_is_unknown_counts_only_for_the_sessions_one_process(store, processes):
     items, clock = store
+    other = [SessionRecord(SESSION, os.getppid(), "busy", clock.now - 1, entrypoint="claude-desktop")]
+    items.observe(desktop_record("idle", clock.now - 30) + other[:processes - 1], True)
     items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | {"pid": 0} | at(clock, 0))
-    other = [SessionRecord(SESSION, os.getppid(), "busy", clock.now + 1, entrypoint="claude-desktop")]
     items.observe(desktop_record("idle", clock.now + 5) + other[:processes - 1], True)
     wait(items, clock, 120)
     assert [i["kind"] for i in published(items)] == (["idle"] if processes == 1 else [])
+
+
+def test_a_prompt_of_unknown_process_never_speaks_for_a_later_process_of_the_session(store):
+    items, clock = store
+    earlier = [SessionRecord(SESSION, os.getppid(), "idle", clock.now - 30, entrypoint="claude-desktop")]
+    items.observe(earlier, True)
+    items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | {"pid": 0} | at(clock, 0))
+    items.notice(desktop(hook("SessionEnd")) | {"pid": os.getppid()} | at(clock, 2))
+    items.observe(desktop_record("idle", clock.now + 10), True)  # reopened in a new process
+    wait(items, clock, 120)
+    assert published(items) == []
 
 
 @pytest.mark.parametrize("ended", ["Stop", "Esc"])

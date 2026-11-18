@@ -1327,6 +1327,10 @@ class AttentionStore:
             if prompt == "end":
                 return False  # /clear or /exit: SessionEnd closes the items as session_ended
             self._prompted[key] = max(at, self._prompted.get(key, 0.0))
+            if not pid and record is not None and self._read_at:
+                # A hook that could not tell its process speaks for the one process running the session.
+                bound = (session, record.pid)
+                self._prompted[bound] = max(at, self._prompted.get(bound, 0.0))
             for oldest in list(self._prompted)[:-MAX_LAST_MESSAGES]:
                 del self._prompted[oldest]
             if prompt == "task":
@@ -1768,10 +1772,7 @@ class AttentionStore:
         wait opens the item itself, with the turn's last message."""
         opened = []
         for record in [r for rs in self._records.values() for r in rs]:
-            # A prompt whose hook could not tell its process speaks for the one process running the session.
-            prompted = max((self._prompted[key] for key in ((record.session_id, record.pid), (record.session_id, 0))
-                            if key in self._prompted and self._same_process(record.session_id, key[1], record.pid)),
-                           default=None)
+            prompted = self._prompted.get((record.session_id, record.pid))
             if (record.entrypoint in NO_IDLE_NOTICE and record.status == "idle" and prompted is not None
                     and prompted < record.status_at <= now - IDLE_NOTICE_SECONDS
                     and not any(i.provider == "claude" and i.kind == "idle" and i.session == record.session_id
