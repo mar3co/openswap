@@ -565,10 +565,11 @@ def test_session_records_are_read_from_every_home(tmp_path):
     (other / "sessions").mkdir(parents=True)
     (home / "sessions" / f"{os.getpid()}.json").write_text(json.dumps({
         "pid": os.getpid(), "sessionId": SESSION, "status": "waiting", "statusUpdatedAt": 1_800_000_000_500,
-        "waitingFor": "permission prompt"}))
+        "waitingFor": "permission prompt", "cwd": "/Users/o/code/app"}))
     (other / "sessions" / "999999.json").write_text(json.dumps({"pid": 999999, "sessionId": OTHER}))  # gone
     assert read_records([home, other, tmp_path / "missing"]) == (
-        [SessionRecord(SESSION, os.getpid(), "waiting", 1_800_000_000.5, "permission prompt")], True)
+        [SessionRecord(SESSION, os.getpid(), "waiting", 1_800_000_000.5, "permission prompt",
+                       cwd="/Users/o/code/app")], True)
     (other / "sessions" / "1.json").write_text("{torn")
     assert read_records([home, other])[1] is False
 
@@ -667,6 +668,117 @@ def test_a_later_desktop_turn_restarts_the_wait_and_reports_nothing_for_the_firs
 def test_a_terminal_session_still_waits_for_claude_codes_own_idle_notice(store):
     items, clock = store
     items.notice(hook("Stop", last_assistant_message="Done.") | {"entrypoint": "cli", "pid": os.getpid()})
+    wait(items, clock, 120)
+    assert published(items) == []
+
+
+def desktop_record(status, status_at, entrypoint="claude-desktop"):
+    return [SessionRecord(SESSION, os.getpid(), status, status_at, entrypoint=entrypoint, cwd="/Users/o/code/app")]
+
+
+@pytest.mark.parametrize("entrypoint", ["claude-desktop", "claude-vscode"])
+def test_a_desktop_turn_ended_without_a_stop_publishes_sixty_seconds_after_it_went_idle(store, entrypoint):
+    items, clock = store
+    # Esc, or an API error: the session goes idle and no Stop comes.
+    items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | {"entrypoint": entrypoint} | at(clock, 0))
+    items.observe(desktop_record("busy", clock.now + 1, entrypoint), True)
+    items.observe(desktop_record("idle", clock.now + 5, entrypoint), True)
+    wait(items, clock, 64.9)
+    assert published(items) == []
+    wait(items, clock, 0.1)
+    [item] = published(items)
+    assert (item["kind"], item.get("detail")) == ("idle", None)
+    items.notice(desktop(hook("UserPromptSubmit", prompt="next")) | at(clock, 0))
+    assert closes(items) == [{"id": item["id"], "reason": "answered_on_mac"}]
+
+
+@pytest.mark.parametrize("processes", [1, 2])
+def test_a_prompt_whose_process_is_unknown_counts_only_for_the_sessions_one_process(store, processes):
+    items, clock = store
+    other = [SessionRecord(SESSION, os.getppid(), "busy", clock.now - 1, entrypoint="claude-desktop")]
+    items.observe(desktop_record("idle", clock.now - 30) + other[:processes - 1], True)
+    items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | {"pid": 0} | at(clock, 0))
+    items.observe(desktop_record("idle", clock.now + 5) + other[:processes - 1], True)
+    wait(items, clock, 120)
+    assert [i["kind"] for i in published(items)] == (["idle"] if processes == 1 else [])
+
+
+def test_a_prompt_of_unknown_process_never_speaks_for_a_later_process_of_the_session(store):
+    items, clock = store
+    earlier = [SessionRecord(SESSION, os.getppid(), "idle", clock.now - 30, entrypoint="claude-desktop")]
+    items.observe(earlier, True)
+    items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | {"pid": 0} | at(clock, 0))
+    items.notice(desktop(hook("SessionEnd")) | {"pid": os.getppid()} | at(clock, 2))
+    items.observe(desktop_record("idle", clock.now + 10), True)  # reopened in a new process
+    wait(items, clock, 120)
+    assert published(items) == []
+
+
+@pytest.mark.parametrize("ended", ["SessionEnd", "gone"])  # /clear's hook, or its record seen gone
+def test_a_resumed_session_never_reuses_a_prompt_of_unknown_process_from_before_it_ended(store, ended):
+    items, clock = store
+    items.observe(desktop_record("idle", clock.now - 30), True)
+    items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | {"pid": 0} | at(clock, 0))
+    items.notice(desktop(hook("Stop", last_assistant_message="Done.")) | {"pid": 0} | at(clock, 5))
+    if ended == "SessionEnd":
+        items.notice(desktop(hook("SessionEnd")) | {"pid": 0} | at(clock, 8))
+    else:
+        items.observe([], True)
+    items.observe(desktop_record("idle", clock.now + 10), True)  # the same process resumes it
+    wait(items, clock, 120)
+    assert published(items) == []
+
+
+def test_another_process_ending_with_an_unknown_pid_keeps_this_processs_prompt(store):
+    items, clock = store
+    theirs = [SessionRecord(SESSION, os.getppid(), "idle", clock.now - 30, entrypoint="claude-desktop")]
+    items.observe(desktop_record("busy", clock.now - 30) + theirs, True)
+    items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | at(clock, 0))
+    items.notice(desktop(hook("SessionEnd")) | {"pid": 0} | at(clock, 3))  # the other process's /exit
+    items.observe(desktop_record("idle", clock.now + 5), True)  # Esc: no Stop
+    wait(items, clock, 120)
+    assert [i["kind"] for i in published(items)] == ["idle"]
+
+
+@pytest.mark.parametrize("ended", ["Stop", "Esc"])
+def test_a_slash_command_just_after_a_desktop_turn_ended_opens_nothing(store, ended):
+    """``/cost`` starts no turn: the session file keeps the earlier turn's ``idle``."""
+    items, clock = store
+    items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | at(clock, -10))
+    if ended == "Stop":
+        items.notice(desktop(hook("Stop", last_assistant_message="Done.")) | at(clock, 0))
+    items.observe(desktop_record("idle", clock.now), True)
+    items.notice(desktop(hook("UserPromptSubmit", prompt="/cost")) | at(clock, 2))
+    wait(items, clock, 120)
+    assert published(items) == []
+
+
+def test_a_desktop_turn_with_its_stop_opens_one_notice_with_its_last_message(store):
+    items, clock = store
+    items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | at(clock, 0))
+    items.observe(desktop_record("idle", clock.now + 6), True)
+    # Its hook arrives after the session file went idle, within the minute.
+    items.notice(desktop(hook("Stop", last_assistant_message="Done.")) | at(clock, 5))
+    wait(items, clock, 120)
+    [item] = published(items)
+    assert item["detail"] == {"last_message": "Done."}
+
+
+@pytest.mark.parametrize("entrypoint", ["claude-desktop", "cli"])
+def test_an_idle_session_with_no_prompt_seen_or_a_terminal_session_opens_nothing(store, entrypoint):
+    items, clock = store
+    if entrypoint == "cli":  # its own idle_prompt says when it waits
+        items.notice(hook("UserPromptSubmit", prompt="go") | {"entrypoint": "cli", "pid": os.getpid()} | at(clock, 0))
+    items.observe(desktop_record("idle", clock.now + 5, entrypoint), True)
+    wait(items, clock, 120)
+    assert published(items) == []
+
+
+def test_a_desktop_turn_from_before_notices_were_turned_off_opens_nothing(store):
+    items, clock = store
+    items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | at(clock, 0))
+    items.clear()  # turned off: this turn's later hooks never come
+    items.observe(desktop_record("idle", clock.now + 5), True)
     wait(items, clock, 120)
     assert published(items) == []
 

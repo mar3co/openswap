@@ -505,6 +505,7 @@ class SessionRecord:
     waiting_for: str = ""
     proc_start: str = ""  # when the process began (``procStart``, as ``ps`` lstart shows it); "" when not said
     entrypoint: str = ""  # Claude Code's name for its surface (``cli``, ``claude-desktop``, ...); "" when not said
+    cwd: str = ""
 
 
 def read_records(config_homes) -> tuple[list[SessionRecord], bool]:
@@ -739,7 +740,8 @@ def _session_record(data: dict, session: str, pid: int) -> SessionRecord:
     return SessionRecord(session, pid, data.get("status") if isinstance(data.get("status"), str) else "",
                          at / 1000 if type(at) in (int, float) and math.isfinite(at) else 0.0,
                          waiting if isinstance(waiting, str) else "", started if _LSTART.fullmatch(started) else "",
-                         data["entrypoint"] if is_entrypoint(data.get("entrypoint")) else "")
+                         data["entrypoint"] if is_entrypoint(data.get("entrypoint")) else "",
+                         data["cwd"] if isinstance(data.get("cwd"), str) else "")
 
 
 def read_session(home: str, pid: int) -> SessionRecord | None:
@@ -788,6 +790,7 @@ class AttentionStore:
         # A Codex thread's prompt time is kept by thread ID.
         self._last_message: dict[tuple, tuple[float, str]] = {}
         self._prompted: dict[object, float] = {}
+        self._tied: set[tuple[str, int]] = set()  # ``_prompted`` keys a prompt of unknown process was given
         self._left_waiting: dict[tuple[str, int], float] = {}
         # The session files: ``records()`` reads them as (records, complete).
         self._read_records = records
@@ -1325,8 +1328,14 @@ class AttentionStore:
             if prompt == "end":
                 return False  # /clear or /exit: SessionEnd closes the items as session_ended
             self._prompted[key] = max(at, self._prompted.get(key, 0.0))
+            if not pid and record is not None and self._read_at:
+                # A hook that could not tell its process speaks for the one process running the session.
+                bound = (session, record.pid)
+                self._prompted[bound] = max(at, self._prompted.get(bound, 0.0))
+                self._tied.add(bound)
             for oldest in list(self._prompted)[:-MAX_LAST_MESSAGES]:
                 del self._prompted[oldest]
+                self._tied.discard(oldest)
             if prompt == "task":
                 # A background task's result starting a turn: the owner did
                 # nothing, and a subagent's prompt may still be waiting. Or the
@@ -1350,6 +1359,7 @@ class AttentionStore:
             for table in (self._last_message, self._prompted, self._left_waiting, self._stopped, self._stop_launch,
                           self._busy_at):
                 table.pop(key, None)
+            self._forget_unknown(session, pid)
             self._release(self._wakers_of(session, pid))
             return self._close(mine, "session_ended")
         # PostToolUse / PostToolUseFailure: the prompt for that call was answered.
@@ -1673,6 +1683,7 @@ class AttentionStore:
                 for table in (self._last_message, self._prompted, self._left_waiting, self._stopped,
                               self._stop_launch, self._busy_at):
                     table.pop(key, None)
+                self._forget_unknown(item.session, item.pid)
                 self._known_procs.discard(key)
                 if not live.get(item.session):
                     self._known.discard(item.session)
@@ -1721,6 +1732,7 @@ class AttentionStore:
                                                  else CODEX_PROMPT_SECONDS)]
             waited += [i for i in self._items if i.provider == "claude" and i.kind == "idle" and not self._shown(i)
                        and now - i.created_at >= IDLE_NOTICE_SECONDS and self._still_idle(i)]
+            waited += self._open_stopless(now)
             self._held.update(i.id for i in waited)
             if changed or waited:
                 self._commit()
@@ -1729,8 +1741,10 @@ class AttentionStore:
     def clear(self) -> None:
         """Notices were turned off: drop every item without reporting closes."""
         with self._lock:
-            if self._items or self._closed or self._last_message:
+            if self._items or self._closed or self._last_message or self._prompted:
                 self._items, self._closed, self._last_message, self._due = [], [], {}, {}
+                # Hooks are dropped while off: what is known of a turn goes stale.
+                self._prompted, self._stopped, self._stop_launch, self._tied = {}, {}, {}, set()
                 self._due_exit = {}
                 self._attached, self._sent, self._requests = {}, {}, []
                 # A reply whose hand-over is unknown stays "sent"; one in hand-over settles there.
@@ -1754,6 +1768,35 @@ class AttentionStore:
                    and i.created_at < before
                    and not (self._hook_denied(i) and item.created_at >= (self._sent[i.id].exit_at or math.inf))
                    for i in self._items)
+
+    def _forget_unknown(self, session: str, pid: int) -> None:
+        """Process ``pid`` of ``session`` ended. One its hooks could not tell
+        (0) may be the process its prompts were given to (``UserPromptSubmit``):
+        those go too. Another process's own prompts stay."""
+        self._tied.discard((session, pid))
+        if not pid:
+            for key in [k for k in self._tied if k[0] == session]:
+                self._tied.discard(key)
+                self._prompted.pop(key, None)
+
+    def _open_stopless(self, now: float) -> list[Item]:
+        """On a surface without an idle notice, open the idle item of each turn
+        that ended with no ``Stop`` (Esc, an API error) and has been idle for
+        ``IDLE_NOTICE_SECONDS``: its session file went ``idle`` after the
+        latest prompt, and no idle item is open. A turn's ``Stop`` within that
+        wait opens the item itself, with the turn's last message."""
+        opened = []
+        for record in [r for rs in self._records.values() for r in rs]:
+            prompted = self._prompted.get((record.session_id, record.pid))
+            if (record.entrypoint in NO_IDLE_NOTICE and record.status == "idle" and prompted is not None
+                    and prompted < record.status_at <= now - IDLE_NOTICE_SECONDS
+                    and not any(i.provider == "claude" and i.kind == "idle" and i.session == record.session_id
+                                and self._same_process(record.session_id, i.pid, record.pid) for i in self._items)):
+                self._open("idle", "claude", record.session_id, {"cwd": record.cwd, "pid": record.pid,
+                                                                 "entrypoint": record.entrypoint,
+                                                                 "at": record.status_at}, published=False)
+                opened.append(self._items[-1])
+        return opened
 
     def _still_idle(self, item: Item) -> bool:
         """Whether the session file, if one is read and says, still says ``idle``:

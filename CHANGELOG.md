@@ -11,6 +11,12 @@ release workflow copies that section into the GitHub release, and
 opensoft.me/swap/changelog shows this file.
 -->
 
+## Unreleased
+
+### Fixed
+
+- A Claude Desktop or VS Code turn you stop with Esc, or that ends on an API error, now shows on your iPhone and Apple Watch once the session has waited a minute, as a finished turn does.
+
 ## 0.4.3 (2026-11-15)
 
 ### New

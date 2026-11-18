@@ -667,3 +667,51 @@ union verified, linear time). Minors:
   mar3co/openswap#226 (a skipped idle item can go out stale before its `Stop`
   lands; not a regression) and mar3co/openswap#227 (b3 assertion, `_unread`
   comment). 7852 tests pass.
+
+## Desktop turns that end without a Stop (mar3co/openswap#208)
+
+- **Rule.** On a Claude Desktop or VS Code session (`NO_IDLE_NOTICE`), a turn
+  that ends with no `Stop` (Esc, an API error) opens its idle item once its
+  session file has said `idle` for `IDLE_NOTICE_SECONDS`. That `idle` must be
+  dated after the process's latest `UserPromptSubmit`, and no idle item may be
+  open for that process. The item has no last message. It is then decided by
+  the away rule like any idle item. Turning notices off now also forgets
+  `_prompted`, `_stopped` and `_stop_launch`, since hooks are dropped while
+  off. Session records now carry `cwd`.
+- **Ruling: no early-idle window.** Fix round 1 let an `idle` up to 5 s before
+  the prompt hook's clock count, for a turn that fails at once. Two later
+  rounds showed that, from the session file and the hooks alone, such a turn
+  looks the same as a slash command that starts no turn (`/cost`): every
+  version of the window either sent a stray notice or missed a real turn. The
+  window was taken out (b87b434), and the case is filed as
+  mar3co/openswap#235. The fix there needs a ruling on which prompts start no
+  turn.
+- **Reviews (all Opus, cold).** The first seat raised:
+  - a `Stop` arriving more than 60 s late sends a second notice: filed as
+    mar3co/openswap#233;
+  - a worker restart mid-turn loses the notice: filed as
+    mar3co/openswap#234;
+  - the fast-failure case, handled by the ruling above.
+
+  The two seats on the window found its holes. The final seat on the net diff
+  since 181f8e4 (tests and docstring) found nothing. 7860 tests pass.
+- **Codex round (PR mar3co/openswap#236).** Codex found that a prompt hook
+  reporting pid 0 never counted for the session's process. The fix ties such
+  a prompt to the session's one process when it arrives, after a complete read
+  (4483042). An earlier check-time lookup (ea624ca) was replaced: a cold seat
+  showed it let a stale pid-0 prompt speak for a later process. The final cold
+  seat found that a pid-0 `SessionEnd` doesn't undo that tie. Under the review
+  budget, that is filed as mar3co/openswap#237 rather than fixed here. 7863
+  tests pass.
+- **Codex round 2.** Codex found that a pid-0 `SessionEnd` left the tied key
+  (the earlier mar3co/openswap#237). 5fba591 forgot every key of the session.
+  A cold seat showed that wiped other live processes' prompts. 4cdfec8 forgets
+  only keys tied by pid-0 prompts (`_tied`). The final seat found three
+  narrower cases:
+  - a second process's pid-0 exit drops a tie;
+  - a `_tied` leak through the Codex trim;
+  - pre-existing: no cleanup when a record goes with no item open.
+
+  The pid-0 loop wasn't converging, so they are filed in the rewritten
+  mar3co/openswap#237. A `test-windows` timing flake in `test_redact` is
+  mar3co/openswap#238. 7866 tests pass.
