@@ -1356,6 +1356,7 @@ class AttentionStore:
             for table in (self._last_message, self._prompted, self._left_waiting, self._stopped, self._stop_launch,
                           self._busy_at):
                 table.pop(key, None)
+            self._forget_unknown(session, pid)
             self._release(self._wakers_of(session, pid))
             return self._close(mine, "session_ended")
         # PostToolUse / PostToolUseFailure: the prompt for that call was answered.
@@ -1679,6 +1680,7 @@ class AttentionStore:
                 for table in (self._last_message, self._prompted, self._left_waiting, self._stopped,
                               self._stop_launch, self._busy_at):
                     table.pop(key, None)
+                self._forget_unknown(item.session, item.pid)
                 self._known_procs.discard(key)
                 if not live.get(item.session):
                     self._known.discard(item.session)
@@ -1763,6 +1765,14 @@ class AttentionStore:
                    and i.created_at < before
                    and not (self._hook_denied(i) and item.created_at >= (self._sent[i.id].exit_at or math.inf))
                    for i in self._items)
+
+    def _forget_unknown(self, session: str, pid: int) -> None:
+        """A process of ``session`` that its hooks could not tell (``pid`` 0)
+        ended: its prompts may stand under any of the session's processes
+        (``UserPromptSubmit``), so none of the session's is kept."""
+        if not pid:
+            for key in [k for k in self._prompted if isinstance(k, tuple) and k[0] == session]:
+                del self._prompted[key]
 
     def _open_stopless(self, now: float) -> list[Item]:
         """On a surface without an idle notice, open the idle item of each turn

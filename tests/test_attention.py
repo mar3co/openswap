@@ -714,6 +714,21 @@ def test_a_prompt_of_unknown_process_never_speaks_for_a_later_process_of_the_ses
     assert published(items) == []
 
 
+@pytest.mark.parametrize("ended", ["SessionEnd", "gone"])  # /clear's hook, or its record seen gone
+def test_a_resumed_session_never_reuses_a_prompt_of_unknown_process_from_before_it_ended(store, ended):
+    items, clock = store
+    items.observe(desktop_record("idle", clock.now - 30), True)
+    items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | {"pid": 0} | at(clock, 0))
+    items.notice(desktop(hook("Stop", last_assistant_message="Done.")) | {"pid": 0} | at(clock, 5))
+    if ended == "SessionEnd":
+        items.notice(desktop(hook("SessionEnd")) | {"pid": 0} | at(clock, 8))
+    else:
+        items.observe([], True)
+    items.observe(desktop_record("idle", clock.now + 10), True)  # the same process resumes it
+    wait(items, clock, 120)
+    assert published(items) == []
+
+
 @pytest.mark.parametrize("ended", ["Stop", "Esc"])
 def test_a_slash_command_just_after_a_desktop_turn_ended_opens_nothing(store, ended):
     """``/cost`` starts no turn: the session file keeps the earlier turn's ``idle``."""
