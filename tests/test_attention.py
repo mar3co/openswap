@@ -680,7 +680,7 @@ def desktop_record(status, status_at, entrypoint="claude-desktop"):
 def test_a_desktop_turn_ended_without_a_stop_publishes_sixty_seconds_after_it_went_idle(store, entrypoint):
     items, clock = store
     # Esc, or an API error: the session goes idle and no Stop comes.
-    items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | at(clock, 0))
+    items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | {"entrypoint": entrypoint} | at(clock, 0))
     items.observe(desktop_record("busy", clock.now + 1, entrypoint), True)
     items.observe(desktop_record("idle", clock.now + 5, entrypoint), True)
     wait(items, clock, 64.9)
@@ -692,11 +692,23 @@ def test_a_desktop_turn_ended_without_a_stop_publishes_sixty_seconds_after_it_we
     assert closes(items) == [{"id": item["id"], "reason": "answered_on_mac"}]
 
 
+@pytest.mark.parametrize(("idle_at", "shown"), [(-1, True), (-6, False)])
+def test_a_desktop_turn_that_ends_before_its_prompt_hook_reads_its_clock_still_shows(store, idle_at, shown):
+    """An API error can end the turn before the async prompt hook starts; an
+    idle status from well before the prompt is the earlier turn's."""
+    items, clock = store
+    items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | at(clock, 0))
+    items.observe(desktop_record("idle", clock.now + idle_at), True)
+    wait(items, clock, 120)
+    assert [i["kind"] for i in published(items)] == (["idle"] if shown else [])
+
+
 def test_a_desktop_turn_with_its_stop_opens_one_notice_with_its_last_message(store):
     items, clock = store
     items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | at(clock, 0))
     items.observe(desktop_record("idle", clock.now + 6), True)
-    items.notice(desktop(hook("Stop", last_assistant_message="Done.")) | at(clock, 5))  # its hook arrives late
+    # Its hook arrives after the session file went idle, within the minute.
+    items.notice(desktop(hook("Stop", last_assistant_message="Done.")) | at(clock, 5))
     wait(items, clock, 120)
     [item] = published(items)
     assert item["detail"] == {"last_message": "Done."}

@@ -153,9 +153,10 @@ MAX_UNPAIRED_WAKERS = 2
 # ``ps`` gives whole seconds, and the hook's wrapper starts before the Stop
 # notice reads its clock.
 LAUNCH_SECONDS = 2.0
-# A Stop hook takes at most this long from its start to reading its clock; beyond it, its own
-# launch says nothing about the turn's end.
-STOP_START_SECONDS = 5.0
+# A hook takes at most this long from its start to reading its clock: a Stop hook's launch
+# beyond it says nothing about the turn's end, and a turn can end this long before its own
+# prompt's hook is dated.
+HOOK_START_SECONDS = 5.0
 # What ends a wake hook's text in the woken turn's prompt (measured on 2.1.325):
 # a text holding it could not be told apart there.
 WOKEN_TAG = "</system-reminder>"
@@ -1764,13 +1765,15 @@ class AttentionStore:
         """On a surface without an idle notice, open the idle item of each turn
         that ended with no ``Stop`` (Esc, an API error) and has been idle for
         ``IDLE_NOTICE_SECONDS``: its session file went ``idle`` after the
-        latest prompt, and no idle item is open. A turn's ``Stop``, even a
-        late one, opens that item itself, with the turn's last message."""
+        latest prompt (or up to ``HOOK_START_SECONDS`` before its hook read
+        its clock: an API error can end a turn that fast), and no idle item is
+        open. A turn's ``Stop`` within that wait opens the item itself, with
+        the turn's last message."""
         opened = []
         for record in [r for rs in self._records.values() for r in rs]:
             prompted = self._prompted.get((record.session_id, record.pid))
             if (record.entrypoint in NO_IDLE_NOTICE and record.status == "idle" and prompted is not None
-                    and prompted < record.status_at <= now - IDLE_NOTICE_SECONDS
+                    and prompted - HOOK_START_SECONDS < record.status_at <= now - IDLE_NOTICE_SECONDS
                     and not any(i.provider == "claude" and i.kind == "idle" and i.session == record.session_id
                                 and self._same_process(record.session_id, i.pid, record.pid) for i in self._items)):
                 self._open("idle", "claude", record.session_id, {"cwd": record.cwd, "pid": record.pid,
@@ -2193,7 +2196,7 @@ class AttentionStore:
         stop_launch = self._stop_launch.get(key)
         # A Stop hook started long before the Stop it reports is not the turn's own (a session's
         # command sending one): its launch vouches for nothing.
-        if stop_launch is not None and self._stopped[key] - stop_launch <= STOP_START_SECONDS:
+        if stop_launch is not None and self._stopped[key] - stop_launch <= HOOK_START_SECONDS:
             return stop_launch - launched <= 1
         return launched >= self._stopped[key] - LAUNCH_SECONDS
 
