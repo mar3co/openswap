@@ -692,6 +692,16 @@ def test_a_desktop_turn_ended_without_a_stop_publishes_sixty_seconds_after_it_we
     assert closes(items) == [{"id": item["id"], "reason": "answered_on_mac"}]
 
 
+@pytest.mark.parametrize("processes", [1, 2])
+def test_a_prompt_whose_process_is_unknown_counts_only_for_the_sessions_one_process(store, processes):
+    items, clock = store
+    items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | {"pid": 0} | at(clock, 0))
+    other = [SessionRecord(SESSION, os.getppid(), "busy", clock.now + 1, entrypoint="claude-desktop")]
+    items.observe(desktop_record("idle", clock.now + 5) + other[:processes - 1], True)
+    wait(items, clock, 120)
+    assert [i["kind"] for i in published(items)] == (["idle"] if processes == 1 else [])
+
+
 @pytest.mark.parametrize("ended", ["Stop", "Esc"])
 def test_a_slash_command_just_after_a_desktop_turn_ended_opens_nothing(store, ended):
     """``/cost`` starts no turn: the session file keeps the earlier turn's ``idle``."""
