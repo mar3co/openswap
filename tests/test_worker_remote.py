@@ -878,7 +878,7 @@ def test_heartbeats_keep_their_cadence_while_renewal_is_blocked(remote_setup, mo
     thread.start()
     try:
         assert blocking.blocked.wait(5)
-        blocked_at = time.monotonic()
+        blocked_at = next(t for op, t, _ in blocking.stamps if op == "renew")
         # Count heartbeats rather than timing a window: under load the heartbeat
         # period stretches, and the gap check below is what bounds the cadence.
         heartbeats = []
@@ -886,7 +886,8 @@ def test_heartbeats_keep_their_cadence_while_renewal_is_blocked(remote_setup, mo
             time.sleep(0.05)
             heartbeats = [t for op, t, _ in blocking.stamps if op == "heartbeat" and t >= blocked_at]
         assert len(heartbeats) >= 8, heartbeats
-        assert all(b - a < 0.25 for a, b in zip(heartbeats, heartbeats[1:])), heartbeats
+        since_block = [blocked_at, *heartbeats]
+        assert all(b - a < 0.25 for a, b in zip(since_block, since_block[1:])), (blocked_at, heartbeats)
         assert all(name != thread.name for op, _, name in blocking.stamps if op == "renew")
     finally:
         stop.set()
