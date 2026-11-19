@@ -891,6 +891,56 @@ def test_a_desktop_turn_with_its_stop_opens_one_notice_with_its_last_message(sto
     assert item["detail"] == {"last_message": "Done."}
 
 
+@pytest.mark.parametrize("stop_at", [4, 6], ids=["dated before the session went idle", "dated after"])
+def test_a_desktop_stop_arriving_after_its_turns_notice_fills_that_notice_in(store, stop_at):
+    """The Mac slept between the turn's end and its async Stop hook's send."""
+    items, clock = store
+    items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | at(clock, 0))
+    items.observe(desktop_record("idle", clock.now + 5), True)
+    wait(items, clock, 65)
+    [item] = published(items)
+    items.notice(desktop(hook("Stop", last_assistant_message="Done.")) | at(clock, stop_at - 65))
+    assert published(items) == [item | {"detail": {"last_message": "Done."}}] and closes(items) == []
+
+
+@pytest.mark.parametrize("before", ["Stop", "task"], ids=["a Stop already seen", "a background task's prompt"])
+def test_a_desktop_stop_after_another_turn_boundary_supersedes_the_notice(store, before):
+    items, clock = store
+    items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | at(clock, 0))
+    if before == "Stop":
+        items.notice(desktop(hook("Stop", last_assistant_message="First.")) | at(clock, 5))
+    items.observe(desktop_record("idle", clock.now + 5), True)
+    wait(items, clock, 65)
+    [item] = published(items)
+    if before == "task":
+        items.notice(desktop(hook("UserPromptSubmit", prompt="<task-notification>\n<task-id>x</task-id>"))
+                     | at(clock, 0))
+    items.notice(desktop(hook("Stop", last_assistant_message="Result is 42.")) | at(clock, 10))
+    [newer] = published(items)
+    assert closes(items) == [{"id": item["id"], "reason": "superseded"}]
+    assert newer["detail"] == {"last_message": "Result is 42."}
+
+
+def test_a_desktop_turn_ended_without_a_stop_across_a_worker_restart_still_publishes(tmp_path):
+    clock = Clock()
+    first = AttentionStore(tmp_path, clock=clock)
+    first.notice(desktop(hook("UserPromptSubmit", prompt="go")) | at(clock, 0))
+    restarted = AttentionStore(tmp_path, clock=clock)  # an upgrade mid-turn
+    restarted.observe(desktop_record("idle", clock.now + 5), True)  # Esc: no Stop
+    wait(restarted, clock, 65)
+    assert [i["kind"] for i in published(restarted)] == ["idle"]
+
+
+@pytest.mark.parametrize("prompted", [{}, [["thread", "x"]], [[["s", "1"], 1.0]], [[["s"], 1.0]], [[1, 1.0]],
+                                      [["thread", 1.0, 2.0]]])
+def test_a_saved_prompt_time_of_the_wrong_shape_sets_the_state_aside(tmp_path, prompted):
+    clock = Clock()
+    AttentionStore(tmp_path, clock=clock).notice(notification("idle_prompt"))
+    path = tmp_path / "worker" / "attention.json"
+    path.write_text(json.dumps(json.loads(path.read_text()) | {"prompted": prompted}))
+    assert published(AttentionStore(tmp_path, clock=clock)) == []
+
+
 @pytest.mark.parametrize("entrypoint", ["claude-desktop", "cli"])
 def test_an_idle_session_with_no_prompt_seen_or_a_terminal_session_opens_nothing(store, entrypoint):
     items, clock = store
