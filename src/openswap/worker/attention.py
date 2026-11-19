@@ -1615,7 +1615,9 @@ class AttentionStore:
                 # keeps nothing of that session's turns, open item or not, SessionEnd or not.
                 for key in self._known_procs - procs:
                     self._forget(key)
-            self._known_procs = {k for k in self._known_procs if k in open_procs} | procs
+                self._known_procs = {k for k in self._known_procs if k in open_procs} | procs
+            else:
+                self._known_procs |= procs  # one that left is forgotten on the next whole read
             self._left_waiting = {k: t for k, t in self._left_waiting.items()
                                   if k[0] in live or k[0] in open_sessions}
             self._busy_at = {k: t for k, t in self._busy_at.items() if k[0] in live or k[0] in open_sessions}

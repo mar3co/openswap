@@ -723,6 +723,7 @@ def test_a_resumed_session_never_reuses_a_prompt_from_before_its_process_left_it
                  | at(clock, 0))
     # Its SessionEnd never came, and no item was open.
     left = [SessionRecord(OTHER, os.getpid(), "idle", clock.now + 3, entrypoint="claude-desktop")]
+    items.observe(left if ended == "clear" else [], False)  # another session's file mid-write
     items.observe(left if ended == "clear" else [], True)
     items.observe(desktop_record("idle", clock.now + 10), True)  # the same process resumes it
     wait(items, clock, 120)
