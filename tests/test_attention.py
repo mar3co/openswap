@@ -23,7 +23,7 @@ from openswap.settings import (
 )
 from openswap.worker import ipc
 from openswap.worker.attention import (
-    IDLE_READ_SECONDS, SESSION_END_GRACE_SECONDS, AttentionStore, Item, NoticeError, SessionRecord,
+    IDLE_READ_SECONDS, MAX_LAST_MESSAGES, SESSION_END_GRACE_SECONDS, AttentionStore, Item, NoticeError, SessionRecord,
     approved_folder_label, idle_seconds_from, read_records, validate_notice,
 )
 from openswap.worker.protocol import MAX_BODY, ProtocolError, attention_report
@@ -833,6 +833,14 @@ def test_a_slash_command_dated_before_the_prompt_after_it_keeps_its_turns_notice
     items.observe(desktop_record("idle", clock.now - 1), True)
     wait(items, clock, 120)
     assert [i["kind"] for i in published(items)] == ["idle"]
+
+
+def test_codex_prompts_that_crowd_out_a_claude_prompt_time_drop_its_local_command_time_too(store):
+    items, clock = store
+    items.notice(desktop(hook("UserPromptSubmit", prompt="/cost")) | at(clock, 0))
+    for n in range(MAX_LAST_MESSAGES):
+        items.notice(codex("UserPromptSubmit", thread=f"thread-{n}", turn_id="t1", prompt="go") | at(clock, 1))
+    assert items._local_prompted == {}
 
 
 def test_a_desktop_turn_with_its_stop_opens_one_notice_with_its_last_message(store):

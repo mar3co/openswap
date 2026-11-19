@@ -1339,9 +1339,7 @@ class AttentionStore:
                 self._prompted[k] = max(at, self._prompted.get(k, 0.0))
                 if prompt == "local":
                     self._local_prompted[k] = max(at, self._local_prompted.get(k, 0.0))
-            for oldest in list(self._prompted)[:-MAX_LAST_MESSAGES]:
-                del self._prompted[oldest]
-                self._local_prompted.pop(oldest, None)
+            self._trim_prompted()
             if prompt == "task":
                 # A background task's result starting a turn: the owner did
                 # nothing, and a subagent's prompt may still be waiting. Or the
@@ -1509,8 +1507,7 @@ class AttentionStore:
             return True
         if event == "UserPromptSubmit":
             self._prompted[thread] = max(at, self._prompted.get(thread, 0.0))
-            for oldest in list(self._prompted)[:-MAX_LAST_MESSAGES]:
-                del self._prompted[oldest]
+            self._trim_prompted()
             return self._close([i for i in own if i.created_at <= at], "answered_on_mac")
         # Interrupt: Esc or "No" at the prompt ends the turn.
         return self._close([i for i in prompts if i.created_at <= at], "answered_on_mac")
@@ -1782,6 +1779,11 @@ class AttentionStore:
         for table in (self._last_message, self._prompted, self._local_prompted, self._left_waiting, self._stopped,
                       self._stop_launch, self._busy_at):
             table.pop(key, None)
+
+    def _trim_prompted(self) -> None:
+        for oldest in list(self._prompted)[:-MAX_LAST_MESSAGES]:
+            del self._prompted[oldest]
+            self._local_prompted.pop(oldest, None)
 
     def _open_stopless(self, now: float) -> list[Item]:
         """On a surface without an idle notice, open the idle item of each turn
