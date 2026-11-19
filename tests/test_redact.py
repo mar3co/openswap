@@ -125,8 +125,8 @@ HOSTILE = [
 def test_checking_and_masking_a_hostile_input_within_the_budget_is_quick(text):
     # Each at the most it is ever given: a call up to the check budget, prose up to its cap plus the margin.
     call, prose = text[:CHECK_BUDGET - 10], text[:1000 + MASK_MARGIN]
-    # Each a few times what a shared Windows runner takes (about 0.5 s for the call), and under what a
-    # quadratic pattern takes on these sizes even on a fast machine.
+    # Each a few times what a shared Windows runner takes (about 0.5 s for the call), and well under the
+    # seconds a typical quadratic pattern takes on these sizes.
     for check, bound in ((lambda: holds_credential({"command": call}), 2.0), (lambda: mask_shapes(prose), 1.0)):
         started = time.perf_counter()
         check()
