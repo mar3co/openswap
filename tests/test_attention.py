@@ -714,19 +714,43 @@ def test_a_prompt_of_unknown_process_never_speaks_for_a_later_process_of_the_ses
     assert published(items) == []
 
 
-@pytest.mark.parametrize("ended", ["SessionEnd", "gone"])  # /clear's hook, or its record seen gone
-def test_a_resumed_session_never_reuses_a_prompt_of_unknown_process_from_before_it_ended(store, ended):
+@pytest.mark.parametrize("unknown", [True, False])  # whether the prompt's hook could tell its process
+@pytest.mark.parametrize("ended", ["clear", "gone"])  # its record moved to another session, or went
+def test_a_resumed_session_never_reuses_a_prompt_from_before_its_process_left_it(store, ended, unknown):
     items, clock = store
-    items.observe(desktop_record("idle", clock.now - 30), True)
-    items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | {"pid": 0} | at(clock, 0))
-    items.notice(desktop(hook("Stop", last_assistant_message="Done.")) | {"pid": 0} | at(clock, 5))
-    if ended == "SessionEnd":
-        items.notice(desktop(hook("SessionEnd")) | {"pid": 0} | at(clock, 8))
-    else:
-        items.observe([], True)
+    items.observe(desktop_record("busy", clock.now - 30), True)
+    items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | {"pid": 0 if unknown else os.getpid()}
+                 | at(clock, 0))
+    # Its SessionEnd never came, and no item was open.
+    left = [SessionRecord(OTHER, os.getpid(), "idle", clock.now + 3, entrypoint="claude-desktop")]
+    items.observe(left if ended == "clear" else [], True)
     items.observe(desktop_record("idle", clock.now + 10), True)  # the same process resumes it
     wait(items, clock, 120)
     assert published(items) == []
+
+
+def test_another_process_leaving_keeps_a_prompt_of_unknown_process_given_to_this_one(store):
+    items, clock = store
+    items.observe(desktop_record("busy", clock.now - 30), True)
+    items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | {"pid": 0} | at(clock, 0))  # this one's, alone
+    theirs = [SessionRecord(SESSION, os.getppid(), "idle", clock.now + 1, entrypoint="claude-desktop")]
+    items.observe(desktop_record("busy", clock.now - 30) + theirs, True)
+    items.notice(desktop(hook("SessionEnd")) | {"pid": 0} | at(clock, 3))  # the other process's /exit
+    items.observe(desktop_record("idle", clock.now + 5), True)  # Esc: no Stop
+    wait(items, clock, 120)
+    assert [i["kind"] for i in published(items)] == ["idle"]
+
+
+def test_a_prompt_of_unknown_process_from_a_process_not_yet_read_is_given_to_it(tmp_path):
+    clock = Clock()
+    reads = [([], True)]
+    items = AttentionStore(tmp_path, clock=clock, records=lambda: reads[0])
+    items.refresh()
+    reads[0] = (desktop_record("busy", clock.now - 1), True)  # just opened: not read yet
+    items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | {"pid": 0} | at(clock, 0))
+    reads[0] = (desktop_record("idle", clock.now + 5), True)  # Esc: no Stop
+    wait(items, clock, 120)
+    assert [i["kind"] for i in published(items)] == ["idle"]
 
 
 def test_another_process_ending_with_an_unknown_pid_keeps_this_processs_prompt(store):

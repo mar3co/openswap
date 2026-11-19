@@ -790,7 +790,6 @@ class AttentionStore:
         # A Codex thread's prompt time is kept by thread ID.
         self._last_message: dict[tuple, tuple[float, str]] = {}
         self._prompted: dict[object, float] = {}
-        self._tied: set[tuple[str, int]] = set()  # ``_prompted`` keys a prompt of unknown process was given
         self._left_waiting: dict[tuple[str, int], float] = {}
         # The session files: ``records()`` reads them as (records, complete).
         self._read_records = records
@@ -1126,9 +1125,11 @@ class AttentionStore:
         if notice.get("provider") == "claude":
             with self._lock:
                 self._seen.setdefault(notice["session_id"], {})[notice.get("pid", 0)] = self._at(notice)
-        # A reply in flight is settled against what the session file says now.
-        if notice.get("event") == "Notification" or (notice.get("provider") == "claude" and any(
-                i.session == notice.get("session_id") for i in self._items if i.id in self._sent)):
+        # A reply in flight is settled against what the session file says now, and a prompt
+        # whose hook could not tell its process is given to the one running its session now.
+        if notice.get("event") == "Notification" or (notice.get("provider") == "claude" and (any(
+                i.session == notice.get("session_id") for i in self._items if i.id in self._sent)
+                or (notice.get("event") == "UserPromptSubmit" and not notice.get("pid")))):
             self.refresh(for_notice=True)
         with self._lock:
             if self._apply(notice, publishes, launched):
@@ -1332,10 +1333,8 @@ class AttentionStore:
                 # A hook that could not tell its process speaks for the one process running the session.
                 bound = (session, record.pid)
                 self._prompted[bound] = max(at, self._prompted.get(bound, 0.0))
-                self._tied.add(bound)
             for oldest in list(self._prompted)[:-MAX_LAST_MESSAGES]:
                 del self._prompted[oldest]
-                self._tied.discard(oldest)
             if prompt == "task":
                 # A background task's result starting a turn: the owner did
                 # nothing, and a subagent's prompt may still be waiting. Or the
@@ -1356,10 +1355,7 @@ class AttentionStore:
             self._release([w for w in self._wakers_of(session, pid) if w is not paired])
             return self._close([i for i in mine if i.created_at <= at], "answered_on_mac")
         if event == "SessionEnd":
-            for table in (self._last_message, self._prompted, self._left_waiting, self._stopped, self._stop_launch,
-                          self._busy_at):
-                table.pop(key, None)
-            self._forget_unknown(session, pid)
+            self._forget(key)
             self._release(self._wakers_of(session, pid))
             return self._close(mine, "session_ended")
         # PostToolUse / PostToolUseFailure: the prompt for that call was answered.
@@ -1613,8 +1609,13 @@ class AttentionStore:
                 if record.session_id in open_sessions:
                     self._seen.setdefault(record.session_id, {})[record.pid] = now
             self._known = {s for s in self._known if s in open_sessions} | set(live)
-            self._known_procs = {k for k in self._known_procs if k in open_procs} | {
-                (r.session_id, r.pid) for rs in live.values() for r in rs}
+            procs = {(r.session_id, r.pid) for rs in live.values() for r in rs}
+            if complete:
+                # A process that no longer runs a session it ran (it ended, or /clear moved it)
+                # keeps nothing of that session's turns, open item or not, SessionEnd or not.
+                for key in self._known_procs - procs:
+                    self._forget(key)
+            self._known_procs = {k for k in self._known_procs if k in open_procs} | procs
             self._left_waiting = {k: t for k, t in self._left_waiting.items()
                                   if k[0] in live or k[0] in open_sessions}
             self._busy_at = {k: t for k, t in self._busy_at.items() if k[0] in live or k[0] in open_sessions}
@@ -1680,10 +1681,7 @@ class AttentionStore:
                     self._due_exit[item.id] = exit_at
             for item in ended:
                 key = (item.session, item.pid)
-                for table in (self._last_message, self._prompted, self._left_waiting, self._stopped,
-                              self._stop_launch, self._busy_at):
-                    table.pop(key, None)
-                self._forget_unknown(item.session, item.pid)
+                self._forget(key)
                 self._known_procs.discard(key)
                 if not live.get(item.session):
                     self._known.discard(item.session)
@@ -1744,7 +1742,7 @@ class AttentionStore:
             if self._items or self._closed or self._last_message or self._prompted:
                 self._items, self._closed, self._last_message, self._due = [], [], {}, {}
                 # Hooks are dropped while off: what is known of a turn goes stale.
-                self._prompted, self._stopped, self._stop_launch, self._tied = {}, {}, {}, set()
+                self._prompted, self._stopped, self._stop_launch = {}, {}, {}
                 self._due_exit = {}
                 self._attached, self._sent, self._requests = {}, {}, []
                 # A reply whose hand-over is unknown stays "sent"; one in hand-over settles there.
@@ -1769,15 +1767,11 @@ class AttentionStore:
                    and not (self._hook_denied(i) and item.created_at >= (self._sent[i.id].exit_at or math.inf))
                    for i in self._items)
 
-    def _forget_unknown(self, session: str, pid: int) -> None:
-        """Process ``pid`` of ``session`` ended. One its hooks could not tell
-        (0) may be the process its prompts were given to (``UserPromptSubmit``):
-        those go too. Another process's own prompts stay."""
-        self._tied.discard((session, pid))
-        if not pid:
-            for key in [k for k in self._tied if k[0] == session]:
-                self._tied.discard(key)
-                self._prompted.pop(key, None)
+    def _forget(self, key: tuple[str, int]) -> None:
+        """Drop what is known of the turns of process ``key[1]`` in session ``key[0]``."""
+        for table in (self._last_message, self._prompted, self._left_waiting, self._stopped, self._stop_launch,
+                      self._busy_at):
+            table.pop(key, None)
 
     def _open_stopless(self, now: float) -> list[Item]:
         """On a surface without an idle notice, open the idle item of each turn
