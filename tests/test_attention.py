@@ -730,6 +730,24 @@ def test_a_resumed_session_never_reuses_a_prompt_from_before_its_process_left_it
     assert published(items) == []
 
 
+def test_a_process_seen_in_another_session_on_an_incomplete_read_has_left_this_one(store):
+    items, clock = store
+    items.observe(desktop_record("busy", clock.now - 30), True)
+    items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | at(clock, 0))
+    left = [SessionRecord(OTHER, os.getpid(), "idle", clock.now + 3, entrypoint="claude-desktop")]
+    items.observe(left, False)  # another file unreadable, but this process is plainly elsewhere
+    items.observe(desktop_record("idle", clock.now + 10), True)  # resumed before any whole read
+    wait(items, clock, 120)
+    assert published(items) == []
+
+
+def test_the_processes_kept_while_reads_are_incomplete_are_only_those_still_unaccounted_for(store):
+    items, _ = store
+    for n in range(50):  # one process moving through sessions while another file stays unreadable
+        items.observe([SessionRecord(f"session-{n}", os.getpid(), "idle", 1.0)], False)
+    assert items._known_procs == {("session-49", os.getpid())}
+
+
 def test_another_process_leaving_keeps_a_prompt_of_unknown_process_given_to_this_one(store):
     items, clock = store
     items.observe(desktop_record("busy", clock.now - 30), True)

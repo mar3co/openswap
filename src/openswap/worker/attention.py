@@ -1610,14 +1610,15 @@ class AttentionStore:
                     self._seen.setdefault(record.session_id, {})[record.pid] = now
             self._known = {s for s in self._known if s in open_sessions} | set(live)
             procs = {(r.session_id, r.pid) for rs in live.values() for r in rs}
-            if complete:
-                # A process that no longer runs a session it ran (it ended, or /clear moved it)
-                # keeps nothing of that session's turns, open item or not, SessionEnd or not.
-                for key in self._known_procs - procs:
-                    self._forget(key)
-                self._known_procs = {k for k in self._known_procs if k in open_procs} | procs
-            else:
-                self._known_procs |= procs  # one that left is forgotten on the next whole read
+            # A process that no longer runs a session it ran (it ended, or /clear moved it)
+            # keeps nothing of that session's turns, open item or not, SessionEnd or not. A
+            # read missing a record shows that only when the process runs another session or none.
+            pids = {pid for _, pid in procs}
+            left = {k for k in self._known_procs - procs if complete or k[1] in pids or not self._alive(k[1])}
+            for key in left:
+                self._forget(key)
+            self._known_procs = {k for k in self._known_procs
+                                 if k in open_procs or (not complete and k not in left)} | procs
             self._left_waiting = {k: t for k, t in self._left_waiting.items()
                                   if k[0] in live or k[0] in open_sessions}
             self._busy_at = {k: t for k, t in self._busy_at.items() if k[0] in live or k[0] in open_sessions}
