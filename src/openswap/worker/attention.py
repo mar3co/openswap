@@ -1335,11 +1335,13 @@ class AttentionStore:
             if not pid and record is not None and self._read_at:
                 # A hook that could not tell its process speaks for the one process running the session.
                 keys.append((session, record.pid))
-            for table in [self._prompted] + ([self._local_prompted] if prompt == "local" else []):
-                for k in keys:
-                    table[k] = max(at, table.get(k, 0.0))
-                for oldest in list(table)[:-MAX_LAST_MESSAGES]:
-                    del table[oldest]
+            for k in keys:
+                self._prompted[k] = max(at, self._prompted.get(k, 0.0))
+                if prompt == "local":
+                    self._local_prompted[k] = max(at, self._local_prompted.get(k, 0.0))
+            for oldest in list(self._prompted)[:-MAX_LAST_MESSAGES]:
+                del self._prompted[oldest]
+                self._local_prompted.pop(oldest, None)
             if prompt == "task":
                 # A background task's result starting a turn: the owner did
                 # nothing, and a subagent's prompt may still be waiting. Or the

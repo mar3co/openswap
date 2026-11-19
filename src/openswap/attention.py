@@ -85,12 +85,12 @@ TASK_TAG = "<task-notification>"
 SESSION_COMMANDS = frozenset({"/clear", "/reset", "/new", "/exit", "/quit"})
 # Claude Code's built-in commands that start no model turn, aliases included
 # (https://code.claude.com/docs/en/commands, 2026-11-19). Skills, custom commands,
-# and built-ins that may hand Claude a prompt (/plan, /goal, /compact, /btw,
+# and built-ins that may hand Claude a prompt (/plan, /goal, /compact,
 # /background, ...) are left out: a turn of theirs that fails at once must still
 # show. A local command added since only risks one stray idle notice.
 LOCAL_COMMANDS = frozenset({
     "/add-dir", "/advisor", "/agents", "/allowed-tools", "/android", "/app", "/artifacts", "/autocompact",
-    "/autofix-pr", "/bashes", "/branch", "/bug", "/cd", "/checkpoint", "/chrome", "/color", "/config", "/context",
+    "/autofix-pr", "/bashes", "/branch", "/btw", "/bug", "/cd", "/checkpoint", "/chrome", "/color", "/config", "/context",
     "/continue", "/copy", "/cost", "/design-login", "/desktop", "/diff", "/effort", "/export", "/extra-usage",
     "/fast", "/feedback", "/focus", "/fork", "/heapdump", "/help", "/hooks", "/ide", "/import",
     "/install-github-app", "/install-slack-app", "/ios", "/keybindings", "/list-agents", "/login", "/logout",
@@ -344,7 +344,7 @@ def _hook_notice(event: str, raw: bytes) -> dict | None:
             text = _woken_text(prompt, "\n" + WOKEN_TAG)
             if text is not None:
                 notice["reply"] = reply_key(text)  # names the text, never carries it
-        elif (command := prompt.strip().split(" ", 1)[0]) in SESSION_COMMANDS:
+        elif (command := (prompt.split(maxsplit=1) or [""])[0]) in SESSION_COMMANDS:
             notice["prompt_kind"] = "end"
         elif command in LOCAL_COMMANDS:
             notice["prompt_kind"] = "local"
