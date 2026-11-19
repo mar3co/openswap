@@ -715,3 +715,30 @@ union verified, linear time). Minors:
   The pid-0 loop wasn't converging, so they are filed in the rewritten
   mar3co/openswap#237. A `test-windows` timing flake in `test_redact` is
   mar3co/openswap#238. 7866 tests pass.
+
+## Prompts of unknown process (mar3co/openswap#237)
+
+- **Owner ruling (2026-11-18).** Merge PR mar3co/openswap#236 with the pid-0
+  cases open, then fix them in a follow-up.
+- **Rule.** `observe` forgets a process's per-process turn state (`_forget`)
+  as soon as a read shows it left a session:
+  - it now runs another session, or its PID is dead (any read);
+  - or its record is missing (complete reads only).
+
+  This covers an exit, `/clear`, a lost `SessionEnd`, and states with no item
+  open. It replaces #236's `_tied` bookkeeping, so another process's exit no
+  longer drops a live process's prompt, and nothing leaks. A pid-0
+  `UserPromptSubmit` now re-reads the session files before it is given to the
+  session's one process. While reads stay incomplete, `_known_procs` keeps
+  only live processes whose record went unread.
+- **Reviews (all Opus, cold).** The first seat raised:
+  - a process leaving during an incomplete read was never forgotten: fixed
+    in 6a773af.
+
+  The second seat raised:
+  - `_known_procs` growing while reads stay incomplete;
+  - a resume before any complete read reusing a prompt.
+
+  Both were fixed in 66b4c59. The final seat found nothing new that is
+  reachable in a normal setup. Its stale-PID case, a test gap and two older
+  behaviors are filed as mar3co/openswap#239. 7872 tests pass.
