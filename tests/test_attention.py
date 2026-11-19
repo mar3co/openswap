@@ -23,8 +23,8 @@ from openswap.settings import (
 )
 from openswap.worker import ipc
 from openswap.worker.attention import (
-    IDLE_READ_SECONDS, SESSION_END_GRACE_SECONDS, AttentionStore, Item, NoticeError, SessionRecord, Waiter,
-    approved_folder_label, idle_seconds_from, read_records, validate_notice,
+    IDLE_READ_SECONDS, MAX_LAST_MESSAGES, SESSION_END_GRACE_SECONDS, AttentionStore, Item, NoticeError, SessionRecord,
+    Waiter, approved_folder_label, idle_seconds_from, read_records, validate_notice,
 )
 from openswap.worker.protocol import MAX_BODY, ProtocolError, attention_report
 from openswap.worker.refserver import ControlStore
@@ -903,7 +903,8 @@ def test_a_desktop_stop_arriving_after_its_turns_notice_fills_that_notice_in(sto
     assert published(items) == [item | {"detail": {"last_message": "Done."}}] and closes(items) == []
 
 
-@pytest.mark.parametrize("before", ["Stop", "task"], ids=["a Stop already seen", "a background task's prompt"])
+@pytest.mark.parametrize("before", ["Stop", "task", "turn"],
+                         ids=["a Stop already seen", "a background task's prompt", "a turn with its prompt still late"])
 def test_a_desktop_stop_after_another_turn_boundary_supersedes_the_notice(store, before):
     items, clock = store
     items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | at(clock, 0))
@@ -915,10 +916,35 @@ def test_a_desktop_stop_after_another_turn_boundary_supersedes_the_notice(store,
     if before == "task":
         items.notice(desktop(hook("UserPromptSubmit", prompt="<task-notification>\n<task-id>x</task-id>"))
                      | at(clock, 0))
+    if before == "turn":
+        items.observe(desktop_record("idle", clock.now + 10), True)
     items.notice(desktop(hook("Stop", last_assistant_message="Result is 42.")) | at(clock, 10))
     [newer] = published(items)
     assert closes(items) == [{"id": item["id"], "reason": "superseded"}]
     assert newer["detail"] == {"last_message": "Result is 42."}
+
+
+def test_a_stop_is_told_from_a_newer_turns_by_a_fresh_read_of_the_session_file(tmp_path):
+    clock = Clock()
+    reads = [(desktop_record("busy", clock.now - 1), True)]
+    items = AttentionStore(tmp_path, clock=clock, records=lambda: reads[0])
+    items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | at(clock, 0))
+    reads[0] = (desktop_record("idle", clock.now + 5), True)
+    wait(items, clock, 65)
+    [item] = published(items)
+    reads[0] = (desktop_record("idle", clock.now + 3), True)  # a short turn since, not read yet
+    items.notice(desktop(hook("Stop", last_assistant_message="Result is 42.")) | at(clock, 2))
+    assert closes(items) == [{"id": item["id"], "reason": "superseded"}]
+
+
+def test_the_most_recently_prompted_process_is_the_last_to_be_forgotten(store):
+    items, clock = store
+    items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | at(clock, 0))
+    for n in range(MAX_LAST_MESSAGES - 1):
+        items.notice(desktop(hook("UserPromptSubmit", session=f"session-{n}", prompt="go")) | at(clock, 1))
+    items.notice(desktop(hook("UserPromptSubmit", prompt="again")) | at(clock, 2))
+    items.notice(desktop(hook("UserPromptSubmit", session="one-more", prompt="go")) | at(clock, 3))
+    assert (SESSION, os.getpid()) in items._prompted and ("session-0", os.getpid()) not in items._prompted
 
 
 def test_a_desktop_turn_ended_without_a_stop_across_a_worker_restart_still_publishes(tmp_path):

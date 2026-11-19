@@ -91,12 +91,11 @@ class Env:
     def at(self, seconds):
         return {"at": self.clock.now + seconds}
 
-    def status(self, status, at, session=SESSION, entrypoint=""):
+    def status(self, status, at, session=SESSION):
         """The session file now says ``status`` since ``at``, and the worker read it."""
         (self.home / "sessions" / f"{PID}.json").write_text(json.dumps(
-            {"pid": PID, "sessionId": session, "status": status, "statusUpdatedAt": at * 1000,
-             **({"entrypoint": entrypoint} if entrypoint else {})}))
-        self.store.observe({session: SessionRecord(session, PID, status, at, entrypoint=entrypoint)}, True)
+            {"pid": PID, "sessionId": session, "status": status, "statusUpdatedAt": at * 1000}))
+        self.store.observe({session: SessionRecord(session, PID, status, at)}, True)
 
     def register(self):
         self.status("busy", self.clock.now - 10)
@@ -430,22 +429,6 @@ def test_a_channel_turn_with_another_token_applies_nothing(env):
     env.store.notice(hook("UserPromptSubmit", prompt='<channel source="openswap" reply="0000">\nx\n</channel>')
                      | env.at(0.1))
     assert item in env.store._items and env.outcomes() == {"r1": "sent"}
-
-
-@pytest.mark.parametrize("stop_at", [-1, 0.1], ids=["its own turn's late Stop", "the channel turn's Stop"])
-def test_a_stop_overtaking_the_channel_turns_prompt_supersedes_only_from_after_the_message(env, stop_at):
-    env.store.notice(hook("UserPromptSubmit", prompt="go") | env.at(0))
-    env.status("idle", env.clock.now + 1, entrypoint="claude-desktop")  # Esc, or a Stop still on its way
-    env.clock.now += 62
-    env.store.tick()
-    [item] = env.store._items
-    env.reply(item.id, "message", text="Run the tests")
-    assert len(env.link.sent) == 1
-    env.store.notice(hook("Stop", last_assistant_message="Done.") | env.at(stop_at))
-    if stop_at < 0:
-        assert env.closes() == {} and item.detail == {"last_message": "Done."}
-    else:
-        assert env.closes() == {item.id: "superseded"}
 
 
 @pytest.mark.parametrize("ending", ["typed", "clear", "session_end"])

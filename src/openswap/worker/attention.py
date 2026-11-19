@@ -1159,10 +1159,12 @@ class AttentionStore:
         if notice.get("provider") == "claude":
             with self._lock:
                 self._seen.setdefault(notice["session_id"], {})[notice.get("pid", 0)] = self._at(notice)
-        # A reply in flight is settled against what the session file says now, and a prompt
-        # whose hook could not tell its process is given to the one running its session now.
+        # A reply in flight is settled against what the session file says now, a Stop is told
+        # from a newer turn's (``_unchanged_since``), and a prompt whose hook could not tell its
+        # process is given to the one running its session now.
         if notice.get("event") == "Notification" or (notice.get("provider") == "claude" and (any(
-                i.session == notice.get("session_id") for i in self._items if i.id in self._sent)
+                i.session == notice.get("session_id") for i in self._items
+                if i.id in self._sent or (i.stopless and notice.get("event") == "Stop"))
                 or (notice.get("event") == "UserPromptSubmit" and not notice.get("pid")))):
             self.refresh(for_notice=True)
         with self._lock:
@@ -1366,11 +1368,11 @@ class AttentionStore:
             prompt = notice.get("prompt_kind")
             if prompt == "end":
                 return False  # /clear or /exit: SessionEnd closes the items as session_ended
-            self._prompted[key] = max(at, self._prompted.get(key, 0.0))
+            self._prompted[key] = max(at, self._prompted.pop(key, 0.0))
             if not pid and record is not None and self._read_at:
                 # A hook that could not tell its process speaks for the one process running the session.
                 bound = (session, record.pid)
-                self._prompted[bound] = max(at, self._prompted.get(bound, 0.0))
+                self._prompted[bound] = max(at, self._prompted.pop(bound, 0.0))
             for oldest in list(self._prompted)[:-MAX_LAST_MESSAGES]:
                 del self._prompted[oldest]
             if prompt == "task":
@@ -1437,15 +1439,13 @@ class AttentionStore:
         of date (``_idle_again``); on a surface without an idle notice, the
         session's idle item opens, and comes due (``tick``) once it has stayed
         idle for ``IDLE_NOTICE_SECONDS``. An idle item opened with no ``Stop``
-        (``_open_stopless``) since the latest prompt stands for this turn, whose
-        ``Stop`` came late: it takes this turn's last message, and no new item
-        opens. A ``Stop`` dated after a message was sent to it is that message's turn."""
+        (``_open_stopless``), whose session file says what it said then, stands
+        for this turn, whose ``Stop`` came late: it takes this turn's last
+        message, and no new item opens."""
         session, pid, at = notice["session_id"], notice.get("pid", 0), notice["at"]
         mine = [i for i in self._items if i.provider == "claude" and i.kind == "idle" and i.session == session
                 and self._same_process(session, i.pid, pid)]
-        prompted = self._prompted.get((session, pid), 0.0)
-        own = next((i for i in mine if i.stopless and i.created_at > prompted
-                    and (i.id not in self._sent or at < self._sent[i.id].at)), None)
+        own = next((i for i in mine if i.stopless and self._unchanged_since(i)), None)
         if own is not None:
             own.stopless = False
             if last:
@@ -1458,6 +1458,14 @@ class AttentionStore:
             self._open("idle", "claude", session, notice, published=False, detail={"last_message": last})
             return True
         return False
+
+    def _unchanged_since(self, item: Item) -> bool:
+        """Whether no turn began in the item's process since it opened: no prompt
+        seen since, and its session file still says the status the item opened at
+        (``_open_stopless`` dates it by that status)."""
+        record = self._record_for(item.session, item.pid)
+        return (self._prompted.get((item.session, item.pid), 0.0) < item.created_at and record is not None
+                and record.status == "idle" and record.status_at <= item.created_at)
 
     def _stop_again(self, item: Item) -> bool:
         """What the latest ``Stop`` of the item's process does now that the item
@@ -1550,7 +1558,7 @@ class AttentionStore:
                 self._held.add(self._items[-1].id)
             return True
         if event == "UserPromptSubmit":
-            self._prompted[thread] = max(at, self._prompted.get(thread, 0.0))
+            self._prompted[thread] = max(at, self._prompted.pop(thread, 0.0))
             for oldest in list(self._prompted)[:-MAX_LAST_MESSAGES]:
                 del self._prompted[oldest]
             return self._close([i for i in own if i.created_at <= at], "answered_on_mac")
