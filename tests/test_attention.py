@@ -114,6 +114,11 @@ def test_hook_input_maps_to_its_notice_and_never_carries_raw_tool_input():
     assert stop["last_message"].startswith("Done. [31m\nAll green") and len(stop["last_message"]) == 1000
     assert hook("UserPromptSubmit", prompt="<task-notification>\n…")["prompt_kind"] == "task"
     assert hook("UserPromptSubmit", prompt="/clear")["prompt_kind"] == "end"
+    assert hook("UserPromptSubmit", prompt="/new")["prompt_kind"] == "end"
+    assert hook("UserPromptSubmit", prompt="/cost")["prompt_kind"] == "local"
+    assert hook("UserPromptSubmit", prompt="/model opus")["prompt_kind"] == "local"
+    for turn in ("/code-review high", "/plan fix the bug", "/my-command", "/costs"):  # skills and custom commands
+        assert "prompt_kind" not in hook("UserPromptSubmit", prompt=turn)
     assert "prompt_kind" not in hook("UserPromptSubmit", prompt="fix the <task-notification> parser")
     assert "fix the" not in json.dumps(hook("UserPromptSubmit", prompt="fix the bug"))
     assert question()["questions"] == [{"question": "Which database?", "header": "DB",
@@ -794,6 +799,40 @@ def test_a_slash_command_just_after_a_desktop_turn_ended_opens_nothing(store, en
     items.notice(desktop(hook("UserPromptSubmit", prompt="/cost")) | at(clock, 2))
     wait(items, clock, 120)
     assert published(items) == []
+
+
+@pytest.mark.parametrize(("idle_at", "shown"), [(-1, True), (-6, False)])
+def test_a_desktop_turn_that_fails_before_its_prompt_hook_reads_its_clock_still_shows(store, idle_at, shown):
+    """A usage limit or a 400 can end the turn before the async prompt hook
+    starts; an idle status from well before the prompt is the earlier turn's."""
+    items, clock = store
+    items.notice(desktop(hook("UserPromptSubmit", prompt="/code-review")) | at(clock, 0))
+    items.observe(desktop_record("idle", clock.now + idle_at), True)
+    wait(items, clock, 120)
+    assert [i["kind"] for i in published(items)] == (["idle"] if shown else [])
+
+
+@pytest.mark.parametrize("ended", ["Stop", "Esc"])
+def test_a_queued_prompt_that_fails_just_after_a_desktop_turn_ended_shows(store, ended):
+    items, clock = store
+    items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | at(clock, -10))
+    if ended == "Stop":
+        items.notice(desktop(hook("Stop", last_assistant_message="Done.")) | at(clock, 0))
+    items.observe(desktop_record("idle", clock.now + 0.5), True)
+    items.notice(desktop(hook("UserPromptSubmit", prompt="and the docs")) | at(clock, 1))
+    wait(items, clock, 120)
+    [item] = published(items)
+    assert (item["kind"], item.get("detail")) == ("idle", None)
+
+
+def test_a_slash_command_dated_before_the_prompt_after_it_keeps_its_turns_notice(store):
+    """Prompt hooks are async: the latest prompt is the one dated last, whatever arrives last."""
+    items, clock = store
+    items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | at(clock, 0))
+    items.notice(desktop(hook("UserPromptSubmit", prompt="/cost")) | at(clock, -3))
+    items.observe(desktop_record("idle", clock.now - 1), True)
+    wait(items, clock, 120)
+    assert [i["kind"] for i in published(items)] == ["idle"]
 
 
 def test_a_desktop_turn_with_its_stop_opens_one_notice_with_its_last_message(store):
