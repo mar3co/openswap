@@ -799,6 +799,7 @@ class AttentionStore:
         self._records: dict[str, list[SessionRecord]] = {}  # by session ID: its live processes' records
         self._known: set[str] = set()  # sessions seen in a record, so a missing one has ended
         self._known_procs: set[tuple[str, int]] = set()  # the same, per process
+        self._left: dict[tuple[str, int], float] = {}  # (session, PID) -> when that process was seen to leave it
         self._starts: dict[int, str] = {}  # PID -> when that process began, while it runs
         self._due: dict[str, float] = {}  # item ID -> when its answer at the Mac closes it
         self._due_exit: dict[str, float] = {}  # item ID -> when its session left ``waiting``
@@ -1076,6 +1077,12 @@ class AttentionStore:
         known = self._starts.get(pid)  # read by ``refresh`` outside the lock
         return known is None or " ".join(known.split()) == " ".join(started.split())
 
+    def _wrote(self, record: SessionRecord) -> bool:
+        """Whether ``record`` was surely written by the process its PID runs now:
+        both start times are known and agree."""
+        known = self._starts.get(record.pid)
+        return bool(record.proc_start) and known is not None and known.split() == record.proc_start.split()
+
     def _record_for(self, session: str, pid: int) -> SessionRecord | None:
         """The session file of ``session`` written by Claude Code process ``pid``;
         with ``pid`` 0 (unknown), the one record only when exactly one process
@@ -1217,6 +1224,8 @@ class AttentionStore:
         event, session, at = notice["event"], notice["session_id"], self._at(notice)
         pid = notice.get("pid", 0)
         key = (session, pid)
+        if pid and event != "SessionEnd" and at < self._left.get(key, -math.inf):
+            return False  # a late hook of a turn its process has since left
         # Only this process's items: the same session may run in another process too.
         mine = [i for i in self._items if i.provider == "claude" and i.session == session
                 and self._same_process(session, i.pid, pid)]
@@ -1355,7 +1364,7 @@ class AttentionStore:
             self._release([w for w in self._wakers_of(session, pid) if w is not paired])
             return self._close([i for i in mine if i.created_at <= at], "answered_on_mac")
         if event == "SessionEnd":
-            self._forget(key)
+            self._forget(key, at)
             self._release(self._wakers_of(session, pid))
             return self._close(mine, "session_ended")
         # PostToolUse / PostToolUseFailure: the prompt for that call was answered.
@@ -1522,6 +1531,7 @@ class AttentionStore:
         # One read at a time, so an older read is never applied after a newer one.
         with self._refresh_lock:
             if self._read_records is not None:
+                read_at = self.clock()
                 try:
                     records, complete = self._read_records()
                 except Exception as exc:  # noqa: BLE001 - an unreadable folder must not stop notices
@@ -1532,7 +1542,7 @@ class AttentionStore:
                         pids = {r.pid for r in records} | {i.pid for i in self._items if i.pid}
                     for pid in pids:
                         self._learn_start(pid)  # never under the lock: ``ps`` can stall
-                    self.observe(records, complete)
+                    self.observe(records, complete, read_at)
             self._observe_codex_answers()
 
     def _observe_codex_answers(self) -> None:
@@ -1571,9 +1581,9 @@ class AttentionStore:
             if self._close(answered, "answered_on_mac"):
                 self._commit()
 
-    def observe(self, records, complete: bool) -> None:
+    def observe(self, records, complete: bool, read_at: float | None = None) -> None:
         """Apply the running sessions' records (a list, or a dict by session ID),
-        as read from every managed config home. ``complete`` is False when a
+        as read from every managed config home at ``read_at`` (None: now). ``complete`` is False when a
         record could not be read: then no session counts as gone for want of
         its record. One session can run in several Claude Code processes; each
         process's record speaks only for that process's items.
@@ -1590,6 +1600,7 @@ class AttentionStore:
         records = list(records.values()) if isinstance(records, dict) else list(records)
         with self._lock:
             now = self.clock()
+            read_at = now if read_at is None else read_at
             self._read_at = now if complete else 0.0
             changed = False
             live: dict[str, list[SessionRecord]] = {}
@@ -1613,10 +1624,11 @@ class AttentionStore:
             # A process that no longer runs a session it ran (it ended, or /clear moved it)
             # keeps nothing of that session's turns, open item or not, SessionEnd or not. A
             # read missing a record shows that only when the process runs another session or none.
-            pids = {pid for _, pid in procs}
+            # A stale file whose start time is unknown may name a reused PID: no evidence.
+            pids = {r.pid for rs in live.values() for r in rs if self._wrote(r)}
             left = {k for k in self._known_procs - procs if complete or k[1] in pids or not self._alive(k[1])}
             for key in left:
-                self._forget(key)
+                self._forget(key, read_at)
             self._known_procs = {k for k in self._known_procs
                                  if k in open_procs or (not complete and k not in left)} | procs
             self._left_waiting = {k: t for k, t in self._left_waiting.items()
@@ -1641,8 +1653,7 @@ class AttentionStore:
                 mine = live.get(item.session, [])
                 if item.pid:
                     record = next((r for r in mine if r.pid == item.pid), None)
-                    gone = not self._alive(item.pid, item.started) or (
-                        record is None and complete and (item.session, item.pid) in self._known_procs)
+                    gone = not self._alive(item.pid, item.started) or (item.session, item.pid) in left
                 else:
                     record = None
                     gone = not mine and complete and item.session in self._known
@@ -1684,7 +1695,7 @@ class AttentionStore:
                     self._due_exit[item.id] = exit_at
             for item in ended:
                 key = (item.session, item.pid)
-                self._forget(key)
+                self._forget(key, read_at)
                 self._known_procs.discard(key)
                 if not live.get(item.session):
                     self._known.discard(item.session)
@@ -1770,11 +1781,17 @@ class AttentionStore:
                    and not (self._hook_denied(i) and item.created_at >= (self._sent[i.id].exit_at or math.inf))
                    for i in self._items)
 
-    def _forget(self, key: tuple[str, int]) -> None:
-        """Drop what is known of the turns of process ``key[1]`` in session ``key[0]``."""
+    def _forget(self, key: tuple[str, int], at: float) -> None:
+        """Drop what is known of the turns of process ``key[1]`` in session ``key[0]``,
+        which it was seen to leave at ``at``."""
         for table in (self._last_message, self._prompted, self._left_waiting, self._stopped, self._stop_launch,
                       self._busy_at):
             table.pop(key, None)
+        if not key[1]:
+            return  # every process its hooks could not tell shares the key: one leaving says nothing of the others
+        self._left[key] = max(at, self._left.pop(key, -math.inf))
+        for oldest in list(self._left)[:-MAX_LAST_MESSAGES]:
+            del self._left[oldest]
 
     def _open_stopless(self, now: float) -> list[Item]:
         """On a surface without an idle notice, open the idle item of each turn

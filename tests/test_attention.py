@@ -23,7 +23,7 @@ from openswap.settings import (
 )
 from openswap.worker import ipc
 from openswap.worker.attention import (
-    IDLE_READ_SECONDS, SESSION_END_GRACE_SECONDS, AttentionStore, Item, NoticeError, SessionRecord,
+    IDLE_READ_SECONDS, SESSION_END_GRACE_SECONDS, AttentionStore, Item, NoticeError, SessionRecord, Waiter,
     approved_folder_label, idle_seconds_from, read_records, validate_notice,
 )
 from openswap.worker.protocol import MAX_BODY, ProtocolError, attention_report
@@ -734,17 +734,101 @@ def test_a_process_seen_in_another_session_on_an_incomplete_read_has_left_this_o
     items, clock = store
     items.observe(desktop_record("busy", clock.now - 30), True)
     items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | at(clock, 0))
-    left = [SessionRecord(OTHER, os.getpid(), "idle", clock.now + 3, entrypoint="claude-desktop")]
+    left = [SessionRecord(OTHER, os.getpid(), "idle", clock.now + 3, entrypoint="claude-desktop",
+                          proc_start=items._starts[os.getpid()])]
     items.observe(left, False)  # another file unreadable, but this process is plainly elsewhere
     items.observe(desktop_record("idle", clock.now + 10), True)  # resumed before any whole read
     wait(items, clock, 120)
     assert published(items) == []
 
 
+@pytest.mark.parametrize("started", ["", "Thu Nov  5 09:00:00 2026"])  # not said, or not checkable
+def test_a_stale_file_of_a_reused_pid_never_shows_its_process_left_a_session(store, started):
+    items, clock = store
+    items.observe(desktop_record("busy", clock.now - 30), True)
+    items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | at(clock, 0))
+    if started:
+        del items._starts[os.getpid()]  # ``ps`` could not say when the process began
+    stale = [SessionRecord(OTHER, os.getpid(), "idle", clock.now - 900, proc_start=started)]
+    items.observe(stale, False)  # left by a crashed process; this one's own file mid-write
+    items.observe(desktop_record("idle", clock.now + 5), True)  # Esc: no Stop
+    wait(items, clock, 120)
+    assert [i["kind"] for i in published(items)] == ["idle"]
+
+
+def test_a_process_that_ended_on_an_incomplete_read_leaves_nothing_to_its_pids_next_process(store, monkeypatch):
+    from openswap import process_detection
+
+    items, clock = store
+    items.observe(desktop_record("busy", clock.now - 30), True)
+    items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | at(clock, 0))
+    real = process_detection.is_pid_alive
+    monkeypatch.setattr(process_detection, "is_pid_alive", lambda pid: pid != os.getpid() and real(pid))
+    items.observe([], False)  # it ended; another file mid-write
+    monkeypatch.setattr(process_detection, "is_pid_alive", real)
+    items.observe(desktop_record("idle", clock.now + 10), True)  # its PID reused, resuming the session
+    wait(items, clock, 120)
+    assert published(items) == []
+
+
+def test_an_item_closes_once_its_process_is_plainly_in_another_session_on_an_incomplete_read(store):
+    items, clock = store
+    items.observe(desktop_record("idle", clock.now - 30), True)
+    items.notice(notification("idle_prompt") | {"pid": os.getpid()})
+    assert len(published(items)) == 1
+    left = [SessionRecord(OTHER, os.getpid(), "idle", clock.now + 3, proc_start=items._starts[os.getpid()])]
+    items.observe(left, False)  # /clear moved it; another file unreadable
+    assert published(items) == [] and [c["reason"] for c in closes(items)] == ["session_ended"]
+
+
+@pytest.mark.parametrize("late", ["UserPromptSubmit", "Stop"])
+def test_a_hook_that_lands_after_its_process_left_the_session_is_not_applied(store, late):
+    items, clock = store
+    items.observe(desktop_record("busy", clock.now - 30), True)
+    clock.now += 5
+    items.observe([SessionRecord(OTHER, os.getpid(), "idle", clock.now)], True)  # /clear, no SessionEnd yet
+    items.notice(desktop(hook(late, prompt="go", last_assistant_message="Done.")) | at(clock, -4))
+    items.observe(desktop_record("idle", clock.now + 10), True)  # the same process resumes it
+    wait(items, clock, 120)
+    assert published(items) == []
+
+
+def test_a_session_end_that_lands_after_its_process_was_seen_to_leave_still_releases_its_wake_hook(store):
+    items, clock = store
+    items.observe(desktop_record("busy", clock.now - 30), True)
+    waker = Waiter("wake", SESSION, "", "", os.getpid(), clock.now, "")
+    items._wakers.append(waker)
+    clock.now += 5
+    items.observe([SessionRecord(OTHER, os.getpid(), "idle", clock.now)], True)  # /clear seen first
+    items.notice(desktop(hook("SessionEnd")) | at(clock, -4))
+    assert waker.done.is_set()
+
+
+def test_a_process_resuming_a_session_while_the_read_that_saw_it_leave_runs_keeps_its_new_turn(tmp_path):
+    clock = Clock()
+    reads = [desktop_record("busy", clock.now - 30)]
+
+    def read():
+        records = reads[0]
+        clock.now += 10  # ``ps`` stalls after the files were read
+        return records, True
+
+    items = AttentionStore(tmp_path, clock=clock, records=read)
+    items.refresh()
+    reads[0] = [SessionRecord(OTHER, os.getpid(), "idle", clock.now)]
+    items.refresh()  # read before the stall, applied after it
+    items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | {"at": clock.now - 5})  # resumed meanwhile
+    reads[0] = desktop_record("idle", clock.now)  # Esc: no Stop
+    wait(items, clock, 120)
+    assert [i["kind"] for i in published(items)] == ["idle"]
+
+
 def test_the_processes_kept_while_reads_are_incomplete_are_only_those_still_unaccounted_for(store):
     items, _ = store
+    items._starts[os.getpid()] = "Thu Nov  5 09:00:00 2026"
     for n in range(50):  # one process moving through sessions while another file stays unreadable
-        items.observe([SessionRecord(f"session-{n}", os.getpid(), "idle", 1.0)], False)
+        items.observe([SessionRecord(f"session-{n}", os.getpid(), "idle", 1.0,
+                                     proc_start="Thu Nov  5 09:00:00 2026")], False)
     assert items._known_procs == {("session-49", os.getpid())}
 
 
