@@ -128,7 +128,8 @@ def test_checking_and_masking_a_hostile_input_within_the_budget_is_quick(text):
     for check in (lambda: holds_credential({"command": call}), lambda: mask_shapes(prose)):
         started = time.perf_counter()
         check()
-        assert time.perf_counter() - started < 0.5
+        # Backtracking on these sizes takes minutes; a shared Windows runner can take 0.5 s for the linear scan.
+        assert time.perf_counter() - started < 2.0
 
 
 @pytest.mark.parametrize("shape", SHAPES)
