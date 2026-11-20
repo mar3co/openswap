@@ -82,7 +82,28 @@ CHANNEL_TAG = '<channel source="openswap"'
 _REPLY_ATTRIBUTE = re.compile(r'<channel source="openswap" reply="([a-z0-9]{1,32})"')
 # How Claude Code starts a turn with a background task's (a subagent's) result.
 TASK_TAG = "<task-notification>"
-SESSION_COMMANDS = frozenset({"/clear", "/exit", "/quit"})
+SESSION_COMMANDS = frozenset({"/clear", "/reset", "/new", "/exit", "/quit"})
+# Claude Code's built-in commands that start no model turn, aliases included
+# (https://code.claude.com/docs/en/commands, 2026-11-19). Skills, custom commands,
+# and built-ins that may hand Claude a prompt (/compact, /plan fix the bug, ...)
+# are left out: a turn of theirs that fails at once must still show. A local
+# command added since only risks one stray idle notice.
+LOCAL_COMMANDS = frozenset({
+    "/add-dir", "/advisor", "/agents", "/allowed-tools", "/android", "/app", "/artifacts", "/autocompact",
+    "/autofix-pr", "/bashes", "/branch", "/btw", "/bug", "/cd", "/checkpoint", "/chrome", "/color", "/config", "/context",
+    "/continue", "/copy", "/cost", "/design-login", "/desktop", "/diff", "/effort", "/export", "/extra-usage",
+    "/fast", "/feedback", "/focus", "/fork", "/heapdump", "/help", "/hooks", "/ide", "/import",
+    "/install-github-app", "/install-slack-app", "/ios", "/keybindings", "/list-agents", "/login", "/logout",
+    "/mcp", "/memory", "/mobile", "/model", "/output-style", "/passes", "/peers", "/permissions", "/plugin",
+    "/powerup", "/privacy-settings", "/radio", "/rate-limit-options", "/rc", "/release-notes", "/reload-plugins",
+    "/reload-skills", "/remote-control", "/remote-env", "/rename", "/restart", "/resume", "/rewind", "/sandbox",
+    "/scroll-speed", "/settings", "/setup-bedrock", "/setup-vertex", "/share", "/skill-doctor", "/skills",
+    "/stats", "/status", "/stickers", "/stop", "/tasks", "/teleport", "/terminal-setup", "/theme", "/tp", "/tui",
+    "/ultrareview", "/undo", "/update", "/upgrade", "/usage", "/usage-credits", "/voice", "/web-setup",
+    "/workflows",
+})
+# Built-ins that start a turn only when given a prompt.
+LOCAL_WITHOUT_PROMPT = frozenset({"/background", "/goal", "/plan"})
 
 
 def main(argv: list[str]) -> int:
@@ -325,8 +346,10 @@ def _hook_notice(event: str, raw: bytes) -> dict | None:
             text = _woken_text(prompt, "\n" + WOKEN_TAG)
             if text is not None:
                 notice["reply"] = reply_key(text)  # names the text, never carries it
-        elif prompt.strip().split(" ", 1)[0] in SESSION_COMMANDS:
+        elif (words := prompt.split(maxsplit=1) or [""])[0] in SESSION_COMMANDS:
             notice["prompt_kind"] = "end"
+        elif words[0] in LOCAL_COMMANDS or (words[0] in LOCAL_WITHOUT_PROMPT and len(words) == 1):
+            notice["prompt_kind"] = "local"
     elif event == "Stop":
         message = masked_text(data.get("last_assistant_message"), DETAIL_CAPS["last_message"])
         if message:

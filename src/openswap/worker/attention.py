@@ -153,9 +153,10 @@ MAX_UNPAIRED_WAKERS = 2
 # ``ps`` gives whole seconds, and the hook's wrapper starts before the Stop
 # notice reads its clock.
 LAUNCH_SECONDS = 2.0
-# A Stop hook takes at most this long from its start to reading its clock; beyond it, its own
-# launch says nothing about the turn's end.
-STOP_START_SECONDS = 5.0
+# A hook takes at most this long from its start to reading its clock: a Stop hook's launch
+# beyond it says nothing about the turn's end, and a turn can end this long before its own
+# prompt's hook is dated.
+HOOK_START_SECONDS = 5.0
 # What ends a wake hook's text in the woken turn's prompt (measured on 2.1.325):
 # a text holding it could not be told apart there.
 WOKEN_TAG = "</system-reminder>"
@@ -391,7 +392,7 @@ _CLAUDE_FIELDS = {"provider", "event", "session_id", "cwd", "at", "pid", "entryp
                   "preview_key", "answers", "reply", "answerable"}
 _CODEX_FIELDS = {"provider", "event", "session_id", "cwd", "at", "pid", "agent_id", "tool_name", "tool_key",
                  "description", "last_message"}
-PROMPT_KINDS = frozenset({"channel", "task", "end"})
+PROMPT_KINDS = frozenset({"channel", "task", "end", "local"})
 # The token a delivered message carries back in its channel turn's tag.
 REPLY_TOKEN = re.compile(r"[a-z0-9]{1,32}")
 
@@ -758,9 +759,14 @@ def read_session(home: str, pid: int) -> SessionRecord | None:
         return None
 
 
+def _prompts_saved(prompted: dict) -> list:
+    return [[list(k) if isinstance(k, tuple) else k, at] for k, at in prompted.items()]
+
+
 def _saved_prompts(entries: object) -> dict:
-    """``AttentionStore._prompted`` from its saved form: ``[key, time]`` pairs,
-    oldest first, a Claude key as ``[session, pid]`` and a Codex one its thread ID."""
+    """``AttentionStore._prompted`` (or ``_local_prompted``) from its saved form:
+    ``[key, time]`` pairs, oldest first, a Claude key as ``[session, pid]`` and a
+    Codex one its thread ID."""
     if not isinstance(entries, list):
         raise ValueError("invalid attention state")
     prompted = {}
@@ -810,6 +816,8 @@ class AttentionStore:
         # A Codex thread's prompt time is kept by thread ID.
         self._last_message: dict[tuple, tuple[float, str]] = {}
         self._prompted: dict[object, float] = {}
+        # When each process's latest built-in command that starts no turn (``/cost``) was submitted.
+        self._local_prompted: dict[object, float] = {}
         self._left_waiting: dict[tuple[str, int], float] = {}
         # The session files: ``records()`` reads them as (records, complete).
         self._read_records = records
@@ -946,6 +954,7 @@ class AttentionStore:
             inflight, codex_seen = data.get("inflight", {}), data.get("codex_seen", {})
             held, suppressed, unread = data.get("held", []), data.get("suppressed", []), data.get("unread", [])
             prompted = _saved_prompts(data.get("prompted", []))
+            local_prompted = _saved_prompts(data.get("local_prompted", []))
             if (not isinstance(saved, dict) or not isinstance(handled, dict) or not isinstance(acks, dict)
                     or not isinstance(inflight, dict) or not all(isinstance(v, str) for v in inflight.values())
                     or not isinstance(codex_seen, dict)
@@ -996,7 +1005,7 @@ class AttentionStore:
         self._held = {i for i in held if i in open_ids}
         self._unread = self._held.intersection(unread)
         self._suppressed = {i for i in suppressed if i in open_ids}
-        self._prompted = prompted
+        self._prompted, self._local_prompted = prompted, local_prompted
         self.ready = True
         self.note_problem("state", None)
 
@@ -1008,7 +1017,7 @@ class AttentionStore:
                 "channels": {str(pid): c.saved() for pid, c in self._channels.items()},
                 "handled": self._handled, "inflight": self._inflight, "codex_seen": self._codex_seen,
                 "held": sorted(self._held), "unread": sorted(self._unread), "suppressed": sorted(self._suppressed),
-                "prompted": [[list(k) if isinstance(k, tuple) else k, at] for k, at in self._prompted.items()]}
+                "prompted": _prompts_saved(self._prompted), "local_prompted": _prompts_saved(self._local_prompted)}
         with self._ack_lock:
             data["acks"] = dict(self._acks)
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1368,10 +1377,10 @@ class AttentionStore:
             prompt = notice.get("prompt_kind")
             if prompt == "end":
                 return False  # /clear or /exit: SessionEnd closes the items as session_ended
-            self._note_prompt(key, at)
+            self._note_prompt(key, at, local=prompt == "local")
             if not pid and record is not None and self._read_at:
                 # A hook that could not tell its process speaks for the one process running the session.
-                self._note_prompt((session, record.pid), at)
+                self._note_prompt((session, record.pid), at, local=prompt == "local")
             if prompt == "task":
                 # A background task's result starting a turn: the owner did
                 # nothing, and a subagent's prompt may still be waiting. Or the
@@ -1456,14 +1465,18 @@ class AttentionStore:
             return True
         return False
 
-    def _note_prompt(self, key: object, at: float) -> None:
-        """Record a prompt of ``key`` at ``at``. Only a newer one moves ``key``
-        last, so the cap forgets the least recently prompted first."""
+    def _note_prompt(self, key: object, at: float, *, local: bool = False) -> None:
+        """Record a prompt of ``key`` at ``at``, ``local`` for a built-in command
+        that starts no turn. Only a newer one moves ``key`` last, so the cap
+        forgets the least recently prompted first."""
         if at >= self._prompted.get(key, -math.inf):
             self._prompted.pop(key, None)
             self._prompted[key] = at
+            if local:
+                self._local_prompted[key] = at
             for oldest in list(self._prompted)[:-MAX_LAST_MESSAGES]:
                 del self._prompted[oldest]
+                self._local_prompted.pop(oldest, None)
 
     def _unchanged_since(self, item: Item) -> bool:
         """Whether no turn began in the item's process since it opened: no prompt
@@ -1808,7 +1821,7 @@ class AttentionStore:
             if self._items or self._closed or self._last_message or self._prompted:
                 self._items, self._closed, self._last_message, self._due = [], [], {}, {}
                 # Hooks are dropped while off: what is known of a turn goes stale.
-                self._prompted, self._stopped, self._stop_launch = {}, {}, {}
+                self._prompted, self._local_prompted, self._stopped, self._stop_launch = {}, {}, {}, {}
                 self._due_exit = {}
                 self._attached, self._sent, self._requests = {}, {}, []
                 # A reply whose hand-over is unknown stays "sent"; one in hand-over settles there.
@@ -1836,8 +1849,8 @@ class AttentionStore:
     def _forget(self, key: tuple[str, int], at: float) -> None:
         """Drop what is known of the turns of process ``key[1]`` in session ``key[0]``,
         which it was seen to leave at ``at``."""
-        for table in (self._last_message, self._prompted, self._left_waiting, self._stopped, self._stop_launch,
-                      self._busy_at):
+        for table in (self._last_message, self._prompted, self._local_prompted, self._left_waiting, self._stopped,
+                      self._stop_launch, self._busy_at):
             table.pop(key, None)
         if not key[1]:
             return  # every process its hooks could not tell shares the key: one leaving says nothing of the others
@@ -1849,13 +1862,20 @@ class AttentionStore:
         """On a surface without an idle notice, open the idle item of each turn
         that ended with no ``Stop`` (Esc, an API error) and has been idle for
         ``IDLE_NOTICE_SECONDS``: its session file went ``idle`` after the
-        latest prompt, and no idle item is open. A turn's ``Stop`` within that
+        latest prompt, and no idle item is open. A usage limit or a 400 can
+        end a turn before its prompt's hook reads its clock, so an ``idle`` up
+        to ``HOOK_START_SECONDS`` before the prompt counts too, unless that
+        prompt was a built-in command that starts no turn (``/cost`` leaves
+        the earlier turn's ``idle`` as it was). A turn's ``Stop`` within the
         wait opens the item itself, with the turn's last message."""
         opened = []
         for record in [r for rs in self._records.values() for r in rs]:
-            prompted = self._prompted.get((record.session_id, record.pid))
+            key = (record.session_id, record.pid)
+            prompted, at = self._prompted.get(key), record.status_at
             if (record.entrypoint in NO_IDLE_NOTICE and record.status == "idle" and prompted is not None
-                    and prompted < record.status_at <= now - IDLE_NOTICE_SECONDS
+                    and at <= now - IDLE_NOTICE_SECONDS
+                    and (prompted < at or (prompted - HOOK_START_SECONDS < at
+                                           and self._local_prompted.get(key) != prompted))
                     and not any(i.provider == "claude" and i.kind == "idle" and i.session == record.session_id
                                 and self._same_process(record.session_id, i.pid, record.pid) for i in self._items)):
                 self._open("idle", "claude", record.session_id, {"cwd": record.cwd, "pid": record.pid,
@@ -2279,7 +2299,7 @@ class AttentionStore:
         stop_launch = self._stop_launch.get(key)
         # A Stop hook started long before the Stop it reports is not the turn's own (a session's
         # command sending one): its launch vouches for nothing.
-        if stop_launch is not None and self._stopped[key] - stop_launch <= STOP_START_SECONDS:
+        if stop_launch is not None and self._stopped[key] - stop_launch <= HOOK_START_SECONDS:
             return stop_launch - launched <= 1
         return launched >= self._stopped[key] - LAUNCH_SECONDS
 

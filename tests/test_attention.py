@@ -114,6 +114,13 @@ def test_hook_input_maps_to_its_notice_and_never_carries_raw_tool_input():
     assert stop["last_message"].startswith("Done. [31m\nAll green") and len(stop["last_message"]) == 1000
     assert hook("UserPromptSubmit", prompt="<task-notification>\n…")["prompt_kind"] == "task"
     assert hook("UserPromptSubmit", prompt="/clear")["prompt_kind"] == "end"
+    assert hook("UserPromptSubmit", prompt="/new")["prompt_kind"] == "end"
+    assert hook("UserPromptSubmit", prompt="/cost")["prompt_kind"] == "local"
+    assert hook("UserPromptSubmit", prompt="/model\nopus")["prompt_kind"] == "local"
+    for bare in ("/plan", " /goal ", "/background"):  # with no prompt, these hand Claude nothing
+        assert hook("UserPromptSubmit", prompt=bare)["prompt_kind"] == "local"
+    for turn in ("/code-review high", "/plan fix the bug", "/my-command", "/costs"):  # skills and custom commands
+        assert "prompt_kind" not in hook("UserPromptSubmit", prompt=turn)
     assert "prompt_kind" not in hook("UserPromptSubmit", prompt="fix the <task-notification> parser")
     assert "fix the" not in json.dumps(hook("UserPromptSubmit", prompt="fix the bug"))
     assert question()["questions"] == [{"question": "Which database?", "header": "DB",
@@ -880,6 +887,48 @@ def test_a_slash_command_just_after_a_desktop_turn_ended_opens_nothing(store, en
     assert published(items) == []
 
 
+@pytest.mark.parametrize(("idle_at", "shown"), [(-1, True), (-6, False)])
+def test_a_desktop_turn_that_fails_before_its_prompt_hook_reads_its_clock_still_shows(store, idle_at, shown):
+    """A usage limit or a 400 can end the turn before the async prompt hook
+    starts; an idle status from well before the prompt is the earlier turn's."""
+    items, clock = store
+    items.notice(desktop(hook("UserPromptSubmit", prompt="/code-review")) | at(clock, 0))
+    items.observe(desktop_record("idle", clock.now + idle_at), True)
+    wait(items, clock, 120)
+    assert [i["kind"] for i in published(items)] == (["idle"] if shown else [])
+
+
+@pytest.mark.parametrize("ended", ["Stop", "Esc"])
+def test_a_queued_prompt_that_fails_just_after_a_desktop_turn_ended_shows(store, ended):
+    items, clock = store
+    items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | at(clock, -10))
+    if ended == "Stop":
+        items.notice(desktop(hook("Stop", last_assistant_message="Done.")) | at(clock, 0))
+    items.observe(desktop_record("idle", clock.now + 0.5), True)
+    items.notice(desktop(hook("UserPromptSubmit", prompt="and the docs")) | at(clock, 1))
+    wait(items, clock, 120)
+    [item] = published(items)
+    assert (item["kind"], item.get("detail")) == ("idle", None)
+
+
+def test_a_slash_command_dated_before_the_prompt_after_it_keeps_its_turns_notice(store):
+    """Prompt hooks are async: the latest prompt is the one dated last, whatever arrives last."""
+    items, clock = store
+    items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | at(clock, 0))
+    items.notice(desktop(hook("UserPromptSubmit", prompt="/cost")) | at(clock, -3))
+    items.observe(desktop_record("idle", clock.now - 1), True)
+    wait(items, clock, 120)
+    assert [i["kind"] for i in published(items)] == ["idle"]
+
+
+def test_codex_prompts_that_crowd_out_a_claude_prompt_time_drop_its_local_command_time_too(store):
+    items, clock = store
+    items.notice(desktop(hook("UserPromptSubmit", prompt="/cost")) | at(clock, 0))
+    for n in range(MAX_LAST_MESSAGES):
+        items.notice(codex("UserPromptSubmit", thread=f"thread-{n}", turn_id="t1", prompt="go") | at(clock, 1))
+    assert items._local_prompted == {}
+
+
 def test_a_desktop_turn_with_its_stop_opens_one_notice_with_its_last_message(store):
     items, clock = store
     items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | at(clock, 0))
@@ -967,13 +1016,26 @@ def test_a_desktop_turn_ended_without_a_stop_across_a_worker_restart_still_publi
     assert [i["kind"] for i in published(restarted)] == ["idle"]
 
 
+def test_a_slash_command_just_after_a_desktop_turn_ended_opens_nothing_across_a_worker_restart(tmp_path):
+    clock = Clock()
+    first = AttentionStore(tmp_path, clock=clock)
+    first.notice(desktop(hook("UserPromptSubmit", prompt="go")) | at(clock, -10))
+    first.observe(desktop_record("idle", clock.now), True)  # Esc: no Stop
+    first.notice(desktop(hook("UserPromptSubmit", prompt="/cost")) | at(clock, 2))
+    restarted = AttentionStore(tmp_path, clock=clock)
+    restarted.observe(desktop_record("idle", clock.now), True)
+    wait(restarted, clock, 120)
+    assert published(restarted) == []
+
+
+@pytest.mark.parametrize("field", ["prompted", "local_prompted"])
 @pytest.mark.parametrize("prompted", [{}, [["thread", "x"]], [[["s", "1"], 1.0]], [[["s"], 1.0]], [[1, 1.0]],
                                       [["thread", 1.0, 2.0]]])
-def test_a_saved_prompt_time_of_the_wrong_shape_sets_the_state_aside(tmp_path, prompted):
+def test_a_saved_prompt_time_of_the_wrong_shape_sets_the_state_aside(tmp_path, field, prompted):
     clock = Clock()
     AttentionStore(tmp_path, clock=clock).notice(notification("idle_prompt"))
     path = tmp_path / "worker" / "attention.json"
-    path.write_text(json.dumps(json.loads(path.read_text()) | {"prompted": prompted}))
+    path.write_text(json.dumps(json.loads(path.read_text()) | {field: prompted}))
     assert published(AttentionStore(tmp_path, clock=clock)) == []
 
 
