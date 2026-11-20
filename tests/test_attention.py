@@ -117,6 +117,8 @@ def test_hook_input_maps_to_its_notice_and_never_carries_raw_tool_input():
     assert hook("UserPromptSubmit", prompt="/new")["prompt_kind"] == "end"
     assert hook("UserPromptSubmit", prompt="/cost")["prompt_kind"] == "local"
     assert hook("UserPromptSubmit", prompt="/model\nopus")["prompt_kind"] == "local"
+    for bare in ("/plan", " /goal ", "/background"):  # with no prompt, these hand Claude nothing
+        assert hook("UserPromptSubmit", prompt=bare)["prompt_kind"] == "local"
     for turn in ("/code-review high", "/plan fix the bug", "/my-command", "/costs"):  # skills and custom commands
         assert "prompt_kind" not in hook("UserPromptSubmit", prompt=turn)
     assert "prompt_kind" not in hook("UserPromptSubmit", prompt="fix the <task-notification> parser")

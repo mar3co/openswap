@@ -85,9 +85,9 @@ TASK_TAG = "<task-notification>"
 SESSION_COMMANDS = frozenset({"/clear", "/reset", "/new", "/exit", "/quit"})
 # Claude Code's built-in commands that start no model turn, aliases included
 # (https://code.claude.com/docs/en/commands, 2026-11-19). Skills, custom commands,
-# and built-ins that may hand Claude a prompt (/plan, /goal, /compact,
-# /background, ...) are left out: a turn of theirs that fails at once must still
-# show. A local command added since only risks one stray idle notice.
+# and built-ins that may hand Claude a prompt (/compact, /plan fix the bug, ...)
+# are left out: a turn of theirs that fails at once must still show. A local
+# command added since only risks one stray idle notice.
 LOCAL_COMMANDS = frozenset({
     "/add-dir", "/advisor", "/agents", "/allowed-tools", "/android", "/app", "/artifacts", "/autocompact",
     "/autofix-pr", "/bashes", "/branch", "/btw", "/bug", "/cd", "/checkpoint", "/chrome", "/color", "/config", "/context",
@@ -102,6 +102,8 @@ LOCAL_COMMANDS = frozenset({
     "/ultrareview", "/undo", "/update", "/upgrade", "/usage", "/usage-credits", "/voice", "/web-setup",
     "/workflows",
 })
+# Built-ins that start a turn only when given a prompt.
+LOCAL_WITHOUT_PROMPT = frozenset({"/background", "/goal", "/plan"})
 
 
 def main(argv: list[str]) -> int:
@@ -344,9 +346,9 @@ def _hook_notice(event: str, raw: bytes) -> dict | None:
             text = _woken_text(prompt, "\n" + WOKEN_TAG)
             if text is not None:
                 notice["reply"] = reply_key(text)  # names the text, never carries it
-        elif (command := (prompt.split(maxsplit=1) or [""])[0]) in SESSION_COMMANDS:
+        elif (words := prompt.split(maxsplit=1) or [""])[0] in SESSION_COMMANDS:
             notice["prompt_kind"] = "end"
-        elif command in LOCAL_COMMANDS:
+        elif words[0] in LOCAL_COMMANDS or (words[0] in LOCAL_WITHOUT_PROMPT and len(words) == 1):
             notice["prompt_kind"] = "local"
     elif event == "Stop":
         message = masked_text(data.get("last_assistant_message"), DETAIL_CAPS["last_message"])
