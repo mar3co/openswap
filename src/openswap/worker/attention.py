@@ -471,13 +471,15 @@ class Item:
     agent: str = ""  # the subagent whose call it is (Codex: its own thread ID); "" for the main thread
     preview_key: str = ""  # digest of the call as a channel would preview it; "" when that is not exact
     started: str = ""  # when ``pid``'s process began (``ps`` lstart): a reused PID differs; "" when unknown
+    stopless: bool = False  # an idle item opened with no Stop of its turn seen (``_open_stopless``)
 
     @classmethod
     def from_dict(cls, data: object) -> Item:
         if isinstance(data, dict):
             # Saved by an earlier build: without the newer fields, or with ``answerable``
             # (a question's wholeness now comes from its waiting hook alone).
-            data = {"preview_key": "", "started": "", **{k: v for k, v in data.items() if k != "answerable"}}
+            data = {"preview_key": "", "started": "", "stopless": False,
+                    **{k: v for k, v in data.items() if k != "answerable"}}
         if not isinstance(data, dict) or set(data) != {f for f in cls.__dataclass_fields__}:
             raise ValueError("invalid item")
         item = cls(**data)
@@ -488,7 +490,7 @@ class Item:
                 or not isinstance(item.tool_key, str) or not isinstance(item.detail, dict)
                 or type(item.pid) is not int or not isinstance(item.entrypoint, str)
                 or not isinstance(item.agent, str) or not isinstance(item.preview_key, str)
-                or not isinstance(item.started, str)):
+                or not isinstance(item.started, str) or type(item.stopless) is not bool):
             raise ValueError("invalid item")
         return item
 
@@ -756,6 +758,24 @@ def read_session(home: str, pid: int) -> SessionRecord | None:
         return None
 
 
+def _saved_prompts(entries: object) -> dict:
+    """``AttentionStore._prompted`` from its saved form: ``[key, time]`` pairs,
+    oldest first, a Claude key as ``[session, pid]`` and a Codex one its thread ID."""
+    if not isinstance(entries, list):
+        raise ValueError("invalid attention state")
+    prompted = {}
+    for key, at in entries:
+        if isinstance(key, list):
+            session, pid = key
+            if not isinstance(session, str) or type(pid) is not int:
+                raise ValueError("invalid attention state")
+            key = (session, pid)
+        if not isinstance(key, (str, tuple)) or type(at) not in (int, float):
+            raise ValueError("invalid attention state")
+        prompted[key] = at
+    return prompted
+
+
 def _new_id() -> str:
     return secrets.token_urlsafe(16)
 
@@ -925,6 +945,7 @@ class AttentionStore:
             saved, handled, acks = data.get("channels", {}), data.get("handled", {}), data.get("acks", {})
             inflight, codex_seen = data.get("inflight", {}), data.get("codex_seen", {})
             held, suppressed, unread = data.get("held", []), data.get("suppressed", []), data.get("unread", [])
+            prompted = _saved_prompts(data.get("prompted", []))
             if (not isinstance(saved, dict) or not isinstance(handled, dict) or not isinstance(acks, dict)
                     or not isinstance(inflight, dict) or not all(isinstance(v, str) for v in inflight.values())
                     or not isinstance(codex_seen, dict)
@@ -975,6 +996,7 @@ class AttentionStore:
         self._held = {i for i in held if i in open_ids}
         self._unread = self._held.intersection(unread)
         self._suppressed = {i for i in suppressed if i in open_ids}
+        self._prompted = prompted
         self.ready = True
         self.note_problem("state", None)
 
@@ -985,7 +1007,8 @@ class AttentionStore:
                 "items": [asdict(item) for item in self._items], "closed": self._closed,
                 "channels": {str(pid): c.saved() for pid, c in self._channels.items()},
                 "handled": self._handled, "inflight": self._inflight, "codex_seen": self._codex_seen,
-                "held": sorted(self._held), "unread": sorted(self._unread), "suppressed": sorted(self._suppressed)}
+                "held": sorted(self._held), "unread": sorted(self._unread), "suppressed": sorted(self._suppressed),
+                "prompted": [[list(k) if isinstance(k, tuple) else k, at] for k, at in self._prompted.items()]}
         with self._ack_lock:
             data["acks"] = dict(self._acks)
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1003,12 +1026,16 @@ class AttentionStore:
                 pass
             raise
 
-    def _commit(self) -> None:
-        """After a change: save (a failure only loses restart survival) and wake the reporter."""
+    def _keep(self) -> None:
+        """Save; a failure only loses restart survival."""
         try:
             self._save()
         except OSError as exc:
             log_limited("state_save", "Could not save session attention state: %s", exc)
+
+    def _commit(self) -> None:
+        """After a change: save and wake the reporter."""
+        self._keep()
         self.changed.set()
 
     # --- lifecycle -----------------------------------------------------------
@@ -1132,15 +1159,19 @@ class AttentionStore:
         if notice.get("provider") == "claude":
             with self._lock:
                 self._seen.setdefault(notice["session_id"], {})[notice.get("pid", 0)] = self._at(notice)
-        # A reply in flight is settled against what the session file says now, and a prompt
-        # whose hook could not tell its process is given to the one running its session now.
+        # A reply in flight is settled against what the session file says now, a Stop is told
+        # from a newer turn's (``_unchanged_since``), and a prompt whose hook could not tell its
+        # process is given to the one running its session now.
         if notice.get("event") == "Notification" or (notice.get("provider") == "claude" and (any(
-                i.session == notice.get("session_id") for i in self._items if i.id in self._sent)
+                i.session == notice.get("session_id") for i in self._items
+                if i.id in self._sent or (i.stopless and notice.get("event") == "Stop"))
                 or (notice.get("event") == "UserPromptSubmit" and not notice.get("pid")))):
             self.refresh(for_notice=True)
         with self._lock:
             if self._apply(notice, publishes, launched):
                 self._commit()
+            elif notice["event"] == "UserPromptSubmit":
+                self._keep()  # the prompt's time: a turn ending with no Stop after a restart still opens its item
         if publishes:
             self._settle(enabled=True)
 
@@ -1337,13 +1368,10 @@ class AttentionStore:
             prompt = notice.get("prompt_kind")
             if prompt == "end":
                 return False  # /clear or /exit: SessionEnd closes the items as session_ended
-            self._prompted[key] = max(at, self._prompted.get(key, 0.0))
+            self._note_prompt(key, at)
             if not pid and record is not None and self._read_at:
                 # A hook that could not tell its process speaks for the one process running the session.
-                bound = (session, record.pid)
-                self._prompted[bound] = max(at, self._prompted.get(bound, 0.0))
-            for oldest in list(self._prompted)[:-MAX_LAST_MESSAGES]:
-                del self._prompted[oldest]
+                self._note_prompt((session, record.pid), at)
             if prompt == "task":
                 # A background task's result starting a turn: the owner did
                 # nothing, and a subagent's prompt may still be waiting. Or the
@@ -1407,10 +1435,19 @@ class AttentionStore:
         did not start (a background task's result) makes what the owner saw out
         of date (``_idle_again``); on a surface without an idle notice, the
         session's idle item opens, and comes due (``tick``) once it has stayed
-        idle for ``IDLE_NOTICE_SECONDS``."""
+        idle for ``IDLE_NOTICE_SECONDS``. An idle item opened with no ``Stop``
+        (``_open_stopless``), whose session file says what it said then, stands
+        for this turn, whose ``Stop`` came late: it takes this turn's last
+        message, and no new item opens."""
         session, pid, at = notice["session_id"], notice.get("pid", 0), notice["at"]
         mine = [i for i in self._items if i.provider == "claude" and i.kind == "idle" and i.session == session
                 and self._same_process(session, i.pid, pid)]
+        own = next((i for i in mine if i.stopless and self._unchanged_since(i)), None)
+        if own is not None:
+            own.stopless = False
+            if last:
+                own.detail = {"last_message": last}
+            return True
         idle = next((i for i in mine if i.created_at < at), None)
         if idle is not None:
             return self._idle_again(idle, notice, last)
@@ -1418,6 +1455,23 @@ class AttentionStore:
             self._open("idle", "claude", session, notice, published=False, detail={"last_message": last})
             return True
         return False
+
+    def _note_prompt(self, key: object, at: float) -> None:
+        """Record a prompt of ``key`` at ``at``. Only a newer one moves ``key``
+        last, so the cap forgets the least recently prompted first."""
+        if at >= self._prompted.get(key, -math.inf):
+            self._prompted.pop(key, None)
+            self._prompted[key] = at
+            for oldest in list(self._prompted)[:-MAX_LAST_MESSAGES]:
+                del self._prompted[oldest]
+
+    def _unchanged_since(self, item: Item) -> bool:
+        """Whether no turn began in the item's process since it opened: no prompt
+        seen since, and its session file still says the status the item opened at
+        (``_open_stopless`` dates it by that status)."""
+        record = self._record_for(item.session, item.pid)
+        return (self._prompted.get((item.session, item.pid), 0.0) < item.created_at and record is not None
+                and record.status == "idle" and record.status_at <= item.created_at)
 
     def _stop_again(self, item: Item) -> bool:
         """What the latest ``Stop`` of the item's process does now that the item
@@ -1510,9 +1564,7 @@ class AttentionStore:
                 self._held.add(self._items[-1].id)
             return True
         if event == "UserPromptSubmit":
-            self._prompted[thread] = max(at, self._prompted.get(thread, 0.0))
-            for oldest in list(self._prompted)[:-MAX_LAST_MESSAGES]:
-                del self._prompted[oldest]
+            self._note_prompt(thread, at)
             return self._close([i for i in own if i.created_at <= at], "answered_on_mac")
         # Interrupt: Esc or "No" at the prompt ends the turn.
         return self._close([i for i in prompts if i.created_at <= at], "answered_on_mac")
@@ -1809,6 +1861,7 @@ class AttentionStore:
                 self._open("idle", "claude", record.session_id, {"cwd": record.cwd, "pid": record.pid,
                                                                  "entrypoint": record.entrypoint,
                                                                  "at": record.status_at}, published=False)
+                self._items[-1].stopless = True
                 opened.append(self._items[-1])
         return opened
 
@@ -2800,10 +2853,7 @@ class AttentionStore:
         with self._lock:
             sent = set(closed_ids)
             self._closed = [c for c in self._closed if c["id"] not in sent]
-            try:
-                self._save()
-            except OSError as exc:
-                log_limited("state_save", "Could not save session attention state: %s", exc)
+            self._keep()
             if self._closed:
                 self.changed.set()  # more closes wait: the next report carries them at once
 
