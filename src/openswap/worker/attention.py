@@ -1368,13 +1368,10 @@ class AttentionStore:
             prompt = notice.get("prompt_kind")
             if prompt == "end":
                 return False  # /clear or /exit: SessionEnd closes the items as session_ended
-            self._prompted[key] = max(at, self._prompted.pop(key, 0.0))
+            self._note_prompt(key, at)
             if not pid and record is not None and self._read_at:
                 # A hook that could not tell its process speaks for the one process running the session.
-                bound = (session, record.pid)
-                self._prompted[bound] = max(at, self._prompted.pop(bound, 0.0))
-            for oldest in list(self._prompted)[:-MAX_LAST_MESSAGES]:
-                del self._prompted[oldest]
+                self._note_prompt((session, record.pid), at)
             if prompt == "task":
                 # A background task's result starting a turn: the owner did
                 # nothing, and a subagent's prompt may still be waiting. Or the
@@ -1458,6 +1455,15 @@ class AttentionStore:
             self._open("idle", "claude", session, notice, published=False, detail={"last_message": last})
             return True
         return False
+
+    def _note_prompt(self, key: object, at: float) -> None:
+        """Record a prompt of ``key`` at ``at``. Only a newer one moves ``key``
+        last, so the cap forgets the least recently prompted first."""
+        if at >= self._prompted.get(key, -math.inf):
+            self._prompted.pop(key, None)
+            self._prompted[key] = at
+            for oldest in list(self._prompted)[:-MAX_LAST_MESSAGES]:
+                del self._prompted[oldest]
 
     def _unchanged_since(self, item: Item) -> bool:
         """Whether no turn began in the item's process since it opened: no prompt
@@ -1558,9 +1564,7 @@ class AttentionStore:
                 self._held.add(self._items[-1].id)
             return True
         if event == "UserPromptSubmit":
-            self._prompted[thread] = max(at, self._prompted.pop(thread, 0.0))
-            for oldest in list(self._prompted)[:-MAX_LAST_MESSAGES]:
-                del self._prompted[oldest]
+            self._note_prompt(thread, at)
             return self._close([i for i in own if i.created_at <= at], "answered_on_mac")
         # Interrupt: Esc or "No" at the prompt ends the turn.
         return self._close([i for i in prompts if i.created_at <= at], "answered_on_mac")

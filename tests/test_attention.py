@@ -947,6 +947,16 @@ def test_the_most_recently_prompted_process_is_the_last_to_be_forgotten(store):
     assert (SESSION, os.getpid()) in items._prompted and ("session-0", os.getpid()) not in items._prompted
 
 
+def test_a_late_hook_of_an_older_prompt_does_not_make_its_process_the_last_to_be_forgotten(store):
+    items, clock = store
+    items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | at(clock, 2))
+    for n in range(MAX_LAST_MESSAGES - 1):
+        items.notice(desktop(hook("UserPromptSubmit", session=f"session-{n}", prompt="go")) | at(clock, 3))
+    items.notice(desktop(hook("UserPromptSubmit", prompt="earlier")) | at(clock, 1))  # its hook ran late
+    items.notice(desktop(hook("UserPromptSubmit", session="one-more", prompt="go")) | at(clock, 4))
+    assert (SESSION, os.getpid()) not in items._prompted and ("session-0", os.getpid()) in items._prompted
+
+
 def test_a_desktop_turn_ended_without_a_stop_across_a_worker_restart_still_publishes(tmp_path):
     clock = Clock()
     first = AttentionStore(tmp_path, clock=clock)
