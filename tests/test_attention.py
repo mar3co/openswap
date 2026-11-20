@@ -24,7 +24,7 @@ from openswap.settings import (
 from openswap.worker import ipc
 from openswap.worker.attention import (
     IDLE_READ_SECONDS, MAX_LAST_MESSAGES, SESSION_END_GRACE_SECONDS, AttentionStore, Item, NoticeError, SessionRecord,
-    approved_folder_label, idle_seconds_from, read_records, validate_notice,
+    Waiter, approved_folder_label, idle_seconds_from, read_records, validate_notice,
 )
 from openswap.worker.protocol import MAX_BODY, ProtocolError, attention_report
 from openswap.worker.refserver import ControlStore
@@ -739,17 +739,101 @@ def test_a_process_seen_in_another_session_on_an_incomplete_read_has_left_this_o
     items, clock = store
     items.observe(desktop_record("busy", clock.now - 30), True)
     items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | at(clock, 0))
-    left = [SessionRecord(OTHER, os.getpid(), "idle", clock.now + 3, entrypoint="claude-desktop")]
+    left = [SessionRecord(OTHER, os.getpid(), "idle", clock.now + 3, entrypoint="claude-desktop",
+                          proc_start=items._starts[os.getpid()])]
     items.observe(left, False)  # another file unreadable, but this process is plainly elsewhere
     items.observe(desktop_record("idle", clock.now + 10), True)  # resumed before any whole read
     wait(items, clock, 120)
     assert published(items) == []
 
 
+@pytest.mark.parametrize("started", ["", "Thu Nov  5 09:00:00 2026"])  # not said, or not checkable
+def test_a_stale_file_of_a_reused_pid_never_shows_its_process_left_a_session(store, started):
+    items, clock = store
+    items.observe(desktop_record("busy", clock.now - 30), True)
+    items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | at(clock, 0))
+    if started:
+        del items._starts[os.getpid()]  # ``ps`` could not say when the process began
+    stale = [SessionRecord(OTHER, os.getpid(), "idle", clock.now - 900, proc_start=started)]
+    items.observe(stale, False)  # left by a crashed process; this one's own file mid-write
+    items.observe(desktop_record("idle", clock.now + 5), True)  # Esc: no Stop
+    wait(items, clock, 120)
+    assert [i["kind"] for i in published(items)] == ["idle"]
+
+
+def test_a_process_that_ended_on_an_incomplete_read_leaves_nothing_to_its_pids_next_process(store, monkeypatch):
+    from openswap import process_detection
+
+    items, clock = store
+    items.observe(desktop_record("busy", clock.now - 30), True)
+    items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | at(clock, 0))
+    real = process_detection.is_pid_alive
+    monkeypatch.setattr(process_detection, "is_pid_alive", lambda pid: pid != os.getpid() and real(pid))
+    items.observe([], False)  # it ended; another file mid-write
+    monkeypatch.setattr(process_detection, "is_pid_alive", real)
+    items.observe(desktop_record("idle", clock.now + 10), True)  # its PID reused, resuming the session
+    wait(items, clock, 120)
+    assert published(items) == []
+
+
+def test_an_item_closes_once_its_process_is_plainly_in_another_session_on_an_incomplete_read(store):
+    items, clock = store
+    items.observe(desktop_record("idle", clock.now - 30), True)
+    items.notice(notification("idle_prompt") | {"pid": os.getpid()})
+    assert len(published(items)) == 1
+    left = [SessionRecord(OTHER, os.getpid(), "idle", clock.now + 3, proc_start=items._starts[os.getpid()])]
+    items.observe(left, False)  # /clear moved it; another file unreadable
+    assert published(items) == [] and [c["reason"] for c in closes(items)] == ["session_ended"]
+
+
+@pytest.mark.parametrize("late", ["UserPromptSubmit", "Stop"])
+def test_a_hook_that_lands_after_its_process_left_the_session_is_not_applied(store, late):
+    items, clock = store
+    items.observe(desktop_record("busy", clock.now - 30), True)
+    clock.now += 5
+    items.observe([SessionRecord(OTHER, os.getpid(), "idle", clock.now)], True)  # /clear, no SessionEnd yet
+    items.notice(desktop(hook(late, prompt="go", last_assistant_message="Done.")) | at(clock, -4))
+    items.observe(desktop_record("idle", clock.now + 10), True)  # the same process resumes it
+    wait(items, clock, 120)
+    assert published(items) == []
+
+
+def test_a_session_end_that_lands_after_its_process_was_seen_to_leave_still_releases_its_wake_hook(store):
+    items, clock = store
+    items.observe(desktop_record("busy", clock.now - 30), True)
+    waker = Waiter("wake", SESSION, "", "", os.getpid(), clock.now, "")
+    items._wakers.append(waker)
+    clock.now += 5
+    items.observe([SessionRecord(OTHER, os.getpid(), "idle", clock.now)], True)  # /clear seen first
+    items.notice(desktop(hook("SessionEnd")) | at(clock, -4))
+    assert waker.done.is_set()
+
+
+def test_a_process_resuming_a_session_while_the_read_that_saw_it_leave_runs_keeps_its_new_turn(tmp_path):
+    clock = Clock()
+    reads = [desktop_record("busy", clock.now - 30)]
+
+    def read():
+        records = reads[0]
+        clock.now += 10  # ``ps`` stalls after the files were read
+        return records, True
+
+    items = AttentionStore(tmp_path, clock=clock, records=read)
+    items.refresh()
+    reads[0] = [SessionRecord(OTHER, os.getpid(), "idle", clock.now)]
+    items.refresh()  # read before the stall, applied after it
+    items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | {"at": clock.now - 5})  # resumed meanwhile
+    reads[0] = desktop_record("idle", clock.now)  # Esc: no Stop
+    wait(items, clock, 120)
+    assert [i["kind"] for i in published(items)] == ["idle"]
+
+
 def test_the_processes_kept_while_reads_are_incomplete_are_only_those_still_unaccounted_for(store):
     items, _ = store
+    items._starts[os.getpid()] = "Thu Nov  5 09:00:00 2026"
     for n in range(50):  # one process moving through sessions while another file stays unreadable
-        items.observe([SessionRecord(f"session-{n}", os.getpid(), "idle", 1.0)], False)
+        items.observe([SessionRecord(f"session-{n}", os.getpid(), "idle", 1.0,
+                                     proc_start="Thu Nov  5 09:00:00 2026")], False)
     assert items._known_procs == {("session-49", os.getpid())}
 
 
@@ -852,6 +936,105 @@ def test_a_desktop_turn_with_its_stop_opens_one_notice_with_its_last_message(sto
     wait(items, clock, 120)
     [item] = published(items)
     assert item["detail"] == {"last_message": "Done."}
+
+
+@pytest.mark.parametrize("stop_at", [4, 6], ids=["dated before the session went idle", "dated after"])
+def test_a_desktop_stop_arriving_after_its_turns_notice_fills_that_notice_in(store, stop_at):
+    """The Mac slept between the turn's end and its async Stop hook's send."""
+    items, clock = store
+    items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | at(clock, 0))
+    items.observe(desktop_record("idle", clock.now + 5), True)
+    wait(items, clock, 65)
+    [item] = published(items)
+    items.notice(desktop(hook("Stop", last_assistant_message="Done.")) | at(clock, stop_at - 65))
+    assert published(items) == [item | {"detail": {"last_message": "Done."}}] and closes(items) == []
+
+
+@pytest.mark.parametrize("before", ["Stop", "task", "turn"],
+                         ids=["a Stop already seen", "a background task's prompt", "a turn with its prompt still late"])
+def test_a_desktop_stop_after_another_turn_boundary_supersedes_the_notice(store, before):
+    items, clock = store
+    items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | at(clock, 0))
+    if before == "Stop":
+        items.notice(desktop(hook("Stop", last_assistant_message="First.")) | at(clock, 5))
+    items.observe(desktop_record("idle", clock.now + 5), True)
+    wait(items, clock, 65)
+    [item] = published(items)
+    if before == "task":
+        items.notice(desktop(hook("UserPromptSubmit", prompt="<task-notification>\n<task-id>x</task-id>"))
+                     | at(clock, 0))
+    if before == "turn":
+        items.observe(desktop_record("idle", clock.now + 10), True)
+    items.notice(desktop(hook("Stop", last_assistant_message="Result is 42.")) | at(clock, 10))
+    [newer] = published(items)
+    assert closes(items) == [{"id": item["id"], "reason": "superseded"}]
+    assert newer["detail"] == {"last_message": "Result is 42."}
+
+
+def test_a_stop_is_told_from_a_newer_turns_by_a_fresh_read_of_the_session_file(tmp_path):
+    clock = Clock()
+    reads = [(desktop_record("busy", clock.now - 1), True)]
+    items = AttentionStore(tmp_path, clock=clock, records=lambda: reads[0])
+    items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | at(clock, 0))
+    reads[0] = (desktop_record("idle", clock.now + 5), True)
+    wait(items, clock, 65)
+    [item] = published(items)
+    reads[0] = (desktop_record("idle", clock.now + 3), True)  # a short turn since, not read yet
+    items.notice(desktop(hook("Stop", last_assistant_message="Result is 42.")) | at(clock, 2))
+    assert closes(items) == [{"id": item["id"], "reason": "superseded"}]
+
+
+def test_the_most_recently_prompted_process_is_the_last_to_be_forgotten(store):
+    items, clock = store
+    items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | at(clock, 0))
+    for n in range(MAX_LAST_MESSAGES - 1):
+        items.notice(desktop(hook("UserPromptSubmit", session=f"session-{n}", prompt="go")) | at(clock, 1))
+    items.notice(desktop(hook("UserPromptSubmit", prompt="again")) | at(clock, 2))
+    items.notice(desktop(hook("UserPromptSubmit", session="one-more", prompt="go")) | at(clock, 3))
+    assert (SESSION, os.getpid()) in items._prompted and ("session-0", os.getpid()) not in items._prompted
+
+
+def test_a_late_hook_of_an_older_prompt_does_not_make_its_process_the_last_to_be_forgotten(store):
+    items, clock = store
+    items.notice(desktop(hook("UserPromptSubmit", prompt="go")) | at(clock, 2))
+    for n in range(MAX_LAST_MESSAGES - 1):
+        items.notice(desktop(hook("UserPromptSubmit", session=f"session-{n}", prompt="go")) | at(clock, 3))
+    items.notice(desktop(hook("UserPromptSubmit", prompt="earlier")) | at(clock, 1))  # its hook ran late
+    items.notice(desktop(hook("UserPromptSubmit", session="one-more", prompt="go")) | at(clock, 4))
+    assert (SESSION, os.getpid()) not in items._prompted and ("session-0", os.getpid()) in items._prompted
+
+
+def test_a_desktop_turn_ended_without_a_stop_across_a_worker_restart_still_publishes(tmp_path):
+    clock = Clock()
+    first = AttentionStore(tmp_path, clock=clock)
+    first.notice(desktop(hook("UserPromptSubmit", prompt="go")) | at(clock, 0))
+    restarted = AttentionStore(tmp_path, clock=clock)  # an upgrade mid-turn
+    restarted.observe(desktop_record("idle", clock.now + 5), True)  # Esc: no Stop
+    wait(restarted, clock, 65)
+    assert [i["kind"] for i in published(restarted)] == ["idle"]
+
+
+def test_a_slash_command_just_after_a_desktop_turn_ended_opens_nothing_across_a_worker_restart(tmp_path):
+    clock = Clock()
+    first = AttentionStore(tmp_path, clock=clock)
+    first.notice(desktop(hook("UserPromptSubmit", prompt="go")) | at(clock, -10))
+    first.observe(desktop_record("idle", clock.now), True)  # Esc: no Stop
+    first.notice(desktop(hook("UserPromptSubmit", prompt="/cost")) | at(clock, 2))
+    restarted = AttentionStore(tmp_path, clock=clock)
+    restarted.observe(desktop_record("idle", clock.now), True)
+    wait(restarted, clock, 120)
+    assert published(restarted) == []
+
+
+@pytest.mark.parametrize("field", ["prompted", "local_prompted"])
+@pytest.mark.parametrize("prompted", [{}, [["thread", "x"]], [[["s", "1"], 1.0]], [[["s"], 1.0]], [[1, 1.0]],
+                                      [["thread", 1.0, 2.0]]])
+def test_a_saved_prompt_time_of_the_wrong_shape_sets_the_state_aside(tmp_path, field, prompted):
+    clock = Clock()
+    AttentionStore(tmp_path, clock=clock).notice(notification("idle_prompt"))
+    path = tmp_path / "worker" / "attention.json"
+    path.write_text(json.dumps(json.loads(path.read_text()) | {field: prompted}))
+    assert published(AttentionStore(tmp_path, clock=clock)) == []
 
 
 @pytest.mark.parametrize("entrypoint", ["claude-desktop", "cli"])

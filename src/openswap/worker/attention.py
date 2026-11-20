@@ -472,13 +472,15 @@ class Item:
     agent: str = ""  # the subagent whose call it is (Codex: its own thread ID); "" for the main thread
     preview_key: str = ""  # digest of the call as a channel would preview it; "" when that is not exact
     started: str = ""  # when ``pid``'s process began (``ps`` lstart): a reused PID differs; "" when unknown
+    stopless: bool = False  # an idle item opened with no Stop of its turn seen (``_open_stopless``)
 
     @classmethod
     def from_dict(cls, data: object) -> Item:
         if isinstance(data, dict):
             # Saved by an earlier build: without the newer fields, or with ``answerable``
             # (a question's wholeness now comes from its waiting hook alone).
-            data = {"preview_key": "", "started": "", **{k: v for k, v in data.items() if k != "answerable"}}
+            data = {"preview_key": "", "started": "", "stopless": False,
+                    **{k: v for k, v in data.items() if k != "answerable"}}
         if not isinstance(data, dict) or set(data) != {f for f in cls.__dataclass_fields__}:
             raise ValueError("invalid item")
         item = cls(**data)
@@ -489,7 +491,7 @@ class Item:
                 or not isinstance(item.tool_key, str) or not isinstance(item.detail, dict)
                 or type(item.pid) is not int or not isinstance(item.entrypoint, str)
                 or not isinstance(item.agent, str) or not isinstance(item.preview_key, str)
-                or not isinstance(item.started, str)):
+                or not isinstance(item.started, str) or type(item.stopless) is not bool):
             raise ValueError("invalid item")
         return item
 
@@ -757,6 +759,29 @@ def read_session(home: str, pid: int) -> SessionRecord | None:
         return None
 
 
+def _prompts_saved(prompted: dict) -> list:
+    return [[list(k) if isinstance(k, tuple) else k, at] for k, at in prompted.items()]
+
+
+def _saved_prompts(entries: object) -> dict:
+    """``AttentionStore._prompted`` (or ``_local_prompted``) from its saved form:
+    ``[key, time]`` pairs, oldest first, a Claude key as ``[session, pid]`` and a
+    Codex one its thread ID."""
+    if not isinstance(entries, list):
+        raise ValueError("invalid attention state")
+    prompted = {}
+    for key, at in entries:
+        if isinstance(key, list):
+            session, pid = key
+            if not isinstance(session, str) or type(pid) is not int:
+                raise ValueError("invalid attention state")
+            key = (session, pid)
+        if not isinstance(key, (str, tuple)) or type(at) not in (int, float):
+            raise ValueError("invalid attention state")
+        prompted[key] = at
+    return prompted
+
+
 def _new_id() -> str:
     return secrets.token_urlsafe(16)
 
@@ -802,6 +827,7 @@ class AttentionStore:
         self._records: dict[str, list[SessionRecord]] = {}  # by session ID: its live processes' records
         self._known: set[str] = set()  # sessions seen in a record, so a missing one has ended
         self._known_procs: set[tuple[str, int]] = set()  # the same, per process
+        self._left: dict[tuple[str, int], float] = {}  # (session, PID) -> when that process was seen to leave it
         self._starts: dict[int, str] = {}  # PID -> when that process began, while it runs
         self._due: dict[str, float] = {}  # item ID -> when its answer at the Mac closes it
         self._due_exit: dict[str, float] = {}  # item ID -> when its session left ``waiting``
@@ -927,6 +953,8 @@ class AttentionStore:
             saved, handled, acks = data.get("channels", {}), data.get("handled", {}), data.get("acks", {})
             inflight, codex_seen = data.get("inflight", {}), data.get("codex_seen", {})
             held, suppressed, unread = data.get("held", []), data.get("suppressed", []), data.get("unread", [])
+            prompted = _saved_prompts(data.get("prompted", []))
+            local_prompted = _saved_prompts(data.get("local_prompted", []))
             if (not isinstance(saved, dict) or not isinstance(handled, dict) or not isinstance(acks, dict)
                     or not isinstance(inflight, dict) or not all(isinstance(v, str) for v in inflight.values())
                     or not isinstance(codex_seen, dict)
@@ -977,6 +1005,7 @@ class AttentionStore:
         self._held = {i for i in held if i in open_ids}
         self._unread = self._held.intersection(unread)
         self._suppressed = {i for i in suppressed if i in open_ids}
+        self._prompted, self._local_prompted = prompted, local_prompted
         self.ready = True
         self.note_problem("state", None)
 
@@ -987,7 +1016,8 @@ class AttentionStore:
                 "items": [asdict(item) for item in self._items], "closed": self._closed,
                 "channels": {str(pid): c.saved() for pid, c in self._channels.items()},
                 "handled": self._handled, "inflight": self._inflight, "codex_seen": self._codex_seen,
-                "held": sorted(self._held), "unread": sorted(self._unread), "suppressed": sorted(self._suppressed)}
+                "held": sorted(self._held), "unread": sorted(self._unread), "suppressed": sorted(self._suppressed),
+                "prompted": _prompts_saved(self._prompted), "local_prompted": _prompts_saved(self._local_prompted)}
         with self._ack_lock:
             data["acks"] = dict(self._acks)
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1005,12 +1035,16 @@ class AttentionStore:
                 pass
             raise
 
-    def _commit(self) -> None:
-        """After a change: save (a failure only loses restart survival) and wake the reporter."""
+    def _keep(self) -> None:
+        """Save; a failure only loses restart survival."""
         try:
             self._save()
         except OSError as exc:
             log_limited("state_save", "Could not save session attention state: %s", exc)
+
+    def _commit(self) -> None:
+        """After a change: save and wake the reporter."""
+        self._keep()
         self.changed.set()
 
     # --- lifecycle -----------------------------------------------------------
@@ -1079,6 +1113,12 @@ class AttentionStore:
         known = self._starts.get(pid)  # read by ``refresh`` outside the lock
         return known is None or " ".join(known.split()) == " ".join(started.split())
 
+    def _wrote(self, record: SessionRecord) -> bool:
+        """Whether ``record`` was surely written by the process its PID runs now:
+        both start times are known and agree."""
+        known = self._starts.get(record.pid)
+        return bool(record.proc_start) and known is not None and known.split() == record.proc_start.split()
+
     def _record_for(self, session: str, pid: int) -> SessionRecord | None:
         """The session file of ``session`` written by Claude Code process ``pid``;
         with ``pid`` 0 (unknown), the one record only when exactly one process
@@ -1128,15 +1168,19 @@ class AttentionStore:
         if notice.get("provider") == "claude":
             with self._lock:
                 self._seen.setdefault(notice["session_id"], {})[notice.get("pid", 0)] = self._at(notice)
-        # A reply in flight is settled against what the session file says now, and a prompt
-        # whose hook could not tell its process is given to the one running its session now.
+        # A reply in flight is settled against what the session file says now, a Stop is told
+        # from a newer turn's (``_unchanged_since``), and a prompt whose hook could not tell its
+        # process is given to the one running its session now.
         if notice.get("event") == "Notification" or (notice.get("provider") == "claude" and (any(
-                i.session == notice.get("session_id") for i in self._items if i.id in self._sent)
+                i.session == notice.get("session_id") for i in self._items
+                if i.id in self._sent or (i.stopless and notice.get("event") == "Stop"))
                 or (notice.get("event") == "UserPromptSubmit" and not notice.get("pid")))):
             self.refresh(for_notice=True)
         with self._lock:
             if self._apply(notice, publishes, launched):
                 self._commit()
+            elif notice["event"] == "UserPromptSubmit":
+                self._keep()  # the prompt's time: a turn ending with no Stop after a restart still opens its item
         if publishes:
             self._settle(enabled=True)
 
@@ -1220,6 +1264,8 @@ class AttentionStore:
         event, session, at = notice["event"], notice["session_id"], self._at(notice)
         pid = notice.get("pid", 0)
         key = (session, pid)
+        if pid and event != "SessionEnd" and at < self._left.get(key, -math.inf):
+            return False  # a late hook of a turn its process has since left
         # Only this process's items: the same session may run in another process too.
         mine = [i for i in self._items if i.provider == "claude" and i.session == session
                 and self._same_process(session, i.pid, pid)]
@@ -1331,15 +1377,10 @@ class AttentionStore:
             prompt = notice.get("prompt_kind")
             if prompt == "end":
                 return False  # /clear or /exit: SessionEnd closes the items as session_ended
-            keys = [key]
+            self._note_prompt(key, at, local=prompt == "local")
             if not pid and record is not None and self._read_at:
                 # A hook that could not tell its process speaks for the one process running the session.
-                keys.append((session, record.pid))
-            for k in keys:
-                self._prompted[k] = max(at, self._prompted.get(k, 0.0))
-                if prompt == "local":
-                    self._local_prompted[k] = max(at, self._local_prompted.get(k, 0.0))
-            self._trim_prompted()
+                self._note_prompt((session, record.pid), at, local=prompt == "local")
             if prompt == "task":
                 # A background task's result starting a turn: the owner did
                 # nothing, and a subagent's prompt may still be waiting. Or the
@@ -1360,7 +1401,7 @@ class AttentionStore:
             self._release([w for w in self._wakers_of(session, pid) if w is not paired])
             return self._close([i for i in mine if i.created_at <= at], "answered_on_mac")
         if event == "SessionEnd":
-            self._forget(key)
+            self._forget(key, at)
             self._release(self._wakers_of(session, pid))
             return self._close(mine, "session_ended")
         # PostToolUse / PostToolUseFailure: the prompt for that call was answered.
@@ -1403,10 +1444,19 @@ class AttentionStore:
         did not start (a background task's result) makes what the owner saw out
         of date (``_idle_again``); on a surface without an idle notice, the
         session's idle item opens, and comes due (``tick``) once it has stayed
-        idle for ``IDLE_NOTICE_SECONDS``."""
+        idle for ``IDLE_NOTICE_SECONDS``. An idle item opened with no ``Stop``
+        (``_open_stopless``), whose session file says what it said then, stands
+        for this turn, whose ``Stop`` came late: it takes this turn's last
+        message, and no new item opens."""
         session, pid, at = notice["session_id"], notice.get("pid", 0), notice["at"]
         mine = [i for i in self._items if i.provider == "claude" and i.kind == "idle" and i.session == session
                 and self._same_process(session, i.pid, pid)]
+        own = next((i for i in mine if i.stopless and self._unchanged_since(i)), None)
+        if own is not None:
+            own.stopless = False
+            if last:
+                own.detail = {"last_message": last}
+            return True
         idle = next((i for i in mine if i.created_at < at), None)
         if idle is not None:
             return self._idle_again(idle, notice, last)
@@ -1414,6 +1464,27 @@ class AttentionStore:
             self._open("idle", "claude", session, notice, published=False, detail={"last_message": last})
             return True
         return False
+
+    def _note_prompt(self, key: object, at: float, *, local: bool = False) -> None:
+        """Record a prompt of ``key`` at ``at``, ``local`` for a built-in command
+        that starts no turn. Only a newer one moves ``key`` last, so the cap
+        forgets the least recently prompted first."""
+        if at >= self._prompted.get(key, -math.inf):
+            self._prompted.pop(key, None)
+            self._prompted[key] = at
+            if local:
+                self._local_prompted[key] = at
+            for oldest in list(self._prompted)[:-MAX_LAST_MESSAGES]:
+                del self._prompted[oldest]
+                self._local_prompted.pop(oldest, None)
+
+    def _unchanged_since(self, item: Item) -> bool:
+        """Whether no turn began in the item's process since it opened: no prompt
+        seen since, and its session file still says the status the item opened at
+        (``_open_stopless`` dates it by that status)."""
+        record = self._record_for(item.session, item.pid)
+        return (self._prompted.get((item.session, item.pid), 0.0) < item.created_at and record is not None
+                and record.status == "idle" and record.status_at <= item.created_at)
 
     def _stop_again(self, item: Item) -> bool:
         """What the latest ``Stop`` of the item's process does now that the item
@@ -1506,8 +1577,7 @@ class AttentionStore:
                 self._held.add(self._items[-1].id)
             return True
         if event == "UserPromptSubmit":
-            self._prompted[thread] = max(at, self._prompted.get(thread, 0.0))
-            self._trim_prompted()
+            self._note_prompt(thread, at)
             return self._close([i for i in own if i.created_at <= at], "answered_on_mac")
         # Interrupt: Esc or "No" at the prompt ends the turn.
         return self._close([i for i in prompts if i.created_at <= at], "answered_on_mac")
@@ -1526,6 +1596,7 @@ class AttentionStore:
         # One read at a time, so an older read is never applied after a newer one.
         with self._refresh_lock:
             if self._read_records is not None:
+                read_at = self.clock()
                 try:
                     records, complete = self._read_records()
                 except Exception as exc:  # noqa: BLE001 - an unreadable folder must not stop notices
@@ -1536,7 +1607,7 @@ class AttentionStore:
                         pids = {r.pid for r in records} | {i.pid for i in self._items if i.pid}
                     for pid in pids:
                         self._learn_start(pid)  # never under the lock: ``ps`` can stall
-                    self.observe(records, complete)
+                    self.observe(records, complete, read_at)
             self._observe_codex_answers()
 
     def _observe_codex_answers(self) -> None:
@@ -1575,9 +1646,9 @@ class AttentionStore:
             if self._close(answered, "answered_on_mac"):
                 self._commit()
 
-    def observe(self, records, complete: bool) -> None:
+    def observe(self, records, complete: bool, read_at: float | None = None) -> None:
         """Apply the running sessions' records (a list, or a dict by session ID),
-        as read from every managed config home. ``complete`` is False when a
+        as read from every managed config home at ``read_at`` (None: now). ``complete`` is False when a
         record could not be read: then no session counts as gone for want of
         its record. One session can run in several Claude Code processes; each
         process's record speaks only for that process's items.
@@ -1594,6 +1665,7 @@ class AttentionStore:
         records = list(records.values()) if isinstance(records, dict) else list(records)
         with self._lock:
             now = self.clock()
+            read_at = now if read_at is None else read_at
             self._read_at = now if complete else 0.0
             changed = False
             live: dict[str, list[SessionRecord]] = {}
@@ -1617,10 +1689,11 @@ class AttentionStore:
             # A process that no longer runs a session it ran (it ended, or /clear moved it)
             # keeps nothing of that session's turns, open item or not, SessionEnd or not. A
             # read missing a record shows that only when the process runs another session or none.
-            pids = {pid for _, pid in procs}
+            # A stale file whose start time is unknown may name a reused PID: no evidence.
+            pids = {r.pid for rs in live.values() for r in rs if self._wrote(r)}
             left = {k for k in self._known_procs - procs if complete or k[1] in pids or not self._alive(k[1])}
             for key in left:
-                self._forget(key)
+                self._forget(key, read_at)
             self._known_procs = {k for k in self._known_procs
                                  if k in open_procs or (not complete and k not in left)} | procs
             self._left_waiting = {k: t for k, t in self._left_waiting.items()
@@ -1645,8 +1718,7 @@ class AttentionStore:
                 mine = live.get(item.session, [])
                 if item.pid:
                     record = next((r for r in mine if r.pid == item.pid), None)
-                    gone = not self._alive(item.pid, item.started) or (
-                        record is None and complete and (item.session, item.pid) in self._known_procs)
+                    gone = not self._alive(item.pid, item.started) or (item.session, item.pid) in left
                 else:
                     record = None
                     gone = not mine and complete and item.session in self._known
@@ -1688,7 +1760,7 @@ class AttentionStore:
                     self._due_exit[item.id] = exit_at
             for item in ended:
                 key = (item.session, item.pid)
-                self._forget(key)
+                self._forget(key, read_at)
                 self._known_procs.discard(key)
                 if not live.get(item.session):
                     self._known.discard(item.session)
@@ -1774,16 +1846,17 @@ class AttentionStore:
                    and not (self._hook_denied(i) and item.created_at >= (self._sent[i.id].exit_at or math.inf))
                    for i in self._items)
 
-    def _forget(self, key: tuple[str, int]) -> None:
-        """Drop what is known of the turns of process ``key[1]`` in session ``key[0]``."""
+    def _forget(self, key: tuple[str, int], at: float) -> None:
+        """Drop what is known of the turns of process ``key[1]`` in session ``key[0]``,
+        which it was seen to leave at ``at``."""
         for table in (self._last_message, self._prompted, self._local_prompted, self._left_waiting, self._stopped,
                       self._stop_launch, self._busy_at):
             table.pop(key, None)
-
-    def _trim_prompted(self) -> None:
-        for oldest in list(self._prompted)[:-MAX_LAST_MESSAGES]:
-            del self._prompted[oldest]
-            self._local_prompted.pop(oldest, None)
+        if not key[1]:
+            return  # every process its hooks could not tell shares the key: one leaving says nothing of the others
+        self._left[key] = max(at, self._left.pop(key, -math.inf))
+        for oldest in list(self._left)[:-MAX_LAST_MESSAGES]:
+            del self._left[oldest]
 
     def _open_stopless(self, now: float) -> list[Item]:
         """On a surface without an idle notice, open the idle item of each turn
@@ -1808,6 +1881,7 @@ class AttentionStore:
                 self._open("idle", "claude", record.session_id, {"cwd": record.cwd, "pid": record.pid,
                                                                  "entrypoint": record.entrypoint,
                                                                  "at": record.status_at}, published=False)
+                self._items[-1].stopless = True
                 opened.append(self._items[-1])
         return opened
 
@@ -2799,10 +2873,7 @@ class AttentionStore:
         with self._lock:
             sent = set(closed_ids)
             self._closed = [c for c in self._closed if c["id"] not in sent]
-            try:
-                self._save()
-            except OSError as exc:
-                log_limited("state_save", "Could not save session attention state: %s", exc)
+            self._keep()
             if self._closed:
                 self.changed.set()  # more closes wait: the next report carries them at once
 
